@@ -2,22 +2,22 @@
 //! optionally tracing each instruction.
 //!
 //! Usage:
-//!   remu <program.bin> [--load <hex_addr>] [--start <hex_addr>] [--trace] [--steps <n>]
+//!   remu-cli <program.bin> [--load <hex_addr>] [--start <hex_addr>] [--trace] [--steps <n>]
 //!
 //! Defaults: load address `$0600`, start at the load address, 1,000,000 steps.
 
 use std::process::ExitCode;
 
+use remu::Cpu;
 use remu::cpu::disasm::disassemble;
 use remu::memory::FlatMemory;
-use remu::Cpu;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!(
             "usage: {} <program.bin> [--load <hex>] [--start <hex>] [--trace] [--steps <n>]",
-            args.first().map(String::as_str).unwrap_or("remu")
+            args.first().map(String::as_str).unwrap_or("remu-cli")
         );
         return ExitCode::FAILURE;
     }
@@ -42,7 +42,10 @@ fn main() -> ExitCode {
             "--trace" => trace = true,
             "--steps" => {
                 i += 1;
-                max_steps = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(max_steps);
+                max_steps = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(max_steps);
             }
             other => {
                 eprintln!("unknown argument: {other}");
@@ -70,14 +73,21 @@ fn main() -> ExitCode {
 
     for _ in 0..max_steps {
         if cpu.halted {
-            println!("halted (KIL) at ${:04X} after {} cycles", cpu.regs.pc, cpu.cycles);
+            println!(
+                "halted (KIL) at ${:04X} after {} cycles",
+                cpu.regs.pc, cpu.cycles
+            );
             break;
         }
         if trace {
             let (text, _) = disassemble(&mut mem, cpu.regs.pc);
             println!(
                 "{text:<20} A:{:02X} X:{:02X} Y:{:02X} SP:{:02X} P:{:02X}",
-                cpu.regs.a, cpu.regs.x, cpu.regs.y, cpu.regs.sp, cpu.regs.p.bits()
+                cpu.regs.a,
+                cpu.regs.x,
+                cpu.regs.y,
+                cpu.regs.sp,
+                cpu.regs.p.bits()
             );
         }
         cpu.step(&mut mem);

@@ -24,6 +24,8 @@ pub mod bus;
 pub mod cpu;
 pub mod interrupt;
 pub mod memory;
+#[cfg(feature = "python")]
+mod python;
 
 pub use cpu::Cpu;
 pub use cpu::registers::{Registers, Status};

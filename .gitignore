@@ -24,3 +24,9 @@ target
 # Added by cargo
 
 /target
+
+# Python
+.venv/
+__pycache__/
+*.pyd
+dist/
