@@ -10,7 +10,12 @@ class BusLike(Protocol):
     Every function below that takes a bus accepts either a `Memory` (fast,
     the whole call stays in Rust) or any Python object implementing this
     protocol (e.g. for memory-mapped IO). Exceptions raised inside `read`/
-    `write` propagate out of the CPU call that triggered them.
+    `write` propagate out of the CPU call that triggered them, after the
+    current instruction finishes against a bus that reads as 0 and drops
+    writes — so CPU state reflects that partial execution.
+
+    This protocol exists only in the type stubs for annotation purposes;
+    it is not importable from `remu` at runtime.
     """
 
     def read(self, addr: int) -> int: ...
@@ -91,8 +96,11 @@ class Cpu:
     def run(self, bus: BusLike, instructions: int) -> int:
         """Execute up to `instructions` instructions entirely in Rust.
 
-        Stops early if the CPU jams or a bus callback raises. Returns the
-        number of instructions actually executed.
+        Stops early if the CPU jams or a bus callback raises (the aborted
+        instruction is included in the count). Returns the number of
+        instructions actually executed. Every 64 Ki instructions the loop
+        polls signals (Ctrl-C raises KeyboardInterrupt) and briefly releases
+        the GIL so other Python threads can run.
         """
 
     def set_irq(self, level: bool) -> None:

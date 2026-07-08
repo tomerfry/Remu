@@ -138,9 +138,15 @@ pub struct PyMemory {
 }
 
 fn normalize_index(index: &Bound<'_, PyAny>) -> PyResult<usize> {
+    if !index.is_instance_of::<pyo3::types::PyInt>() {
+        return Err(PyTypeError::new_err(
+            "memory indices must be integers or slices",
+        ));
+    }
+    // An int that doesn't fit isize is out of range like any other (list semantics).
     let i: isize = index
         .extract()
-        .map_err(|_| PyTypeError::new_err("memory indices must be integers or slices"))?;
+        .map_err(|_| PyIndexError::new_err("address out of range (0..=0xFFFF)"))?;
     let i = if i < 0 { i + ADDRESS_SPACE } else { i };
     if !(0..ADDRESS_SPACE).contains(&i) {
         return Err(PyIndexError::new_err("address out of range (0..=0xFFFF)"));
@@ -279,7 +285,9 @@ impl PyCpu {
     }
 
     /// Execute one instruction (or service a pending interrupt). Returns the
-    /// cycles consumed (0 if the CPU is jammed).
+    /// cycles consumed (0 if the CPU is jammed). If a bus callback raises, the
+    /// exception propagates after the instruction finishes against a bus that
+    /// reads as 0 / drops writes — CPU state reflects that partial execution.
     fn step(&mut self, bus: &Bound<'_, PyAny>) -> PyResult<u8> {
         let mut b = BusArg::from_any(bus)?;
         let cycles = self.inner.step(&mut b);
@@ -288,28 +296,46 @@ impl PyCpu {
     }
 
     /// Execute up to `instructions` instructions, stopping early if the CPU
-    /// jams (KIL) or a Python bus callback raises. Returns the number of
-    /// instructions actually executed. The whole loop runs in Rust, so this is
-    /// the fast way to drive the CPU from Python.
+    /// jams (KIL) or a Python bus callback raises (the aborted instruction is
+    /// included in the count; see `step` for its bus semantics). Returns the
+    /// number of instructions actually executed. The hot loop runs in Rust,
+    /// so this is the fast way to drive the CPU from Python.
+    ///
+    /// Every 64 Ki instructions the loop polls for signals (Ctrl-C raises
+    /// `KeyboardInterrupt` instead of spinning to the budget) and briefly
+    /// releases the GIL so other Python threads aren't starved.
     fn run(&mut self, bus: &Bound<'_, PyAny>, instructions: u64) -> PyResult<u64> {
-        let mut b = BusArg::from_any(bus)?;
+        /// Chunk size: rare enough to cost nothing (~200 µs of emulation),
+        /// frequent enough that Ctrl-C and waiting threads feel it instantly.
+        const CHUNK: u64 = 0x10000;
+
+        let py = bus.py();
         let mut executed: u64 = 0;
-        match &mut b {
-            BusArg::Flat(m) => {
-                let mem = &mut m.inner;
-                while executed < instructions && !self.inner.halted {
-                    self.inner.step(mem);
-                    executed += 1;
+        while executed < instructions && !self.inner.halted {
+            let target = (instructions - executed).min(CHUNK);
+            // Re-borrowed each chunk so the borrow is dropped before detaching.
+            let mut b = BusArg::from_any(bus)?;
+            let mut n: u64 = 0;
+            match &mut b {
+                BusArg::Flat(m) => {
+                    let mem = &mut m.inner;
+                    while n < target && !self.inner.halted {
+                        self.inner.step(mem);
+                        n += 1;
+                    }
+                }
+                BusArg::Callback(c) => {
+                    while n < target && !self.inner.halted && c.error.is_none() {
+                        self.inner.step(c);
+                        n += 1;
+                    }
                 }
             }
-            BusArg::Callback(c) => {
-                while executed < instructions && !self.inner.halted && c.error.is_none() {
-                    self.inner.step(c);
-                    executed += 1;
-                }
-            }
+            executed += n;
+            b.check()?;
+            py.check_signals()?;
+            py.detach(|| {});
         }
-        b.check()?;
         Ok(executed)
     }
 

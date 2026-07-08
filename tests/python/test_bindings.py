@@ -49,6 +49,8 @@ class TestMemory:
         mem = remu.Memory()
         with pytest.raises(IndexError):
             mem[0x10000]
+        with pytest.raises(IndexError):
+            mem[2**70]  # doesn't fit a machine word, still an IndexError
         with pytest.raises(TypeError):
             mem["nope"]
 
@@ -135,6 +137,24 @@ class TestCpu:
         assert executed < 1000  # stopped at the jam, not the budget
         # further stepping is a no-op
         assert cpu.step(mem) == 0
+
+    def test_run_is_interruptible(self):
+        # An infinite loop: JMP $0600. interrupt_main() sets the same flag as
+        # Ctrl-C; the timer thread can only deliver it if run() periodically
+        # releases the GIL, and run() must then notice it instead of spinning
+        # to the budget. The budget bounds the test if that ever regresses.
+        import threading
+        import _thread
+
+        mem = make_program(b"\x4C\x00\x06")
+        cpu = booted_cpu(mem)
+        timer = threading.Timer(0.1, _thread.interrupt_main)
+        timer.start()
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                cpu.run(mem, 10**10)
+        finally:
+            timer.cancel()
 
     def test_run_respects_instruction_budget(self):
         mem = make_program(b"\xEA" * 32)  # NOPs

@@ -28,7 +28,8 @@ The same core is exposed as a Python extension module (PyO3 + maturin, ships
 with type stubs):
 
 ```sh
-python -m venv .venv && .venv/Scripts/activate
+python -m venv .venv
+source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install maturin
 maturin develop --release
 ```
