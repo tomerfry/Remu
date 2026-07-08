@@ -179,6 +179,85 @@ fn php_plp_b_and_u_bits() {
 }
 
 #[test]
+fn nmi_latches_on_falling_edge_and_services_once() {
+    let (mut cpu, mut mem) = setup(&[0xEA, 0xEA, 0xEA]); // NOPs
+    mem.load(0xFFFA, &[0x00, 0x80]); // NMI vector -> $8000
+    mem.load(0x8000, &[0xEA, 0xEA]); // NOPs at the handler
+
+    cpu.set_nmi(true); // line idle (high): no edge
+    cpu.step(&mut mem);
+    assert_eq!(cpu.regs.pc, 0x0601);
+
+    cpu.set_nmi(false); // high -> low: latch the NMI
+    let cycles = cpu.step(&mut mem);
+    assert_eq!(cpu.regs.pc, 0x8000);
+    assert_eq!(cycles, 7);
+
+    // Holding the line low does not retrigger — edge, not level.
+    cpu.set_nmi(false);
+    cpu.step(&mut mem);
+    assert_eq!(cpu.regs.pc, 0x8001);
+}
+
+#[test]
+fn irq_is_masked_by_i_flag_and_pushes_b_clear() {
+    let (mut cpu, mut mem) = setup(&[0x58, 0xEA]); // CLI; NOP
+    mem.load(0xFFFE, &[0x00, 0x90]); // IRQ vector -> $9000
+    mem.load(0x9000, &[0xEA]);
+
+    cpu.set_irq(true);
+    cpu.step(&mut mem); // I is set from reset: IRQ stays masked, CLI runs
+    assert_eq!(cpu.regs.pc, 0x0601);
+
+    let sp_before = cpu.regs.sp;
+    let cycles = cpu.step(&mut mem); // now unmasked: serviced before the NOP
+    assert_eq!(cpu.regs.pc, 0x9000);
+    assert_eq!(cycles, 7);
+    assert!(cpu.regs.p.contains(Status::I)); // I set on entry
+
+    // Hardware interrupts push the status with B clear (unlike BRK/PHP).
+    let pushed_p = mem.read(0x0100 | sp_before.wrapping_sub(2) as u16);
+    assert_eq!(pushed_p & 0b0001_0000, 0);
+    cpu.set_irq(false);
+}
+
+#[test]
+fn brk_rti_round_trip() {
+    let (mut cpu, mut mem) = setup(&[0x00, 0xFF, 0xEA]); // BRK; padding; NOP
+    mem.load(0xFFFE, &[0x00, 0x90]); // IRQ/BRK vector -> $9000
+    mem.load(0x9000, &[0x40]); // RTI
+    cpu.regs.p.remove(Status::I);
+    let sp_before = cpu.regs.sp;
+
+    cpu.step(&mut mem); // BRK
+    assert_eq!(cpu.regs.pc, 0x9000);
+    assert!(cpu.regs.p.contains(Status::I));
+
+    // BRK pushes the status with B set, and a return address that skips the
+    // padding byte ($0602).
+    let pushed_p = mem.read(0x0100 | sp_before.wrapping_sub(2) as u16);
+    assert_ne!(pushed_p & 0b0001_0000, 0);
+    let lo = mem.read(0x0100 | sp_before.wrapping_sub(1) as u16) as u16;
+    let hi = mem.read(0x0100 | sp_before as u16) as u16;
+    assert_eq!((hi << 8) | lo, 0x0602);
+
+    cpu.step(&mut mem); // RTI
+    assert_eq!(cpu.regs.pc, 0x0602);
+    assert_eq!(cpu.regs.sp, sp_before);
+    assert!(!cpu.regs.p.contains(Status::I)); // pre-BRK status restored
+}
+
+#[test]
+fn kil_halts_the_cpu() {
+    let (mut cpu, mut mem) = setup(&[0x02]); // KIL
+    cpu.step(&mut mem);
+    assert!(cpu.halted);
+    let pc = cpu.regs.pc;
+    assert_eq!(cpu.step(&mut mem), 0); // stays halted, no state changes
+    assert_eq!(cpu.regs.pc, pc);
+}
+
+#[test]
 fn stack_push_pull_wraps() {
     // PHA then PLA round-trips the accumulator and restores SP.
     let (mut cpu, mut mem) = setup(&[0x48, 0xA9, 0x00, 0x68]); // PHA; LDA #$00; PLA

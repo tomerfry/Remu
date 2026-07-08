@@ -184,6 +184,12 @@ class TestCpu:
         cpu.step(mem)
         assert cpu.pc == 0xA000
 
+        mem[0xFFFA:0xFFFC] = b"\x00\xB0"  # NMI vector -> $B000
+        cpu.set_nmi(True)  # deasserted (line idles high)
+        cpu.set_nmi(False)  # asserting high->low edge latches the NMI
+        cpu.step(mem)
+        assert cpu.pc == 0xB000
+
     def test_repr(self):
         cpu = remu.Cpu()
         text = repr(cpu)

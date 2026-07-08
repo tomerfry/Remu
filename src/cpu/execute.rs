@@ -89,8 +89,7 @@ impl Cpu {
 
             // Jumps / subroutines
             JMP => { self.regs.pc = m.addr; 0 }
-            // JSR is handled directly in `step()` because of its quirky access order.
-            JSR => unreachable!("JSR is handled in Cpu::step"),
+            JSR => { self.jsr(bus); 0 }
             RTS => { self.rts(bus); 0 }
 
             // System
@@ -248,6 +247,20 @@ impl Cpu {
         if m.page_crossed { 2 } else { 1 }
     }
 
+    /// JSR interleaves its operand fetch with the stack pushes: it fetches the
+    /// target low byte, pushes the return address, and only *then* fetches the
+    /// high byte. If the operand lives in the stack page, the push overwrites the
+    /// high byte before it's read — a real hardware quirk the Tom Harte suite
+    /// exercises.
+    fn jsr<B: Bus>(&mut self, bus: &mut B) {
+        let lo = self.fetch_byte(bus) as u16; // PC now points at the high byte
+        let ret = self.regs.pc; // address of the last JSR byte (RTS adds 1)
+        self.push(bus, (ret >> 8) as u8);
+        self.push(bus, ret as u8);
+        let hi = self.read(bus, self.regs.pc) as u16;
+        self.regs.pc = (hi << 8) | lo;
+    }
+
     fn rts<B: Bus>(&mut self, bus: &mut B) {
         let lo = self.pull(bus) as u16;
         let hi = self.pull(bus) as u16;
@@ -257,12 +270,7 @@ impl Cpu {
     fn brk<B: Bus>(&mut self, bus: &mut B) {
         // BRK has a padding byte: the pushed PC skips it.
         self.regs.pc = self.regs.pc.wrapping_add(1);
-        let pc = self.regs.pc;
-        self.push(bus, (pc >> 8) as u8);
-        self.push(bus, pc as u8);
-        self.push_status(bus, true);
-        self.regs.p.insert(Status::I);
-        self.regs.pc = bus.read_u16(IRQ_VECTOR);
+        self.service_interrupt(bus, IRQ_VECTOR, true);
     }
 
     fn rti<B: Bus>(&mut self, bus: &mut B) {

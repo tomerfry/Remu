@@ -107,7 +107,10 @@ class Cpu:
         """Set the IRQ line level (level-triggered)."""
 
     def set_nmi(self, level: bool) -> None:
-        """Set the NMI line level (low->high latches an NMI)."""
+        """Set the NMI line level.
+
+        The line idles high; a high->low (asserting) edge latches an NMI.
+        """
 
     def trigger_nmi(self) -> None:
         """Directly latch a pending NMI."""

@@ -344,7 +344,8 @@ impl PyCpu {
         self.inner.set_irq(level);
     }
 
-    /// Set the NMI line level (a low→high transition latches an NMI).
+    /// Set the NMI line level; the line idles high, and a high→low
+    /// (asserting) edge latches an NMI.
     fn set_nmi(&mut self, level: bool) {
         self.inner.set_nmi(level);
     }

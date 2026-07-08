@@ -16,8 +16,11 @@ pub fn disassemble<B: Bus>(bus: &mut B, addr: u16) -> (String, u16) {
     let info = OPCODES[opcode as usize];
     let mnemonic = format!("{:?}", info.operation);
 
-    let b1 = bus.read(addr.wrapping_add(1));
-    let b2 = bus.read(addr.wrapping_add(2));
+    // Read only the operand bytes the instruction actually has: bus reads can
+    // have device side effects, so a phantom read would perturb the traced run.
+    let len = info.length();
+    let b1 = if len >= 2 { bus.read(addr.wrapping_add(1)) } else { 0 };
+    let b2 = if len >= 3 { bus.read(addr.wrapping_add(2)) } else { 0 };
     let word = (b1 as u16) | ((b2 as u16) << 8);
 
     let operand = match info.mode {
@@ -27,7 +30,7 @@ pub fn disassemble<B: Bus>(bus: &mut B, addr: u16) -> (String, u16) {
         ZeroPage => format!("${:02X}", b1),
         ZeroPageX => format!("${:02X},X", b1),
         ZeroPageY => format!("${:02X},Y", b1),
-        Absolute => format!("${:04X}", word),
+        Absolute | JsrAbsolute => format!("${:04X}", word),
         AbsoluteX => format!("${:04X},X", word),
         AbsoluteY => format!("${:04X},Y", word),
         Indirect => format!("(${:04X})", word),
