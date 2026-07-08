@@ -164,7 +164,7 @@ const fn build_table() -> [OpInfo; 256] {
     // --- JMP / JSR ---
     t[0x4C] = op(JMP, Absolute, 3, false);
     t[0x6C] = op(JMP, Indirect, 5, false);
-    t[0x20] = op(JSR, Absolute, 6, false);
+    t[0x20] = op(JSR, JsrAbsolute, 6, false);
 
     // --- LDA ---
     t[0xA9] = op(LDA, Immediate, 2, false);

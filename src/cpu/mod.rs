@@ -43,7 +43,7 @@ impl Cpu {
             cycles: 0,
             halted: false,
             nmi_pending: false,
-            prev_nmi: false,
+            prev_nmi: true, // the NMI line idles high (deasserted)
             irq_line: false,
         }
     }
@@ -83,22 +83,6 @@ impl Cpu {
         let opcode = self.fetch_byte(bus);
         let info = OPCODES[opcode as usize];
 
-        // JSR interleaves operand fetch with the stack pushes, so it can't use the
-        // generic Absolute resolver: it fetches the target low byte, pushes the
-        // return address, and only *then* fetches the high byte. If the operand
-        // lives in the stack page, the push overwrites the high byte before it's
-        // read — a real hardware quirk the Tom Harte suite exercises.
-        if let opcodes::Operation::JSR = info.operation {
-            let lo = self.fetch_byte(bus) as u16; // PC now points at the high byte
-            let ret = self.regs.pc; // address of the last JSR byte (RTS adds 1)
-            self.push(bus, (ret >> 8) as u8);
-            self.push(bus, ret as u8);
-            let hi = self.read(bus, self.regs.pc) as u16;
-            self.regs.pc = (hi << 8) | lo;
-            self.cycles += info.cycles as u64;
-            return info.cycles;
-        }
-
         let operand = self.resolve(bus, info.mode);
 
         let extra = self.execute(bus, &info, &operand);
@@ -117,13 +101,13 @@ impl Cpu {
 
     /// Update the NMI input line, latching a pending NMI on a high→low edge.
     pub fn set_nmi(&mut self, level: bool) {
-        if level && !self.prev_nmi {
+        if self.prev_nmi && !level {
             self.nmi_pending = true;
         }
         self.prev_nmi = level;
     }
 
-    /// Directly latch a pending NMI (convenience for `set_nmi(true)` edges).
+    /// Directly latch a pending NMI (convenience for a `set_nmi` high→low edge).
     pub fn trigger_nmi(&mut self) {
         self.nmi_pending = true;
     }
@@ -209,7 +193,7 @@ impl Cpu {
     }
 
     /// Push `PC` and `P` and vector through `vector`, setting the `I` flag. Used
-    /// for hardware IRQ/NMI (`with_b == false`).
+    /// for hardware IRQ/NMI (`with_b == false`) and `BRK` (`with_b == true`).
     fn service_interrupt<B: Bus>(&mut self, bus: &mut B, vector: u16, with_b: bool) {
         let pc = self.regs.pc;
         self.push(bus, (pc >> 8) as u8);

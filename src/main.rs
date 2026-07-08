@@ -33,16 +33,34 @@ fn main() -> ExitCode {
         match args[i].as_str() {
             "--load" => {
                 i += 1;
-                load_addr = parse_hex(args.get(i));
+                load_addr = match parse_hex("--load", args.get(i)) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
             }
             "--start" => {
                 i += 1;
-                start_addr = Some(parse_hex(args.get(i)));
+                start_addr = match parse_hex("--start", args.get(i)) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
             }
             "--trace" => trace = true,
             "--steps" => {
                 i += 1;
-                max_steps = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(max_steps);
+                max_steps = match args.get(i).and_then(|s| s.parse().ok()) {
+                    Some(n) => n,
+                    None => {
+                        eprintln!("--steps requires a decimal step count");
+                        return ExitCode::FAILURE;
+                    }
+                };
             }
             other => {
                 eprintln!("unknown argument: {other}");
@@ -70,7 +88,9 @@ fn main() -> ExitCode {
 
     for _ in 0..max_steps {
         if cpu.halted {
-            println!("halted (KIL) at ${:04X} after {} cycles", cpu.regs.pc, cpu.cycles);
+            // PC has already advanced past the KIL opcode byte.
+            let jam_addr = cpu.regs.pc.wrapping_sub(1);
+            println!("halted (KIL) at ${jam_addr:04X} after {} cycles", cpu.cycles);
             break;
         }
         if trace {
@@ -86,7 +106,8 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn parse_hex(s: Option<&String>) -> u16 {
-    s.and_then(|s| u16::from_str_radix(s.trim_start_matches("0x").trim_start_matches('$'), 16).ok())
-        .unwrap_or(0)
+fn parse_hex(flag: &str, s: Option<&String>) -> Result<u16, String> {
+    let s = s.ok_or_else(|| format!("{flag} requires a hex address"))?;
+    u16::from_str_radix(s.trim_start_matches("0x").trim_start_matches('$'), 16)
+        .map_err(|_| format!("{flag}: invalid hex address `{s}`"))
 }

@@ -31,6 +31,9 @@ pub enum AddressingMode {
     AbsoluteY,
     /// Indirect, used only by `JMP ($nnnn)` — includes the page-boundary bug.
     Indirect,
+    /// `JSR`'s absolute target: the handler fetches it itself, interleaved with
+    /// the stack pushes, so `resolve` leaves `PC` untouched.
+    JsrAbsolute,
     /// Indexed indirect `($nn,X)`: add X to the zero-page pointer, then deref.
     IndexedIndirect,
     /// Indirect indexed `($nn),Y`: deref the zero-page pointer, then add Y.
@@ -47,7 +50,7 @@ impl AddressingMode {
             Implied | Accumulator => 1,
             Immediate | ZeroPage | ZeroPageX | ZeroPageY | IndexedIndirect
             | IndirectIndexed | Relative => 2,
-            Absolute | AbsoluteX | AbsoluteY | Indirect => 3,
+            Absolute | AbsoluteX | AbsoluteY | Indirect | JsrAbsolute => 3,
         }
     }
 }
@@ -76,6 +79,9 @@ impl Cpu {
         use AddressingMode::*;
         match mode {
             Implied | Accumulator => Operand::at(0),
+
+            // JSR fetches its own operand (see `Cpu::jsr`).
+            JsrAbsolute => Operand::at(0),
 
             Immediate => {
                 let addr = self.regs.pc;
@@ -115,7 +121,7 @@ impl Cpu {
                 // start of the same page instead.
                 let ptr = self.fetch_word(bus);
                 let lo = self.read(bus, ptr) as u16;
-                let hi = self.read(bus, (ptr & 0xFF00) | ((ptr + 1) & 0x00FF)) as u16;
+                let hi = self.read(bus, (ptr & 0xFF00) | (ptr.wrapping_add(1) & 0x00FF)) as u16;
                 Operand::at(lo | (hi << 8))
             }
 
