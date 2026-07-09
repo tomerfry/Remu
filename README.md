@@ -1,7 +1,8 @@
 # Remu
 
-A CPU emulation framework in Rust, starting with a cycle-conscious MOS 6502
-interpreter. Goals: realistic emulation, and emulation speed to the MAXIMUM.
+A CPU emulation framework in Rust with cycle-conscious interpreters for the
+MOS 6502 and the Intel 8086/8088. Goals: realistic emulation, and emulation
+speed to the MAXIMUM.
 
 ## Rust
 
@@ -18,9 +19,32 @@ cpu.step(&mut mem);
 assert_eq!(cpu.regs.a, 0x42);
 ```
 
+The 8086 core lives in `remu::x86` — 16-bit real mode, the full documented
+instruction set plus the well-known undocumented encodings (`POP CS`, `SALC`,
+`SETMO`, …), validated against the
+[SingleStepTests 8088](https://github.com/SingleStepTests/8088) suite:
+
+```rust
+use remu::x86::{Cpu, LinearMemory};
+
+let mut mem = LinearMemory::new();          // flat 1 MiB real-mode space
+mem.load(0x0_0100, &[0xB8, 0x34, 0x12]);    // MOV AX, 0x1234
+
+let mut cpu = Cpu::new();
+cpu.regs.cs = 0x0000;
+cpu.regs.ip = 0x0100;
+cpu.step(&mut mem);
+assert_eq!(cpu.regs.ax, 0x1234);
+```
+
 ```sh
 cargo test
 ```
+
+To run the exhaustive per-opcode hardware suites (data not vendored), point
+`REMU_HARTE_DIR` at a `SingleStepTests/65x02` `6502/v1` checkout and/or
+`REMU_HARTE_8088_DIR` at a `SingleStepTests/8088` `v2` checkout, then
+`cargo test --release`.
 
 ## Python
 
