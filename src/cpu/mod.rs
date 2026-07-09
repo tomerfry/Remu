@@ -3,13 +3,13 @@
 
 pub mod addressing;
 pub mod disasm;
+mod dispatch;
 mod execute;
 pub mod opcodes;
 pub mod registers;
 
 use crate::bus::Bus;
 use crate::interrupt::{INTERRUPT_CYCLES, IRQ_VECTOR, NMI_VECTOR, RESET_VECTOR};
-use opcodes::OPCODES;
 use registers::{Registers, Status};
 
 /// A 6502 processor.
@@ -80,18 +80,10 @@ impl Cpu {
             return INTERRUPT_CYCLES;
         }
 
+        // Fetch the opcode, then jump straight to its pre-specialized code path
+        // (fused decode+execute; see the `dispatch` module).
         let opcode = self.fetch_byte(bus);
-        let info = OPCODES[opcode as usize];
-
-        let operand = self.resolve(bus, info.mode);
-
-        let extra = self.execute(bus, &info, &operand);
-
-        let mut cycles = info.cycles;
-        if info.page_penalty && operand.page_crossed {
-            cycles += 1;
-        }
-        cycles += extra;
+        let cycles = dispatch::dispatch(self, bus, opcode);
 
         self.cycles += cycles as u64;
         cycles

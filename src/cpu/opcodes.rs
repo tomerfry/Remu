@@ -55,7 +55,10 @@ const fn op(operation: Operation, mode: AddressingMode, cycles: u8, page_penalty
 /// The decode table: index by opcode byte to get its [`OpInfo`].
 ///
 /// Unfilled entries are illegal/undocumented opcodes, left as `KIL` for now.
-pub static OPCODES: [OpInfo; 256] = build_table();
+///
+/// A `const` (not `static`) so the fused dispatch handlers can evaluate their
+/// entry at compile time.
+pub const OPCODES: [OpInfo; 256] = build_table();
 
 const fn build_table() -> [OpInfo; 256] {
     use AddressingMode::*;

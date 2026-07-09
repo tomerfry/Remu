@@ -14,7 +14,11 @@ use crate::interrupt::IRQ_VECTOR;
 
 impl Cpu {
     /// Dispatch one decoded instruction. Returns extra cycles (branch penalties).
-    pub(crate) fn execute<B: Bus>(&mut self, bus: &mut B, info: &OpInfo, m: &Operand) -> u8 {
+    ///
+    /// `inline(always)`: the fused dispatch handlers call this with `info` a
+    /// compile-time constant, and inlining lets the `match` fold to one arm.
+    #[inline(always)]
+    pub(crate) fn execute<B: Bus>(&mut self, bus: &mut B, info: OpInfo, m: &Operand) -> u8 {
         use Operation::*;
         match info.operation {
             // Loads

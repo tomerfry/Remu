@@ -75,6 +75,10 @@ impl Operand {
 
 impl Cpu {
     /// Resolve the operand for `mode`, advancing `PC` past the operand bytes.
+    ///
+    /// `inline(always)`: the fused dispatch handlers call this with `mode` a
+    /// compile-time constant, and inlining lets the `match` fold to one arm.
+    #[inline(always)]
     pub(crate) fn resolve<B: Bus>(&mut self, bus: &mut B, mode: AddressingMode) -> Operand {
         use AddressingMode::*;
         match mode {
