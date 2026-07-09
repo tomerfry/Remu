@@ -1,0 +1,27 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "remu"
+description = "Python bindings for Remu — a fast MOS 6502 emulation framework in Rust"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+keywords = ["6502", "emulator", "emulation", "cpu", "retro"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: System :: Emulators",
+]
+# Version comes from Cargo.toml.
+dynamic = ["version"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.maturin]
+# `python` gates the PyO3 code in the crate; `extension-module` is enabled here
+# (not in Cargo.toml) so plain `cargo test` never links against libpython.
+features = ["python", "pyo3/extension-module"]
+module-name = "remu"

@@ -6,13 +6,19 @@ edition = "2024"
 [lib]
 name = "remu"
 path = "src/lib.rs"
+# `cdylib` is only used when building the Python extension via maturin; plain
+# cargo builds/tests use the rlib.
+crate-type = ["rlib", "cdylib"]
 
 [[bin]]
-name = "remu"
+# Named distinctly from the lib: with `crate-type = ["cdylib", ...]` both
+# targets would otherwise emit colliding `remu.pdb` files on MSVC.
+name = "remu-cli"
 path = "src/main.rs"
 
 [dependencies]
 bitflags = "2"
+pyo3 = { version = "0.29.0", features = ["abi3-py39"], optional = true }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -20,3 +26,9 @@ serde_json = "1"
 
 [profile.release]
 debug = true
+
+[features]
+# Python bindings (PyO3). Off by default so `cargo build`/`cargo test` never
+# touch libpython; maturin enables it (plus `pyo3/extension-module`) — see
+# pyproject.toml.
+python = ["dep:pyo3"]
