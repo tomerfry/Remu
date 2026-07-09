@@ -1,11 +1,12 @@
 //! # Remu
 //!
-//! An emulation framework, starting with a cycle-conscious interpreter for the
-//! MOS 6502 / 65xx CPU.
+//! An emulation framework with cycle-conscious interpreters for the MOS 6502 /
+//! 65xx CPU ([`cpu`]) and the Intel 8086/8088 ([`x86`]).
 //!
-//! The design keeps the CPU decoupled from memory and devices behind the
-//! [`Bus`](bus::Bus) trait, so the same core powers unit tests, integration
-//! images, and (eventually) full emulated machines.
+//! The design keeps each CPU decoupled from memory and devices behind a bus
+//! trait ([`bus::Bus`] for the 6502, [`x86::Bus`] for the 8086), so the same
+//! cores power unit tests, integration images, and (eventually) full emulated
+//! machines.
 //!
 //! ```
 //! use remu::{Cpu, memory::FlatMemory, bus::Bus};
@@ -24,6 +25,7 @@ pub mod bus;
 pub mod cpu;
 pub mod interrupt;
 pub mod memory;
+pub mod x86;
 #[cfg(feature = "python")]
 mod python;
 
