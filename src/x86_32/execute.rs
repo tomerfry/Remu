@@ -1661,6 +1661,15 @@ impl Cpu {
             if cmp && self.regs.eflags.contains(EFlags::ZF) != cont_on_zf {
                 break;
             }
+            // Hardware recognizes interrupts between iterations; with a
+            // 32-bit address size a single REP can run for 2^32 of them, so
+            // yield by rewinding EIP to the prefix. The next `step()` takes
+            // the interrupt, and the handler's IRET resumes the REP with the
+            // already-decremented (E)CX and index registers.
+            if self.count_reg() != 0 && self.interrupt_pending() {
+                self.regs.eip = self.start_eip;
+                break;
+            }
         }
         Ok(cycles)
     }

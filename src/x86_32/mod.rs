@@ -239,6 +239,20 @@ impl Exception {
 /// Result type for anything that can raise a CPU exception.
 pub(crate) type Exec<T> = Result<T, Exception>;
 
+/// How an interrupt or exception reached the delivery path. This selects the
+/// gate privilege check (`INT n` requires gate DPL >= CPL), the `EXT` bit of
+/// any error code generated during delivery, and the double-fault
+/// classification of the event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Event {
+    /// A processor-detected exception (fault, trap or abort).
+    Fault,
+    /// `INT n`, `INT3`, `INTO` or `ICEBP`.
+    SoftInt,
+    /// A hardware interrupt or NMI.
+    External,
+}
+
 /// Cycles consumed by servicing a hardware interrupt (real-mode figure).
 const INTERRUPT_CYCLES: u32 = 37;
 
@@ -317,6 +331,12 @@ pub struct Cpu {
     commit_on_fault: bool,
     /// Bytes consumed by the current instruction (15-byte limit).
     ilen: u8,
+    /// Forces paging to treat the current access as a supervisor access
+    /// regardless of CPL. The 386 performs its *implicit* accesses — reads of
+    /// the descriptor tables, the IDT and the TSS, the accessed/busy bit
+    /// writebacks, and the frame pushes onto an inner-privilege stack — with
+    /// supervisor privilege even while CPL is still 3.
+    supervisor_override: bool,
     /// TLB for paged address translation (see `paging.rs`).
     tlb: paging::Tlb,
 }
@@ -342,6 +362,7 @@ impl Cpu {
             start_eip: 0,
             commit_on_fault: false,
             ilen: 0,
+            supervisor_override: false,
             tlb: paging::Tlb::new(),
         }
     }
@@ -355,6 +376,7 @@ impl Cpu {
         self.nmi_pending = false;
         self.intr = None;
         self.inhibit_interrupts = false;
+        self.supervisor_override = false;
         self.tlb.flush();
     }
 
@@ -406,7 +428,7 @@ impl Cpu {
                         vector: 2,
                         error: None,
                     },
-                    false,
+                    Event::External,
                 );
                 self.cycles += INTERRUPT_CYCLES as u64;
                 return INTERRUPT_CYCLES;
@@ -422,7 +444,7 @@ impl Cpu {
                         vector,
                         error: None,
                     },
-                    false,
+                    Event::External,
                 );
                 self.cycles += INTERRUPT_CYCLES as u64;
                 return INTERRUPT_CYCLES;
@@ -456,7 +478,7 @@ impl Cpu {
                     self.regs.eflags = eflags;
                     self.regs.cr2 = cr2;
                 }
-                self.deliver(bus, e, false);
+                self.deliver(bus, e, Event::Fault);
                 INTERRUPT_CYCLES
             }
         };
@@ -468,7 +490,7 @@ impl Cpu {
                     vector: 1,
                     error: None,
                 },
-                false,
+                Event::Fault,
             );
             cycles += INTERRUPT_CYCLES;
         }
@@ -486,6 +508,7 @@ impl Cpu {
         self.lock = false;
         self.lock_ok = false;
         self.commit_on_fault = false;
+        self.supervisor_override = false;
         let db = self.regs.seg[reg::CS as usize].db();
         self.osize32 = db;
         self.asize32 = db;
@@ -557,6 +580,14 @@ impl Cpu {
     /// Deassert the INTR line.
     pub fn clear_intr(&mut self) {
         self.intr = None;
+    }
+
+    /// Whether an interrupt would be taken at the next instruction boundary.
+    /// Long `REP` string operations poll this between iterations so they stay
+    /// interruptible, as on hardware.
+    #[inline]
+    pub(crate) fn interrupt_pending(&self) -> bool {
+        self.nmi_pending || (self.intr.is_some() && self.regs.eflags.contains(EFlags::IF))
     }
 
     // --- Segment-relative memory access -------------------------------------
@@ -891,48 +922,104 @@ impl Cpu {
 
     // --- Interrupt and exception delivery --------------------------------------
 
-    /// Deliver exception/interrupt `e` at the current `CS:EIP`. `sw_int` marks
-    /// `INT n`-family traps (affects protected-mode privilege checks). Nested
-    /// delivery failure escalates to double fault, then shutdown.
-    pub(crate) fn deliver<B: Bus>(&mut self, bus: &mut B, e: Exception, sw_int: bool) {
-        match self.raise(bus, e, sw_int) {
-            Ok(()) => (),
-            Err(e2) => {
-                // Double fault, then triple fault → shutdown.
-                let df = Exception {
+    /// Exceptions Intel classifies as *contributory* for double-fault
+    /// detection (SDM Table 6-5). `#PF` forms its own class; every other
+    /// exception — and all external interrupts and `INT n` — is benign.
+    fn contributory(vector: u8) -> bool {
+        matches!(vector, 0 | 10 | 11 | 12 | 13)
+    }
+
+    /// Whether `second`, raised while delivering `first`, escalates to `#DF`.
+    ///
+    /// Only a processor-detected exception can contribute: the vector of an
+    /// external interrupt or `INT n` says nothing about its class, so those
+    /// are always benign and their nested faults are handled serially.
+    fn is_double_fault(first: Exception, class: Event, second: u8) -> bool {
+        if class != Event::Fault {
+            return false;
+        }
+        let first_contributory = Self::contributory(first.vector);
+        let first_page_fault = first.vector == 14;
+        if second == 14 {
+            // Contributory → #PF is handled serially; only #PF → #PF faults.
+            first_page_fault
+        } else if Self::contributory(second) {
+            first_contributory || first_page_fault
+        } else {
+            false
+        }
+    }
+
+    /// Deliver exception/interrupt `e` at the current `CS:EIP`.
+    ///
+    /// A fault raised while delivering `e` is handled serially unless the
+    /// pair forms a double fault; a fault while delivering `#DF` is a triple
+    /// fault and shuts the processor down.
+    pub(crate) fn deliver<B: Bus>(&mut self, bus: &mut B, e: Exception, class: Event) {
+        let (mut current, mut class) = (e, class);
+        let mut in_double_fault = false;
+        // Serial handling terminates on its own (nested vectors are all
+        // contributory or #PF), but bound the chain regardless.
+        for _ in 0..4 {
+            let Err(nested) = self.raise(bus, current, class) else {
+                return;
+            };
+            if in_double_fault {
+                break; // triple fault
+            }
+            if Self::is_double_fault(current, class, nested.vector) {
+                current = Exception {
                     vector: 8,
                     error: Some(0),
                 };
-                let _ = e2;
-                if self.raise(bus, df, false).is_err() {
-                    self.shutdown = true;
-                    self.halted = true;
-                }
+                in_double_fault = true;
+            } else {
+                current = nested;
             }
+            class = Event::Fault;
         }
+        self.shutdown = true;
+        self.halted = true;
     }
 
     /// The fallible part of delivery: real mode uses the IVT at `IDTR.base`;
     /// protected mode — including V86 — goes through the IDT gates (see
     /// `protected.rs`).
-    fn raise<B: Bus>(&mut self, bus: &mut B, e: Exception, sw_int: bool) -> Exec<()> {
-        if self.regs.cr0 & cr0::PE != 0 {
-            self.interrupt_protected(bus, e, sw_int)
+    ///
+    /// Delivery is atomic: if it faults partway through, every register side
+    /// effect is rolled back (CR2 excepted, so a nested `#PF` keeps its
+    /// address) and the nested fault is delivered from the architectural
+    /// state the CPU had before delivery began — otherwise a partially
+    /// applied frame, a cleared `VM`, or a switched stack would leak into the
+    /// handler.
+    pub(crate) fn raise<B: Bus>(&mut self, bus: &mut B, e: Exception, class: Event) -> Exec<()> {
+        let snapshot = self.regs;
+        let sup = self.supervisor_override;
+        let r = if self.regs.cr0 & cr0::PE != 0 {
+            self.interrupt_protected(bus, e, class)
         } else {
-            self.interrupt_real(bus, e.vector)
+            self.interrupt_real(bus, e.vector, class)
+        };
+        self.supervisor_override = sup;
+        if r.is_err() {
+            let cr2 = self.regs.cr2;
+            self.regs = snapshot;
+            self.regs.cr2 = cr2;
         }
+        r
     }
 
     /// Real-mode interrupt: push FLAGS/CS/IP (16-bit), clear IF/TF, and load
     /// `CS:IP` from the vector table described by IDTR.
-    fn interrupt_real<B: Bus>(&mut self, bus: &mut B, vector: u8) -> Exec<()> {
+    fn interrupt_real<B: Bus>(&mut self, bus: &mut B, vector: u8, class: Event) -> Exec<()> {
         let entry = vector as u32 * 4;
         if entry + 3 > self.regs.idtr.limit as u32 {
-            return Err(Exception::gp(vector as u16 * 8 + 2));
+            let ext = (class == Event::External) as u16;
+            return Err(Exception::gp(vector as u16 * 8 + 2 + ext));
         }
         let base = self.regs.idtr.base;
-        let ip = self.lin_read16(bus, base + entry)?;
-        let cs = self.lin_read16(bus, base + entry + 2)?;
+        let ip = self.sys_read16(bus, base.wrapping_add(entry))?;
+        let cs = self.sys_read16(bus, base.wrapping_add(entry + 2))?;
 
         let flags = self.regs.eflags.image16();
         self.push16(bus, flags)?;

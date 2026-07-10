@@ -6,8 +6,8 @@
 //! not implemented: those transfers raise #GP. Everything else — including
 //! entering and leaving V86 mode — is modeled.
 
-use super::registers::{DescTable, EFlags, SegReg, cr0, reg};
-use super::{Bus, Cpu, Exception, Exec};
+use super::registers::{EFlags, Registers, SegReg, cr0, reg};
+use super::{Bus, Cpu, Event, Exception, Exec};
 
 /// A parsed segment/gate descriptor.
 #[derive(Debug, Clone, Copy)]
@@ -102,29 +102,41 @@ impl Descriptor {
 impl Cpu {
     // --- Descriptor tables -----------------------------------------------------
 
-    /// The descriptor table a selector refers to.
-    fn table(&self, sel: u16) -> DescTable {
+    /// The `(base, limit)` of the descriptor table a selector refers to. The
+    /// LDT limit is a full 32-bit byte limit (its descriptor may be page
+    /// granular), unlike the 16-bit GDTR/IDTR limits.
+    fn table(&self, sel: u16) -> (u32, u32) {
         if sel & 4 != 0 {
-            DescTable {
-                base: self.regs.ldtr.base,
-                limit: self.regs.ldtr.limit as u16,
-            }
+            (self.regs.ldtr.base, self.regs.ldtr.limit)
         } else {
-            self.regs.gdtr
+            (self.regs.gdtr.base, self.regs.gdtr.limit as u32)
         }
     }
 
-    /// Read the 8-byte descriptor for `sel`. `err` builds the fault for an
-    /// out-of-range selector (usually #GP, #TS from a TSS, or #NP).
+    /// Read the 8-byte descriptor for `sel`, raising `#GP(sel)` if it lies
+    /// outside its table. Descriptor-table reads are implicit supervisor
+    /// accesses, so they bypass page-level user/supervisor checks.
     pub(crate) fn read_descriptor<B: Bus>(&mut self, bus: &mut B, sel: u16) -> Exec<Descriptor> {
-        let t = self.table(sel);
+        self.read_descriptor_err(bus, sel, Exception::gp)
+    }
+
+    /// [`Cpu::read_descriptor`] with a caller-chosen fault for an
+    /// out-of-range selector — a selector taken from the TSS must raise `#TS`
+    /// rather than `#GP`.
+    fn read_descriptor_err<B: Bus>(
+        &mut self,
+        bus: &mut B,
+        sel: u16,
+        err: fn(u16) -> Exception,
+    ) -> Exec<Descriptor> {
+        let (base, limit) = self.table(sel);
         let index = (sel & 0xFFF8) as u32;
-        if index + 7 > t.limit as u32 {
-            return Err(Exception::gp(sel & 0xFFFC));
+        if index + 7 > limit {
+            return Err(err(sel & 0xFFFC));
         }
-        let addr = t.base.wrapping_add(index);
-        let lo = self.lin_read32(bus, addr)?;
-        let hi = self.lin_read32(bus, addr.wrapping_add(4))?;
+        let addr = base.wrapping_add(index);
+        let lo = self.sys_read32(bus, addr)?;
+        let hi = self.sys_read32(bus, addr.wrapping_add(4))?;
         Ok(Self::parse_descriptor(addr, lo, hi))
     }
 
@@ -150,7 +162,7 @@ impl Cpu {
     fn mark_accessed<B: Bus>(&mut self, bus: &mut B, d: &Descriptor) -> Exec<()> {
         if d.is_code_data() && d.attrs & 1 == 0 {
             let byte = ((d.hi >> 8) & 0xFF) as u8 | 1;
-            self.lin_write8(bus, d.addr.wrapping_add(5), byte)?;
+            self.sys_write8(bus, d.addr.wrapping_add(5), byte)?;
         }
         Ok(())
     }
@@ -422,25 +434,13 @@ impl Cpu {
             }
 
             self.switch_stack(bus, new_ss, new_sp, new_cpl)?;
-            if wide {
-                self.push32(bus, old_ss as u32)?;
-                self.push32(bus, old_sp)?;
-                for i in (0..params).rev() {
-                    self.push32(bus, args[i as usize])?;
-                }
-                let (cs, ip) = (self.regs.seg[reg::CS as usize].sel, self.regs.eip);
-                self.push32(bus, cs as u32)?;
-                self.push32(bus, ip)?;
-            } else {
-                self.push16(bus, old_ss)?;
-                self.push16(bus, old_sp as u16)?;
-                for i in (0..params).rev() {
-                    self.push16(bus, args[i as usize] as u16)?;
-                }
-                let (cs, ip) = (self.regs.seg[reg::CS as usize].sel, self.regs.eip);
-                self.push16(bus, cs)?;
-                self.push16(bus, ip as u16)?;
-            }
+            // CS is still the outer segment, so CPL would misclassify these
+            // pushes to the inner stack as user accesses under paging.
+            let sup = self.supervisor_override;
+            self.supervisor_override = true;
+            let pushed = self.push_gate_frame(bus, wide, old_ss, old_sp, &args, params);
+            self.supervisor_override = sup;
+            pushed?;
             self.load_cs(bus, gsel, &gd, new_cpl)?;
             self.regs.eip = if wide { goff } else { goff & 0xFFFF };
             Ok(())
@@ -460,6 +460,38 @@ impl Cpu {
         }
     }
 
+    /// Push a call-gate return frame (outer SS:SP, copied parameters, then
+    /// CS:IP) onto the freshly switched inner stack.
+    fn push_gate_frame<B: Bus>(
+        &mut self,
+        bus: &mut B,
+        wide: bool,
+        old_ss: u16,
+        old_sp: u32,
+        args: &[u32; 32],
+        params: u32,
+    ) -> Exec<()> {
+        let (cs, ip) = (self.regs.seg[reg::CS as usize].sel, self.regs.eip);
+        if wide {
+            self.push32(bus, old_ss as u32)?;
+            self.push32(bus, old_sp)?;
+            for i in (0..params).rev() {
+                self.push32(bus, args[i as usize])?;
+            }
+            self.push32(bus, cs as u32)?;
+            self.push32(bus, ip)?;
+        } else {
+            self.push16(bus, old_ss)?;
+            self.push16(bus, old_sp as u16)?;
+            for i in (0..params).rev() {
+                self.push16(bus, args[i as usize] as u16)?;
+            }
+            self.push16(bus, cs)?;
+            self.push16(bus, ip as u16)?;
+        }
+        Ok(())
+    }
+
     /// Fetch the inner-stack pointer for privilege level `level` from the
     /// current TSS.
     fn tss_stack<B: Bus>(&mut self, bus: &mut B, level: u8) -> Exec<(u16, u32)> {
@@ -467,20 +499,22 @@ impl Cpu {
         let tss_err = Exception::ts(tr.sel & 0xFFFC);
         let wide = tr.attrs & 0x08 != 0; // type 9/B = 32-bit, 1/3 = 16-bit
         if wide {
+            // ESP at `off`, SS at `off+4`: the last byte read is `off+5`,
+            // which must lie within the limit.
             let off = 4 + level as u32 * 8;
-            if off + 5 > tr.limit.wrapping_add(1) {
+            if off + 5 > tr.limit {
                 return Err(tss_err);
             }
-            let sp = self.lin_read32(bus, tr.base.wrapping_add(off))?;
-            let ss = self.lin_read16(bus, tr.base.wrapping_add(off + 4))?;
+            let sp = self.sys_read32(bus, tr.base.wrapping_add(off))?;
+            let ss = self.sys_read16(bus, tr.base.wrapping_add(off + 4))?;
             Ok((ss, sp))
         } else {
             let off = 2 + level as u32 * 4;
-            if off + 3 > tr.limit.wrapping_add(1) {
+            if off + 3 > tr.limit {
                 return Err(tss_err);
             }
-            let sp = self.lin_read16(bus, tr.base.wrapping_add(off))? as u32;
-            let ss = self.lin_read16(bus, tr.base.wrapping_add(off + 2))?;
+            let sp = self.sys_read16(bus, tr.base.wrapping_add(off))? as u32;
+            let ss = self.sys_read16(bus, tr.base.wrapping_add(off + 2))?;
             Ok((ss, sp))
         }
     }
@@ -494,7 +528,7 @@ impl Cpu {
         if (ss & 3) as u8 != new_cpl {
             return Err(Exception::ts(ss & 0xFFFC));
         }
-        let d = self.read_descriptor(bus, ss)?;
+        let d = self.read_descriptor_err(bus, ss, Exception::ts)?;
         if !d.is_writable_data() || d.dpl() != new_cpl {
             return Err(Exception::ts(ss & 0xFFFC));
         }
@@ -648,10 +682,9 @@ impl Cpu {
         let fl = self.pop(bus)?;
 
         // IRETD from CPL 0 with VM set in the popped image → return to V86.
-        if self.osize32 && fl & EFlags::VM.bits() != 0 {
-            if self.cpl() != 0 {
-                return Err(Exception::gp(0));
-            }
+        // At CPL > 0 the VM bit is simply not writable (it is absent from
+        // `iret_flag_mask`), so the return proceeds as an ordinary one.
+        if self.osize32 && fl & EFlags::VM.bits() != 0 && self.cpl() == 0 {
             return self.iret_to_v86(bus, ip, sel, fl);
         }
 
@@ -686,9 +719,13 @@ impl Cpu {
             let sp = self.pop(bus)?;
             let ss = self.pop(bus)? as u16;
             self.load_cs(bus, sel, &d, rpl)?;
+            // `load_outer_ss` can still fault (#GP/#SS on a bad user stack
+            // selector); commit the popped flag image only once it cannot,
+            // or a fault would enter the handler with the *returned-to*
+            // EFLAGS — the register the fault path deliberately preserves.
+            self.load_outer_ss(bus, ss, sp, rpl)?;
             self.regs.eip = ip;
             self.regs.eflags.load(fl, flag_mask);
-            self.load_outer_ss(bus, ss, sp, rpl)?;
             self.validate_data_segs(rpl);
         } else {
             self.load_cs(bus, sel, &d, rpl)?;
@@ -746,23 +783,31 @@ impl Cpu {
 
     // --- Interrupt delivery through the IDT ------------------------------------------
 
-    /// Protected-mode (and V86) interrupt/exception delivery. `sw` marks the
-    /// `INT n` family, which must satisfy gate DPL >= CPL.
+    /// Protected-mode (and V86) interrupt/exception delivery.
+    ///
+    /// `class` selects the gate DPL check (`INT n` needs gate DPL >= CPL) and
+    /// the `EXT` bit of any error code raised while delivering an external
+    /// interrupt.
     pub(crate) fn interrupt_protected<B: Bus>(
         &mut self,
         bus: &mut B,
         e: Exception,
-        sw: bool,
+        class: Event,
     ) -> Exec<()> {
+        let sw = class == Event::SoftInt;
+        // EXT: the fault was raised while delivering an external event.
+        let ext = (class == Event::External) as u16;
+        let sel_err = |sel: u16| sel & 0xFFFC | ext;
+
         let vector = e.vector;
-        let idt_err = (vector as u16) * 8 + 2;
+        let idt_err = (vector as u16) * 8 + 2 + ext;
         let entry = vector as u32 * 8;
         if entry + 7 > self.regs.idtr.limit as u32 {
             return Err(Exception::gp(idt_err));
         }
         let addr = self.regs.idtr.base.wrapping_add(entry);
-        let lo = self.lin_read32(bus, addr)?;
-        let hi = self.lin_read32(bus, addr.wrapping_add(4))?;
+        let lo = self.sys_read32(bus, addr)?;
+        let hi = self.sys_read32(bus, addr.wrapping_add(4))?;
         let gate = Self::parse_descriptor(addr, lo, hi);
 
         let (trap, wide) = match gate.sys_type() {
@@ -782,22 +827,22 @@ impl Cpu {
 
         let gsel = gate.gate_sel();
         if gsel & 0xFFFC == 0 {
-            return Err(Exception::gp(0));
+            return Err(Exception::gp(ext));
         }
         let gd = self.read_descriptor(bus, gsel)?;
         if !gd.is_code() || gd.dpl() > self.cpl() {
-            return Err(Exception::gp(gsel & 0xFFFC));
+            return Err(Exception::gp(sel_err(gsel)));
         }
         if !gd.present() {
-            return Err(Exception::np(gsel & 0xFFFC));
+            return Err(Exception::np(sel_err(gsel)));
         }
         let goff = gate.gate_off(wide);
         if goff > gd.limit {
-            return Err(Exception::gp(0));
+            return Err(Exception::gp(ext));
         }
 
         if self.regs.eflags.contains(EFlags::VM) {
-            return self.v86_interrupt(bus, e, &gd, gsel, goff, trap, wide);
+            return self.v86_interrupt(bus, e, &gd, gsel, goff, trap, wide, ext);
         }
 
         let cpl = self.cpl();
@@ -807,13 +852,19 @@ impl Cpu {
             let (nss, nsp) = self.tss_stack(bus, new_cpl)?;
             let (oss, osp) = (self.regs.seg[reg::SS as usize].sel, self.stack_ptr());
             self.switch_stack(bus, nss, nsp, new_cpl)?;
-            self.push_int_frame(bus, wide, Some((oss, osp)), e.error)?;
+            // CS still holds the outer segment, so these pushes onto the
+            // inner stack must not be page-checked against the outer CPL.
+            let sup = self.supervisor_override;
+            self.supervisor_override = true;
+            let pushed = self.push_int_frame(bus, wide, Some((oss, osp)), e.error);
+            self.supervisor_override = sup;
+            pushed?;
             self.load_cs(bus, gsel, &gd, new_cpl)?;
         } else if gd.is_conforming() || gd.dpl() == cpl {
             self.push_int_frame(bus, wide, None, e.error)?;
             self.load_cs(bus, gsel, &gd, cpl)?;
         } else {
-            return Err(Exception::gp(gsel & 0xFFFC));
+            return Err(Exception::gp(sel_err(gsel)));
         }
         self.regs.eip = if wide { goff } else { goff & 0xFFFF };
         self.regs
@@ -863,6 +914,44 @@ impl Cpu {
         Ok(())
     }
 
+    /// Push the V86 interrupt frame: the four V86 data selectors, then the
+    /// interrupted SS:SP, EFLAGS, CS:IP and any error code.
+    fn push_v86_frame<B: Bus>(
+        &mut self,
+        bus: &mut B,
+        wide: bool,
+        old: &Registers,
+        osp: u32,
+        error: Option<u16>,
+    ) -> Exec<()> {
+        if wide {
+            for idx in [reg::GS, reg::FS, reg::DS, reg::ES] {
+                self.push32(bus, old.seg[idx as usize].sel as u32)?;
+            }
+            self.push32(bus, old.seg[reg::SS as usize].sel as u32)?;
+            self.push32(bus, osp)?;
+            self.push32(bus, old.eflags.bits() | 2)?;
+            self.push32(bus, old.seg[reg::CS as usize].sel as u32)?;
+            self.push32(bus, old.eip)?;
+            if let Some(err) = error {
+                self.push32(bus, err as u32)?;
+            }
+        } else {
+            for idx in [reg::GS, reg::FS, reg::DS, reg::ES] {
+                self.push16(bus, old.seg[idx as usize].sel)?;
+            }
+            self.push16(bus, old.seg[reg::SS as usize].sel)?;
+            self.push16(bus, osp as u16)?;
+            self.push16(bus, old.eflags.image16())?;
+            self.push16(bus, old.seg[reg::CS as usize].sel)?;
+            self.push16(bus, old.eip as u16)?;
+            if let Some(err) = error {
+                self.push16(bus, err)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Interrupt while in V86 mode: switch to the ring-0 handler, pushing the
     /// V86 segment registers first.
     #[allow(clippy::too_many_arguments)]
@@ -875,16 +964,19 @@ impl Cpu {
         goff: u32,
         trap: bool,
         wide: bool,
+        ext: u16,
     ) -> Exec<()> {
         // The handler must run at ring 0.
         if gd.dpl() != 0 || gd.is_conforming() {
-            return Err(Exception::gp(gsel & 0xFFFC));
+            return Err(Exception::gp(gsel & 0xFFFC | ext));
         }
         let (nss, nsp) = self.tss_stack(bus, 0)?;
         let old = self.regs;
         let osp = self.stack_ptr();
 
-        // Leave V86 before touching the ring-0 stack.
+        // Leaving V86 mode and switching stacks happens before the pushes,
+        // which can still fault; `Cpu::raise` rolls the whole delivery back
+        // in that case, so the nested fault sees VM and the V86 stack intact.
         self.regs
             .eflags
             .remove(EFlags::VM | EFlags::TF | EFlags::RF | EFlags::NT);
@@ -893,31 +985,13 @@ impl Cpu {
         }
         self.switch_stack(bus, nss, nsp, 0)?;
 
-        if wide {
-            for idx in [reg::GS, reg::FS, reg::DS, reg::ES] {
-                self.push32(bus, old.seg[idx as usize].sel as u32)?;
-            }
-            self.push32(bus, old.seg[reg::SS as usize].sel as u32)?;
-            self.push32(bus, osp)?;
-            self.push32(bus, old.eflags.bits() | 2)?;
-            self.push32(bus, old.seg[reg::CS as usize].sel as u32)?;
-            self.push32(bus, old.eip)?;
-            if let Some(err) = e.error {
-                self.push32(bus, err as u32)?;
-            }
-        } else {
-            for idx in [reg::GS, reg::FS, reg::DS, reg::ES] {
-                self.push16(bus, old.seg[idx as usize].sel)?;
-            }
-            self.push16(bus, old.seg[reg::SS as usize].sel)?;
-            self.push16(bus, osp as u16)?;
-            self.push16(bus, old.eflags.image16())?;
-            self.push16(bus, old.seg[reg::CS as usize].sel)?;
-            self.push16(bus, old.eip as u16)?;
-            if let Some(err) = e.error {
-                self.push16(bus, err)?;
-            }
-        }
+        // The ring-0 frame is pushed with supervisor privilege (CS still
+        // holds the V86 code segment, whose CPL is 3).
+        let sup = self.supervisor_override;
+        self.supervisor_override = true;
+        let pushed = self.push_v86_frame(bus, wide, &old, osp, e.error);
+        self.supervisor_override = sup;
+        pushed?;
 
         // The V86 data segments are unusable in the handler.
         for idx in [reg::ES, reg::DS, reg::FS, reg::GS] {
@@ -937,18 +1011,14 @@ impl Cpu {
     /// Software interrupt (INT n / INT3 / INTO / ICEBP): traps report the
     /// *next* instruction, which EIP already points to.
     pub(crate) fn software_int<B: Bus>(&mut self, bus: &mut B, vector: u8) -> Exec<()> {
-        if self.regs.cr0 & cr0::PE == 0 {
-            self.interrupt_real(bus, vector)
-        } else {
-            self.interrupt_protected(
-                bus,
-                Exception {
-                    vector,
-                    error: None,
-                },
-                true,
-            )
-        }
+        self.raise(
+            bus,
+            Exception {
+                vector,
+                error: None,
+            },
+            Event::SoftInt,
+        )
     }
 
     // --- I/O permission ------------------------------------------------------------------
@@ -971,7 +1041,7 @@ impl Cpu {
         if 0x67 > tr.limit {
             return Err(Exception::gp(0));
         }
-        let iobase = self.lin_read16(bus, tr.base.wrapping_add(0x66))? as u32;
+        let iobase = self.sys_read16(bus, tr.base.wrapping_add(0x66))? as u32;
         let first = iobase + (port as u32 >> 3);
         let last = iobase + ((port as u32 + size as u32 - 1) >> 3);
         if last > tr.limit {
@@ -979,7 +1049,7 @@ impl Cpu {
         }
         let mut bits = 0u32;
         for (i, a) in (first..=last).enumerate() {
-            bits |= (self.lin_read8(bus, tr.base.wrapping_add(a))? as u32) << (8 * i);
+            bits |= (self.sys_read8(bus, tr.base.wrapping_add(a))? as u32) << (8 * i);
         }
         let shift = port as u32 & 7;
         let mask = ((1u32 << size) - 1) << shift;

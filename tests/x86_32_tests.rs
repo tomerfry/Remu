@@ -3,7 +3,7 @@
 //! protected-mode plumbing. These give readable failures before reaching for
 //! the exhaustive SingleStepTests suite.
 
-use remu::x86_32::{Cpu, EFlags, LinearMemory, reg};
+use remu::x86_32::{Cpu, DescTable, EFlags, LinearMemory, SegReg, reg};
 
 /// Build a CPU + flat memory with `program` at `0000:1100`, a sane stack and
 /// real-mode defaults (mirrors the SingleStepTests rig conventions).
@@ -681,4 +681,409 @@ fn paging_translation_and_fault() {
     // Error code on the stack: bit0=0 (not present), bit1=1 (write).
     let sp = cpu.regs.gpr[reg::ESP as usize] as usize;
     assert_eq!(mem.ram[sp], 0x02);
+}
+
+// --- Privilege-transition regression tests ------------------------------------
+//
+// These cover the paths the SingleStepTests suite cannot reach (it is real
+// mode only): implicit supervisor accesses under paging, nested-fault
+// classification, V86 delivery, and the TSS/LDT/IRET edge cases.
+
+/// An interrupt/trap gate: `access` is 0x8E (32-bit int), 0x86 (16-bit int),
+/// 0x8F (32-bit trap), plus `0x60` to raise the gate DPL to 3.
+fn gate(offset: u32, sel: u16, access: u8) -> [u8; 8] {
+    [
+        offset as u8,
+        (offset >> 8) as u8,
+        sel as u8,
+        (sel >> 8) as u8,
+        0,
+        access,
+        (offset >> 16) as u8,
+        (offset >> 24) as u8,
+    ]
+}
+
+/// A 32-bit available TSS whose ring-0 stack is `ss0:esp0`.
+fn tss(esp0: u32, ss0: u16) -> [u8; 0x68] {
+    let mut t = [0u8; 0x68];
+    t[4..8].copy_from_slice(&esp0.to_le_bytes());
+    t[8..10].copy_from_slice(&ss0.to_le_bytes());
+    t[0x66] = 0x68; // I/O bitmap base beyond the limit: all ports trap
+    t
+}
+
+/// Load SS with the flat 32-bit data segment (`setup_pm` leaves the
+/// real-mode stack in place, which no protected-mode test wants).
+fn flat_ss(cpu: &mut Cpu, esp: u32) {
+    cpu.regs.seg[reg::SS as usize] = SegReg {
+        sel: 0x10,
+        base: 0,
+        limit: 0xFFFF_FFFF,
+        attrs: 0x0C93,
+    };
+    cpu.regs.gpr[reg::ESP as usize] = esp;
+}
+
+/// Attach an IDT at `base` and a task register pointing at `tss_base`.
+fn attach_idt_tss(cpu: &mut Cpu, idt_base: u32, tss_base: u32, tss_sel: u16) {
+    cpu.regs.idtr = DescTable {
+        base: idt_base,
+        limit: 0x7FF,
+    };
+    cpu.regs.tr = SegReg {
+        sel: tss_sel,
+        base: tss_base,
+        limit: 0x67,
+        attrs: 0x0089, // present, 32-bit available TSS
+    };
+}
+
+#[test]
+fn paging_treats_implicit_accesses_as_supervisor() {
+    // A ring-3 `INT n` must reach its ring-0 handler even when the GDT, IDT,
+    // TSS and kernel stack live on supervisor-only pages: the descriptor
+    // reads and the inner-stack pushes happen while CPL is still 3, but the
+    // 386 performs them with supervisor privilege.
+    let (mut cpu, mut mem) = setup_pm();
+
+    mem.load(0x0520, &descriptor(0, 0xF_FFFF, 0xFA, 0xC)); // 20: ring-3 code
+    mem.load(0x0528, &descriptor(0, 0xF_FFFF, 0xF2, 0xC)); // 28: ring-3 data
+    mem.load(0x0530, &descriptor(0x3000, 0x67, 0x89, 0x0)); // 30: TSS
+    mem.load(0x3000, &tss(0x7000, 0x10)); // ring-0 stack: page 6
+
+    // Gates: INT 40h (DPL 3) -> 2C00h; #PF -> 2E00h; #DF -> 2F00h.
+    mem.load(0x0800 + 0x40 * 8, &gate(0x2C00, 0x08, 0xEE));
+    mem.load(0x0800 + 14 * 8, &gate(0x2E00, 0x08, 0x8E));
+    mem.load(0x0800 + 8 * 8, &gate(0x2F00, 0x08, 0x8E));
+    attach_idt_tss(&mut cpu, 0x0800, 0x3000, 0x30);
+
+    // Identity-map 0..0x11FFF. Only the ring-3 code (page 4) and ring-3
+    // stack (page 5) are user pages; the GDT/IDT (page 0), kernel code
+    // (page 2), TSS (page 3) and kernel stack (page 6) are supervisor-only.
+    mem.load(0x10000, &0x0001_1007u32.to_le_bytes()); // PDE: P|RW|US
+    for i in 0..0x12u32 {
+        let user = matches!(i, 4 | 5);
+        let pte = (i << 12) | if user { 7 } else { 3 };
+        mem.load(0x11000 + i * 4, &pte.to_le_bytes());
+    }
+    cpu.regs.cr3 = 0x10000;
+    cpu.regs.cr0 |= remu::x86_32::cr0::PG;
+
+    // Ring-0 stub: build an IRETD frame and drop to ring 3 at 0x4000.
+    flat_ss(&mut cpu, 0x7000);
+    mem.load(
+        0x2000,
+        &[
+            0x6A, 0x2B, // PUSH 2Bh   (ring-3 SS)
+            0x68, 0x00, 0x60, 0x00, 0x00, // PUSH 6000h (ring-3 ESP)
+            0x6A, 0x02, // PUSH 2     (EFLAGS)
+            0x6A, 0x23, // PUSH 23h   (ring-3 CS)
+            0x68, 0x00, 0x40, 0x00, 0x00, // PUSH 4000h (ring-3 EIP)
+            0xCF, // IRETD
+        ],
+    );
+    mem.load(0x4000, &[0xCD, 0x40]); // ring 3: INT 40h
+    mem.load(0x2C00, &[0x90]);
+
+    for _ in 0..6 {
+        cpu.step(&mut mem);
+    }
+    assert_eq!(cpu.cpl(), 3, "IRETD should reach ring 3");
+    assert_eq!(cpu.regs.eip, 0x4000);
+
+    cpu.step(&mut mem); // INT 40h
+    assert!(!cpu.shutdown, "delivery must not triple-fault");
+    assert_eq!(
+        cpu.regs.eip, 0x2C00,
+        "expected the INT 40h handler, not #PF ({:#X}) or #DF ({:#X})",
+        0x2E00, 0x2F00
+    );
+    assert_eq!(cpu.cpl(), 0);
+    // The frame landed on the supervisor-only kernel stack.
+    assert_eq!(cpu.regs.gpr[reg::ESP as usize], 0x7000 - 20);
+}
+
+#[test]
+fn nested_fault_during_external_interrupt_is_serial() {
+    // An external interrupt is benign, so a fault raised while delivering it
+    // is handled serially rather than escalating to #DF. The error code of
+    // that fault carries the EXT bit, since the event was external.
+    let (mut cpu, mut mem) = setup_pm();
+
+    // 38: a code segment that is NOT present -> #NP when the gate loads it.
+    mem.load(0x0538, &descriptor(0, 0xF_FFFF, 0x1A, 0xC));
+    mem.load(0x0800 + 0x20 * 8, &gate(0x2C00, 0x38, 0x8E)); // IRQ -> absent CS
+    mem.load(0x0800 + 11 * 8, &gate(0x2D00, 0x08, 0x8E)); // #NP handler
+    mem.load(0x0800 + 8 * 8, &gate(0x2F00, 0x08, 0x8E)); // #DF handler
+    attach_idt_tss(&mut cpu, 0x0800, 0x3000, 0x30);
+
+    flat_ss(&mut cpu, 0x7000);
+    cpu.regs.eflags.insert(EFlags::IF);
+    cpu.assert_intr(0x20);
+    cpu.step(&mut mem);
+
+    assert!(!cpu.shutdown);
+    assert_eq!(
+        cpu.regs.eip, 0x2D00,
+        "a benign external interrupt + #NP is handled serially, not as #DF"
+    );
+    // Error code at the top of the frame: selector 0x38 with EXT set.
+    let sp = cpu.regs.gpr[reg::ESP as usize] as usize;
+    let err = u32::from_le_bytes(mem.ram[sp..sp + 4].try_into().unwrap());
+    assert_eq!(err, 0x39, "EXT bit must be set for an external event");
+}
+
+#[test]
+fn v86_delivery_fault_preserves_vm() {
+    // A fault partway through V86 interrupt delivery must roll back the
+    // cleared VM flag, so the nested fault is delivered as a V86 event (it
+    // pushes the four V86 data selectors and nulls them) rather than through
+    // the plain protected-mode path.
+    let (mut cpu, mut mem) = setup_pm();
+
+    // 38: ring-0 stack, base 7000h, limit 3Fh, 16-bit (B=0).
+    mem.load(0x0538, &descriptor(0x7000, 0x3F, 0x92, 0x0));
+    mem.load(0x0530, &descriptor(0x3000, 0x67, 0x89, 0x0));
+    // ESP0 = 20h: a 32-bit V86 frame (36 bytes) overflows the stack limit,
+    // a 16-bit one (20 bytes) fits.
+    mem.load(0x3000, &tss(0x20, 0x38));
+    mem.load(0x0800 + 0x50 * 8, &gate(0x2C00, 0x08, 0xEE)); // INT 50h: 32-bit gate
+    mem.load(0x0800 + 12 * 8, &gate(0x2D00, 0x08, 0x86)); // #SS: 16-bit gate
+    mem.load(0x0800 + 8 * 8, &gate(0x2F00, 0x08, 0x8E)); // #DF
+    attach_idt_tss(&mut cpu, 0x0800, 0x3000, 0x30);
+
+    // Enter V86 via IRETD: EIP CS EFLAGS ESP SS ES DS FS GS.
+    flat_ss(&mut cpu, 0x6000);
+    let frame: [u32; 9] = [
+        0x0000,                                      // EIP
+        0x0800,                                      // CS
+        EFlags::VM.bits() | EFlags::IOPL.bits() | 2, // EFLAGS (IOPL 3)
+        0x0100,                                      // ESP
+        0x0900,                                      // SS
+        0x0A00,                                      // ES
+        0x0B00,                                      // DS
+        0x0C00,                                      // FS
+        0x0D00,                                      // GS
+    ];
+    for (i, v) in frame.iter().enumerate() {
+        mem.load(0x6000 - 36 + i as u32 * 4, &v.to_le_bytes());
+    }
+    cpu.regs.gpr[reg::ESP as usize] = 0x6000 - 36;
+    mem.load(0x2000, &[0xCF]); // IRETD
+    mem.load(0x8000, &[0xCD, 0x50]); // V86 code at 0800:0000 -> INT 50h
+
+    cpu.step(&mut mem);
+    assert!(
+        cpu.regs.eflags.contains(EFlags::VM),
+        "should be in V86 mode"
+    );
+    assert_eq!(cpu.cpl(), 3);
+
+    cpu.step(&mut mem); // INT 50h -> #SS mid-frame -> nested #SS delivery
+    assert!(!cpu.shutdown);
+    assert_eq!(cpu.regs.eip, 0x2D00, "expected the #SS handler");
+    assert!(!cpu.regs.eflags.contains(EFlags::VM));
+
+    // A V86 frame nulls the data segments and stacks the four V86 selectors.
+    for idx in [reg::ES, reg::DS, reg::FS, reg::GS] {
+        assert_eq!(
+            cpu.regs.seg[idx as usize].sel, 0,
+            "V86 data segments must be nulled by a V86 delivery"
+        );
+    }
+    let word = |off: usize| mem.ram[off] as u16 | (mem.ram[off + 1] as u16) << 8;
+    assert_eq!(word(0x7000 + 0x1E), 0x0D00, "GS");
+    assert_eq!(word(0x7000 + 0x1C), 0x0C00, "FS");
+    assert_eq!(word(0x7000 + 0x1A), 0x0B00, "DS");
+    assert_eq!(word(0x7000 + 0x18), 0x0A00, "ES");
+}
+
+#[test]
+fn iret_does_not_commit_eflags_when_the_outer_stack_faults() {
+    // IRET to an outer ring with a bad SS faults; the popped EFLAGS image
+    // must not survive into the fault handler.
+    let (mut cpu, mut mem) = setup_pm();
+    mem.load(0x0520, &descriptor(0, 0xF_FFFF, 0xFA, 0xC)); // 20: ring-3 code
+    mem.load(0x0800 + 13 * 8, &gate(0x2D00, 0x08, 0x8E)); // #GP handler
+    attach_idt_tss(&mut cpu, 0x0800, 0x3000, 0x30);
+
+    // Frame: EIP, CS=23h, EFLAGS with DF set, ESP, SS=0FFFCh (bad RPL).
+    flat_ss(&mut cpu, 0x7000);
+    let frame: [u32; 5] = [0x4000, 0x23, EFlags::DF.bits() | 2, 0x6000, 0xFFFC];
+    for (i, v) in frame.iter().enumerate() {
+        mem.load(0x7000 + i as u32 * 4, &v.to_le_bytes());
+    }
+    mem.load(0x2000, &[0xCF]); // IRETD
+
+    assert!(!cpu.regs.eflags.contains(EFlags::DF));
+    cpu.step(&mut mem);
+    assert_eq!(cpu.regs.eip, 0x2D00, "expected #GP on the bad outer SS");
+    assert!(
+        !cpu.regs.eflags.contains(EFlags::DF),
+        "the returned-to EFLAGS image must not be committed before the SS load"
+    );
+}
+
+#[test]
+fn iretd_at_cpl3_ignores_a_set_vm_bit() {
+    // VM is not writable at CPL > 0, so IRETD simply ignores it (no #GP).
+    let (mut cpu, mut mem) = setup_pm();
+    mem.load(0x0520, &descriptor(0, 0xF_FFFF, 0xFA, 0xC)); // 20: ring-3 code
+    mem.load(0x0528, &descriptor(0, 0xF_FFFF, 0xF2, 0xC)); // 28: ring-3 data
+
+    // Drop straight to ring 3 by loading the caches directly.
+    cpu.regs.seg[reg::CS as usize] = SegReg {
+        sel: 0x23,
+        base: 0,
+        limit: 0xFFFF_FFFF,
+        attrs: 0x0CFA,
+    };
+    cpu.regs.seg[reg::SS as usize] = SegReg {
+        sel: 0x2B,
+        base: 0,
+        limit: 0xFFFF_FFFF,
+        attrs: 0x0CF2,
+    };
+    assert_eq!(cpu.cpl(), 3);
+
+    cpu.regs.eip = 0x4000;
+    cpu.regs.gpr[reg::ESP as usize] = 0x6000;
+    let frame: [u32; 3] = [0x4100, 0x23, EFlags::VM.bits() | 2];
+    for (i, v) in frame.iter().enumerate() {
+        mem.load(0x6000 + i as u32 * 4, &v.to_le_bytes());
+    }
+    mem.load(0x4000, &[0xCF]); // IRETD
+
+    cpu.step(&mut mem);
+    assert!(!cpu.shutdown);
+    assert_eq!(cpu.regs.eip, 0x4100, "the return must not raise #GP");
+    assert!(!cpu.regs.eflags.contains(EFlags::VM));
+    assert_eq!(cpu.cpl(), 3);
+}
+
+#[test]
+fn ldt_limit_is_not_truncated_to_16_bits() {
+    // A page-granular LDT has a byte limit above 0xFFFF; selectors beyond
+    // index 0x1000 must still resolve.
+    let (mut cpu, mut mem) = setup_pm();
+    cpu.regs.ldtr = SegReg {
+        sel: 0x40,
+        base: 0x2_0000,
+        limit: 0x1_0FFF, // granular: 0x10 pages
+        attrs: 0x0082,
+    };
+    // A data descriptor at LDT offset 0x1000 -> selector (0x200 << 3) | 4.
+    mem.load(0x2_1000, &descriptor(0x5000, 0xFFFF, 0x92, 0x0));
+    mem.load(0x2000, &[0x66, 0xB8, 0x04, 0x10, 0x8E, 0xD8]); // MOV AX,1004h; MOV DS,AX
+
+    cpu.step(&mut mem);
+    cpu.step(&mut mem);
+    assert_eq!(cpu.regs.seg[reg::DS as usize].sel, 0x1004);
+    assert_eq!(cpu.regs.seg[reg::DS as usize].base, 0x5000);
+}
+
+#[test]
+fn tss_sourced_selector_out_of_range_raises_ts() {
+    // The inner SS selector comes from the TSS: an out-of-range one is #TS,
+    // not #GP.
+    let (mut cpu, mut mem) = setup_pm();
+    mem.load(0x0520, &descriptor(0, 0xF_FFFF, 0xFA, 0xC)); // 20: ring-3 code
+    mem.load(0x0528, &descriptor(0, 0xF_FFFF, 0xF2, 0xC)); // 28: ring-3 data
+    mem.load(0x0530, &descriptor(0x3000, 0x67, 0x89, 0x0)); // 30: TSS
+    mem.load(0x3000, &tss(0x7000, 0x00F8)); // SS0 index 31: past the GDT limit
+
+    // The #TS and #GP handlers are ring-3 code, so their delivery needs no
+    // stack switch and the cascade stops there.
+    mem.load(0x0800 + 0x40 * 8, &gate(0x2C00, 0x08, 0xEE)); // INT 40h -> ring 0
+    mem.load(0x0800 + 10 * 8, &gate(0x4100, 0x23, 0x8E)); // #TS -> ring 3
+    mem.load(0x0800 + 13 * 8, &gate(0x4200, 0x23, 0x8E)); // #GP -> ring 3
+    attach_idt_tss(&mut cpu, 0x0800, 0x3000, 0x30);
+
+    cpu.regs.seg[reg::CS as usize] = SegReg {
+        sel: 0x23,
+        base: 0,
+        limit: 0xFFFF_FFFF,
+        attrs: 0x0CFA,
+    };
+    cpu.regs.seg[reg::SS as usize] = SegReg {
+        sel: 0x2B,
+        base: 0,
+        limit: 0xFFFF_FFFF,
+        attrs: 0x0CF2,
+    };
+    cpu.regs.eip = 0x4000;
+    cpu.regs.gpr[reg::ESP as usize] = 0x6000;
+    mem.load(0x4000, &[0xCD, 0x40]); // INT 40h
+
+    cpu.step(&mut mem);
+    assert!(!cpu.shutdown);
+    assert_eq!(cpu.regs.eip, 0x4100, "expected #TS, not #GP");
+    let sp = cpu.regs.gpr[reg::ESP as usize] as usize;
+    let err = u32::from_le_bytes(mem.ram[sp..sp + 4].try_into().unwrap());
+    assert_eq!(err, 0xF8, "#TS carries the offending SS selector");
+}
+
+#[test]
+fn tss_stack_read_respects_the_limit_exactly() {
+    // ESP0/SS0 for level 0 occupy TSS bytes 4..9, so a limit of 8 is one
+    // byte short and must raise #TS rather than read past it.
+    let (mut cpu, mut mem) = setup_pm();
+    mem.load(0x0520, &descriptor(0, 0xF_FFFF, 0xFA, 0xC));
+    mem.load(0x0528, &descriptor(0, 0xF_FFFF, 0xF2, 0xC));
+    mem.load(0x3000, &tss(0x7000, 0x10)); // a perfectly valid ring-0 stack
+    mem.load(0x0800 + 0x40 * 8, &gate(0x2C00, 0x08, 0xEE));
+    mem.load(0x0800 + 10 * 8, &gate(0x4100, 0x23, 0x8E)); // #TS -> ring 3
+    attach_idt_tss(&mut cpu, 0x0800, 0x3000, 0x30);
+    cpu.regs.tr.limit = 8; // one byte short of SS0's last byte
+
+    cpu.regs.seg[reg::CS as usize] = SegReg {
+        sel: 0x23,
+        base: 0,
+        limit: 0xFFFF_FFFF,
+        attrs: 0x0CFA,
+    };
+    cpu.regs.seg[reg::SS as usize] = SegReg {
+        sel: 0x2B,
+        base: 0,
+        limit: 0xFFFF_FFFF,
+        attrs: 0x0CF2,
+    };
+    cpu.regs.eip = 0x4000;
+    cpu.regs.gpr[reg::ESP as usize] = 0x6000;
+    mem.load(0x4000, &[0xCD, 0x40]);
+    mem.load(0x2C00, &[0x90]);
+
+    cpu.step(&mut mem);
+    assert_eq!(
+        cpu.regs.eip, 0x4100,
+        "the truncated TSS must raise #TS, not deliver the interrupt"
+    );
+}
+
+#[test]
+fn rep_string_is_interruptible() {
+    // A 32-bit REP can run for billions of iterations; hardware recognizes
+    // interrupts between them, resuming at the prefix afterwards.
+    // STI's one-instruction shadow defers delivery past the REP's own
+    // boundary, so the pending request is first seen *inside* the loop.
+    let (mut cpu, mut mem) = setup(&[0xFB, 0x67, 0xF3, 0x66, 0xAB]); // STI; a32 REP STOSD
+    mem.load(0x20 * 4, &[0x00, 0x80, 0x00, 0x00]); // IVT 20h -> 0000:8000
+    cpu.regs.gpr[0] = 0xDEAD_BEEF;
+    cpu.regs.gpr[reg::ECX as usize] = 1000;
+    cpu.regs.gpr[reg::EDI as usize] = 0x4000;
+    cpu.regs.seg[reg::ES as usize] = SegReg::real(0);
+    cpu.assert_intr(0x20);
+
+    cpu.step(&mut mem); // STI
+    cpu.step(&mut mem); // REP STOSD: one iteration, then yields
+    assert_eq!(
+        cpu.regs.eip, 0x1101,
+        "EIP rewinds to the prefix so the REP resumes after the handler"
+    );
+    assert_eq!(cpu.regs.gpr[reg::ECX as usize], 999, "one iteration ran");
+    assert_eq!(cpu.regs.gpr[reg::EDI as usize], 0x4004);
+
+    cpu.step(&mut mem); // the pending interrupt is taken
+    assert_eq!(cpu.regs.eip, 0x8000);
 }

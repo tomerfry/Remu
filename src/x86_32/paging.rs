@@ -71,17 +71,27 @@ impl Cpu {
         self.tlb.flush();
     }
 
+    /// Privilege of the current access for page protection.
+    ///
+    /// Explicit accesses use CPL, but the 386's *implicit* accesses — reading
+    /// the descriptor tables, the IDT and the TSS, writing accessed/busy
+    /// bits, and pushing a frame onto an inner-privilege stack while CPL is
+    /// still 3 — are always supervisor accesses.
+    #[inline]
+    fn user_access(&self) -> bool {
+        self.cpl() == 3 && !self.supervisor_override
+    }
+
     /// Translate linear address `lin` for a read (`write == false`) or write.
     /// Returns the physical address; raises #PF with `CR2 = lin` on failure.
     ///
-    /// Accesses from CPL 3 are user accesses; the 386 has no CR0.WP, so
-    /// supervisor writes ignore the writable bit.
+    /// The 386 has no CR0.WP, so supervisor writes ignore the writable bit.
     fn translate<B: Bus>(&mut self, bus: &mut B, lin: u32, write: bool) -> Exec<u32> {
         let page = lin >> 12;
         let slot = (page as usize) & (TLB_SIZE - 1);
         let e = self.tlb.entries[slot];
         if e.tag == page {
-            let user = self.cpl() == 3;
+            let user = self.user_access();
             if (!user || (e.user && (!write || e.writable))) && (!write || e.dirty) {
                 return Ok(e.phys | (lin & 0xFFF));
             }
@@ -92,7 +102,7 @@ impl Cpu {
     /// Full two-level walk, updating accessed/dirty bits and the TLB.
     #[cold]
     fn walk<B: Bus>(&mut self, bus: &mut B, lin: u32, write: bool) -> Exec<u32> {
-        let user = self.cpl() == 3;
+        let user = self.user_access();
         let fault = |present: bool| {
             let code = (present as u16) | (write as u16) << 1 | (user as u16) << 2;
             Exception::pf(code)
@@ -190,6 +200,48 @@ impl Cpu {
             let hi = self.lin_read16(bus, lin.wrapping_add(2))? as u32;
             Ok(lo | hi << 16)
         }
+    }
+
+    // --- Implicit (always-supervisor) system-structure access ----------------
+
+    /// Read a byte from a system structure (descriptor table, TSS, IDT).
+    #[inline]
+    pub(crate) fn sys_read8<B: Bus>(&mut self, bus: &mut B, lin: u32) -> Exec<u8> {
+        let sup = self.supervisor_override;
+        self.supervisor_override = true;
+        let r = self.lin_read8(bus, lin);
+        self.supervisor_override = sup;
+        r
+    }
+
+    /// Read a word from a system structure.
+    #[inline]
+    pub(crate) fn sys_read16<B: Bus>(&mut self, bus: &mut B, lin: u32) -> Exec<u16> {
+        let sup = self.supervisor_override;
+        self.supervisor_override = true;
+        let r = self.lin_read16(bus, lin);
+        self.supervisor_override = sup;
+        r
+    }
+
+    /// Read a double-word from a system structure.
+    #[inline]
+    pub(crate) fn sys_read32<B: Bus>(&mut self, bus: &mut B, lin: u32) -> Exec<u32> {
+        let sup = self.supervisor_override;
+        self.supervisor_override = true;
+        let r = self.lin_read32(bus, lin);
+        self.supervisor_override = sup;
+        r
+    }
+
+    /// Write a byte to a system structure (accessed/busy bit writeback).
+    #[inline]
+    pub(crate) fn sys_write8<B: Bus>(&mut self, bus: &mut B, lin: u32, v: u8) -> Exec<()> {
+        let sup = self.supervisor_override;
+        self.supervisor_override = true;
+        let r = self.lin_write8(bus, lin, v);
+        self.supervisor_override = sup;
+        r
     }
 
     #[inline]

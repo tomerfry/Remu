@@ -425,8 +425,8 @@ impl Cpu {
     /// Set the busy bit in a TSS descriptor (GDT write, as on hardware).
     fn mark_tss_busy<B: Bus>(&mut self, bus: &mut B, sel: u16) -> Exec<()> {
         let addr = self.regs.gdtr.base.wrapping_add((sel & 0xFFF8) as u32);
-        let b = self.lin_read8(bus, addr.wrapping_add(5))?;
-        self.lin_write8(bus, addr.wrapping_add(5), b | 0x02)
+        let b = self.sys_read8(bus, addr.wrapping_add(5))?;
+        self.sys_write8(bus, addr.wrapping_add(5), b | 0x02)
     }
 
     /// VERR/VERW predicate; never faults on bad selectors, just reports.
