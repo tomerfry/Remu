@@ -190,7 +190,7 @@ impl Cpu {
             0x98 => { self.regs.ax = self.regs.ax as u8 as i8 as i16 as u16; 2 }
             0x99 => { self.regs.dx = if self.regs.ax & 0x8000 != 0 { 0xFFFF } else { 0 }; 5 }
             0x9E => { // SAHF
-                let ah = (self.regs.ax >> 8) as u16;
+                let ah = self.regs.ax >> 8;
                 let keep = self.regs.flags.bits() & 0xFF00;
                 self.regs.flags = Flags::from_bits_truncate(keep | ah);
                 4

@@ -100,5 +100,74 @@ fn jsr_rts(c: &mut Criterion) {
     bench_program(c, "jsr_rts", &program, |_| {});
 }
 
+// --- 80386 core -------------------------------------------------------------
+
+/// Benchmark `STEPS` instructions of a 386 real-mode `program` at `0000:1000`.
+fn bench_386(c: &mut Criterion, name: &str, program: &[u8]) {
+    use remu::x86_32;
+
+    let mut mem = x86_32::LinearMemory::new();
+    mem.load(0x1000, program);
+
+    let mut cpu = x86_32::Cpu::new();
+    cpu.set_cs_ip(0x0000, 0x1000);
+    cpu.regs.seg[x86_32::reg::SS as usize] = x86_32::SegReg::real(0x9000);
+    cpu.regs.gpr[x86_32::reg::ESP as usize] = 0xFF00;
+
+    let mut group = c.benchmark_group("cpu386");
+    group.throughput(Throughput::Elements(STEPS));
+    group.bench_function(name, |b| {
+        b.iter(|| {
+            for _ in 0..STEPS {
+                cpu.step(&mut mem);
+            }
+            black_box(cpu.cycles)
+        })
+    });
+    group.finish();
+
+    assert!(!cpu.halted, "benchmark program {name} halted");
+}
+
+/// 32-bit counting loop: DEC ECX / JNZ with a JMP restart.
+fn tight_loop_386(c: &mut Criterion) {
+    #[rustfmt::skip]
+    let program = [
+        0x66, 0xB9, 0xFF, 0x00, 0x00, 0x00, // 1000: MOV ECX, 0xFF
+        0x66, 0x49,                         // 1006: DEC ECX
+        0x75, 0xFC,                         // 1008: JNZ 1006
+        0xEB, 0xF4,                         // 100A: JMP 1000
+    ];
+    bench_386(c, "tight_loop", &program);
+}
+
+/// 32-bit ALU mix on registers and memory.
+fn arith_386(c: &mut Criterion) {
+    #[rustfmt::skip]
+    let program = [
+        0x66, 0xB8, 0x78, 0x56, 0x34, 0x12, // 1000: MOV EAX, 12345678h
+        0x66, 0x05, 0x01, 0x00, 0x00, 0x00, // 1006: ADD EAX, 1
+        0x66, 0x31, 0x06, 0x00, 0x20,       // 100C: XOR [2000h], EAX
+        0x66, 0xC1, 0xC0, 0x07,             // 1011: ROL EAX, 7
+        0x66, 0x0F, 0xAF, 0xC0,             // 1015: IMUL EAX, EAX
+        0xEB, 0xE5,                         // 1019: JMP 1000
+    ];
+    bench_386(c, "arith", &program);
+}
+
+/// CALL/RET stack traffic.
+fn call_ret_386(c: &mut Criterion) {
+    #[rustfmt::skip]
+    let program = [
+        0xE8, 0x03, 0x00,                   // 1000: CALL 1006
+        0xEB, 0xFB,                         // 1003: JMP 1000
+        0x90,                               // 1005: NOP (padding)
+        0x40,                               // 1006: INC AX
+        0xC3,                               // 1007: RET
+    ];
+    bench_386(c, "call_ret", &program);
+}
+
 criterion_group!(benches, tight_loop, memcpy, arith, jsr_rts);
-criterion_main!(benches);
+criterion_group!(benches386, tight_loop_386, arith_386, call_ret_386);
+criterion_main!(benches, benches386);

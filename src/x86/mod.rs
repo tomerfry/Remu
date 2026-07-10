@@ -168,14 +168,14 @@ impl Cpu {
                 self.cycles += INTERRUPT_CYCLES as u64;
                 return INTERRUPT_CYCLES;
             }
-            if let Some(vector) = self.intr {
-                if self.regs.flags.contains(Flags::IF) {
-                    self.intr = None;
-                    self.halted = false;
-                    self.interrupt(bus, vector);
-                    self.cycles += INTERRUPT_CYCLES as u64;
-                    return INTERRUPT_CYCLES;
-                }
+            if let Some(vector) = self.intr
+                && self.regs.flags.contains(Flags::IF)
+            {
+                self.intr = None;
+                self.halted = false;
+                self.interrupt(bus, vector);
+                self.cycles += INTERRUPT_CYCLES as u64;
+                return INTERRUPT_CYCLES;
             }
         }
 
