@@ -1,12 +1,13 @@
 //! # Remu
 //!
 //! An emulation framework with cycle-conscious interpreters for the MOS 6502 /
-//! 65xx CPU ([`cpu`]) and the Intel 8086/8088 ([`x86`]).
+//! 65xx CPU ([`cpu`]), the Intel 8086/8088 ([`x86`]) and the Intel 80386
+//! ([`x86_32`]).
 //!
 //! The design keeps each CPU decoupled from memory and devices behind a bus
-//! trait ([`bus::Bus`] for the 6502, [`x86::Bus`] for the 8086), so the same
-//! cores power unit tests, integration images, and (eventually) full emulated
-//! machines.
+//! trait ([`bus::Bus`] for the 6502, per-core `Bus` traits for the x86
+//! cores), so the same cores power unit tests, integration images, and
+//! (eventually) full emulated machines.
 //!
 //! ```
 //! use remu::{Cpu, memory::FlatMemory, bus::Bus};
@@ -26,9 +27,10 @@ pub mod cpu;
 pub mod device;
 pub mod interrupt;
 pub mod memory;
-pub mod x86;
 #[cfg(feature = "python")]
 mod python;
+pub mod x86;
+pub mod x86_32;
 
 pub use cpu::Cpu;
 pub use cpu::registers::{Registers, Status};

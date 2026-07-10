@@ -1,8 +1,8 @@
 # Remu
 
 A CPU emulation framework in Rust with cycle-conscious interpreters for the
-MOS 6502 and the Intel 8086/8088. Goals: realistic emulation, and emulation
-speed to the MAXIMUM.
+MOS 6502, the Intel 8086/8088 and the Intel 80386. Goals: realistic
+emulation, and emulation speed to the MAXIMUM.
 
 ## Rust
 
@@ -37,14 +37,34 @@ cpu.step(&mut mem);
 assert_eq!(cpu.regs.ax, 0x1234);
 ```
 
+The 80386 core lives in `remu::x86_32` — 32-bit registers and addressing,
+real mode, protected mode with privilege levels/gates/V86, and paging. The
+real-mode instruction set (including the 386's *undefined* flag behavior for
+BT/BTS/BTR/BTC, SHLD/SHRD, BSF/BSR, escaped-#DE IDIV quotients, and the
+scaled-base SIB quirk) is validated against all 1,758,700 cases of the
+[SingleStepTests 80386](https://github.com/SingleStepTests/80386) suite:
+
+```rust
+use remu::x86_32::{Cpu, LinearMemory};
+
+let mut mem = LinearMemory::new();          // flat 16 MiB space
+mem.load(0x0_1100, &[0x66, 0xB8, 0x78, 0x56, 0x34, 0x12]); // MOV EAX, 0x12345678
+
+let mut cpu = Cpu::new();
+cpu.set_cs_ip(0x0000, 0x1100);
+cpu.step(&mut mem);
+assert_eq!(cpu.regs.gpr[0], 0x1234_5678);
+```
+
 ```sh
 cargo test
 ```
 
 To run the exhaustive per-opcode hardware suites (data not vendored), point
-`REMU_HARTE_DIR` at a `SingleStepTests/65x02` `6502/v1` checkout and/or
-`REMU_HARTE_8088_DIR` at a `SingleStepTests/8088` `v2` checkout, then
-`cargo test --release`.
+`REMU_HARTE_DIR` at a `SingleStepTests/65x02` `6502/v1` checkout,
+`REMU_HARTE_8088_DIR` at a `SingleStepTests/8088` `v2` checkout and/or
+`REMU_HARTE_80386_DIR` at a `SingleStepTests/80386` `v1_ex_real_mode`
+checkout, then `cargo test --release`.
 
 ## Python
 
