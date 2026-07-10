@@ -51,7 +51,7 @@ impl Flags {
     pub fn set_szp8(&mut self, v: u8) {
         self.set(Flags::SF, v & 0x80 != 0);
         self.set(Flags::ZF, v == 0);
-        self.set(Flags::PF, v.count_ones() % 2 == 0);
+        self.set(Flags::PF, v.count_ones().is_multiple_of(2));
     }
 
     /// Set `SF`, `ZF` and `PF` from a 16-bit result. `PF` reflects only the
@@ -60,7 +60,7 @@ impl Flags {
     pub fn set_szp16(&mut self, v: u16) {
         self.set(Flags::SF, v & 0x8000 != 0);
         self.set(Flags::ZF, v == 0);
-        self.set(Flags::PF, (v as u8).count_ones() % 2 == 0);
+        self.set(Flags::PF, (v as u8).count_ones().is_multiple_of(2));
     }
 }
 
