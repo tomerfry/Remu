@@ -27,6 +27,7 @@ pub mod cpu;
 pub mod device;
 pub mod interrupt;
 pub mod memory;
+pub mod os;
 #[cfg(feature = "python")]
 mod python;
 pub mod x86;

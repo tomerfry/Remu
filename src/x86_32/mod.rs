@@ -253,6 +253,27 @@ pub(crate) enum Event {
     External,
 }
 
+/// A request from the CPU for the host (an OS-emulation layer) to act, in
+/// place of the normal in-guest IDT delivery.
+///
+/// Populated in [`Cpu::host_trap`] only when the corresponding opt-in is set
+/// ([`Cpu::syscall_int`] / [`Cpu::trap_faults`]); the CPU is otherwise a plain
+/// bare-metal 386. A userspace emulator drives [`Cpu::step`] and, after each
+/// call, takes any pending trap to service it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostTrap {
+    /// The guest executed `INT n` for the vector named by [`Cpu::syscall_int`]
+    /// (e.g. `int 0x80`). `EIP` already points past the instruction; read the
+    /// syscall number/arguments from the registers and write the result to
+    /// `EAX`.
+    Syscall,
+    /// The guest raised a CPU exception while [`Cpu::trap_faults`] was set.
+    /// Register state has been rewound to the faulting instruction (a `#PF`
+    /// leaves the linear address in `CR2` and its code in `Exception::error`),
+    /// so the host may fix the fault and resume, or terminate the process.
+    Exception(Exception),
+}
+
 /// Cycles consumed by servicing a hardware interrupt (real-mode figure).
 const INTERRUPT_CYCLES: u32 = 37;
 
@@ -339,6 +360,29 @@ pub struct Cpu {
     supervisor_override: bool,
     /// TLB for paged address translation (see `paging.rs`).
     tlb: paging::Tlb,
+
+    // --- Host (OS-emulation) hooks — all inert at their defaults -------------
+    /// If set, `INT n` for this vector does not vector through the IDT; instead
+    /// the CPU records [`HostTrap::Syscall`] and returns, letting a host
+    /// syscall layer service it (e.g. `Some(0x80)` for Linux i386). Default
+    /// `None` — `INT` behaves exactly like hardware.
+    pub syscall_int: Option<u8>,
+    /// If `true`, a CPU exception is handed back via [`HostTrap::Exception`]
+    /// instead of being delivered through the IDT (register state is rewound
+    /// first). A userspace emulator has no guest kernel behind the IDT, so it
+    /// resolves faults on the host. Default `false`.
+    pub trap_faults: bool,
+    /// If `true`, decode a handful of post-386 opcodes (`CPUID`, `RDTSC`,
+    /// `CMPXCHG`, `XADD`, `BSWAP`, `CMOVcc`, long `NOP`) that real 32-bit
+    /// binaries use. Default `false` keeps strict 386 behavior (`#UD`), so the
+    /// conformance suite is unaffected.
+    pub extensions: bool,
+    /// Output: the pending host request, set by the CPU when [`syscall_int`]
+    /// matches or a fault is trapped. The host takes it after each
+    /// [`Cpu::step`]. Cleared on RESET.
+    ///
+    /// [`syscall_int`]: Cpu::syscall_int
+    pub host_trap: Option<HostTrap>,
 }
 
 impl Cpu {
@@ -364,6 +408,10 @@ impl Cpu {
             ilen: 0,
             supervisor_override: false,
             tlb: paging::Tlb::new(),
+            syscall_int: None,
+            trap_faults: false,
+            extensions: false,
+            host_trap: None,
         }
     }
 
@@ -378,6 +426,7 @@ impl Cpu {
         self.inhibit_interrupts = false;
         self.supervisor_override = false;
         self.tlb.flush();
+        self.host_trap = None;
     }
 
     /// Convenience for tests and loaders: set `CS:EIP` with real-mode
@@ -477,6 +526,13 @@ impl Cpu {
                     self.regs = saved;
                     self.regs.eflags = eflags;
                     self.regs.cr2 = cr2;
+                }
+                // OS-emulation hook: hand the (rewound, restartable) fault to
+                // the host instead of vectoring through the IDT.
+                if self.trap_faults {
+                    self.host_trap = Some(HostTrap::Exception(e));
+                    self.cycles += INTERRUPT_CYCLES as u64;
+                    return INTERRUPT_CYCLES;
                 }
                 self.deliver(bus, e, Event::Fault);
                 INTERRUPT_CYCLES

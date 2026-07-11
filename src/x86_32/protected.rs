@@ -1011,6 +1011,13 @@ impl Cpu {
     /// Software interrupt (INT n / INT3 / INTO / ICEBP): traps report the
     /// *next* instruction, which EIP already points to.
     pub(crate) fn software_int<B: Bus>(&mut self, bus: &mut B, vector: u8) -> Exec<()> {
+        // OS-emulation hook: the designated syscall vector (e.g. int 0x80) is
+        // caught here — before any IDT/gate/TSS logic — so it works at CPL 3
+        // with no IDT installed. EIP already points past the INT instruction.
+        if self.syscall_int == Some(vector) {
+            self.host_trap = Some(super::HostTrap::Syscall);
+            return Ok(());
+        }
         self.raise(
             bus,
             Exception {

@@ -8,8 +8,10 @@ use super::{Bus, Cpu, Exception, Exec};
 
 impl Cpu {
     pub(crate) fn dispatch_0f<B: Bus>(&mut self, bus: &mut B, opcode: u8) -> Exec<u32> {
-        // Decode-time LOCK legality: only BTS/BTR/BTC (and group 8) can lock.
-        if self.lock && !matches!(opcode, 0xAB | 0xB3 | 0xBB | 0xBA) {
+        // Decode-time LOCK legality: only BTS/BTR/BTC (and group 8) can lock —
+        // plus CMPXCHG/XADD, the atomic primitives, when extensions are on.
+        let lock_atomic = self.extensions && matches!(opcode, 0xB0 | 0xB1 | 0xC0 | 0xC1);
+        if self.lock && !lock_atomic && !matches!(opcode, 0xAB | 0xB3 | 0xBB | 0xBA) {
             return Err(Exception::ud());
         }
         match opcode {
@@ -311,8 +313,141 @@ impl Cpu {
                 Ok(11)
             }
 
+            // --- Post-386 extensions (opt-in via `Cpu::extensions`) -----------
+            // Real 32-bit binaries and glibc use these; a strict 386 raises
+            // #UD, so they are gated to preserve conformance.
+            0x18..=0x1F if self.extensions => {
+                // Long NOP (0F 1F) and the prefetch/hint group (0F 18..0F 1E):
+                // consume the ModRM operand, do nothing.
+                let _ = self.modrm(bus)?;
+                Ok(3)
+            }
+            0x31 if self.extensions => {
+                // RDTSC: EDX:EAX = timestamp counter (our cycle count).
+                self.regs.set_reg32(reg::EAX, self.cycles as u32);
+                self.regs.set_reg32(reg::EDX, (self.cycles >> 32) as u32);
+                Ok(5)
+            }
+            0x40..=0x4F if self.extensions => self.cmovcc(bus, opcode & 0x0F),
+            0xA2 if self.extensions => {
+                self.cpuid();
+                Ok(14)
+            }
+            0xB0 | 0xB1 if self.extensions => self.cmpxchg(bus, opcode == 0xB0),
+            0xC0 | 0xC1 if self.extensions => self.xadd(bus, opcode == 0xC0),
+            0xC8..=0xCF if self.extensions => {
+                // BSWAP r32: reverse byte order (16-bit form is undefined).
+                let i = opcode & 0x07;
+                let v = self.regs.reg32(i);
+                self.regs.set_reg32(i, v.swap_bytes());
+                Ok(6)
+            }
+
             _ => Err(Exception::ud()),
         }
+    }
+
+    // --- Post-386 extension helpers ------------------------------------------
+
+    /// CMOVcc: read the source (always, per hardware) and move it to the
+    /// destination register only when the condition holds.
+    fn cmovcc<B: Bus>(&mut self, bus: &mut B, cc: u8) -> Exec<u32> {
+        let (m, op) = self.modrm(bus)?;
+        let v = self.read_op(bus, op)?;
+        if self.cond(cc) {
+            if self.osize32 {
+                self.regs.set_reg32(m.reg(), v);
+            } else {
+                self.regs.set_reg16(m.reg(), v as u16);
+            }
+        }
+        Ok(if op.is_mem() { 5 } else { 4 })
+    }
+
+    /// CMPXCHG r/m, reg: compare the accumulator with the destination (setting
+    /// flags as `CMP`); if equal, store `reg` into the destination, otherwise
+    /// load the destination into the accumulator.
+    fn cmpxchg<B: Bus>(&mut self, bus: &mut B, byte: bool) -> Exec<u32> {
+        let (m, op) = self.modrm(bus)?;
+        self.lock_check(op.is_mem())?;
+        if byte {
+            let dest = self.read_op8(bus, op)?;
+            let acc = self.regs.reg8(reg::EAX);
+            self.sub8(acc, dest); // flags only (CMP)
+            if acc == dest {
+                let src = self.regs.reg8(m.reg());
+                self.write_op8(bus, op, src)?;
+            } else {
+                self.regs.set_reg8(reg::EAX, dest);
+            }
+        } else if self.osize32 {
+            let dest = self.read_op32(bus, op)?;
+            let acc = self.regs.reg32(reg::EAX);
+            self.sub32(acc, dest);
+            if acc == dest {
+                let src = self.regs.reg32(m.reg());
+                self.write_op32(bus, op, src)?;
+            } else {
+                self.regs.set_reg32(reg::EAX, dest);
+            }
+        } else {
+            let dest = self.read_op16(bus, op)?;
+            let acc = self.regs.reg16(reg::EAX);
+            self.sub16(acc, dest);
+            if acc == dest {
+                let src = self.regs.reg16(m.reg());
+                self.write_op16(bus, op, src)?;
+            } else {
+                self.regs.set_reg16(reg::EAX, dest);
+            }
+        }
+        Ok(if op.is_mem() { 7 } else { 6 })
+    }
+
+    /// XADD r/m, reg: `temp = dest + reg; reg = dest; dest = temp` (flags as
+    /// `ADD`).
+    fn xadd<B: Bus>(&mut self, bus: &mut B, byte: bool) -> Exec<u32> {
+        let (m, op) = self.modrm(bus)?;
+        self.lock_check(op.is_mem())?;
+        if byte {
+            let dest = self.read_op8(bus, op)?;
+            let src = self.regs.reg8(m.reg());
+            let sum = self.add8(dest, src);
+            self.regs.set_reg8(m.reg(), dest);
+            self.write_op8(bus, op, sum)?;
+        } else if self.osize32 {
+            let dest = self.read_op32(bus, op)?;
+            let src = self.regs.reg32(m.reg());
+            let sum = self.add32(dest, src);
+            self.regs.set_reg32(m.reg(), dest);
+            self.write_op32(bus, op, sum)?;
+        } else {
+            let dest = self.read_op16(bus, op)?;
+            let src = self.regs.reg16(m.reg());
+            let sum = self.add16(dest, src);
+            self.regs.set_reg16(m.reg(), dest);
+            self.write_op16(bus, op, sum)?;
+        }
+        Ok(if op.is_mem() { 7 } else { 6 })
+    }
+
+    /// CPUID: a deliberately minimal descriptor. Advertising no SSE/MMX/CX8
+    /// keeps glibc's IFUNC resolvers on the generic i386/i686 code paths,
+    /// shrinking the opcode surface we must support. FPU is advertised so
+    /// glibc does not bail, but note the core has no x87 arithmetic yet.
+    fn cpuid(&mut self) {
+        let leaf = self.regs.reg32(reg::EAX);
+        let (a, b, c, d) = match leaf {
+            // Vendor string "GenuineIntel", max basic leaf = 1.
+            0 => (1, 0x756e_6547, 0x6c65_746e, 0x4965_6e69),
+            // Family 5 / model 1 / stepping 1; features: FPU | TSC | CMOV.
+            1 => (0x0000_0511, 0, 0, 0x0000_8011),
+            _ => (0, 0, 0, 0),
+        };
+        self.regs.set_reg32(reg::EAX, a);
+        self.regs.set_reg32(reg::EBX, b);
+        self.regs.set_reg32(reg::ECX, c);
+        self.regs.set_reg32(reg::EDX, d);
     }
 
     /// #GP(0) unless we are at ring 0 (real mode qualifies; V86 never does).
