@@ -100,6 +100,29 @@ pub(crate) enum Op {
     RetNearImm,
     /// IMUL `r, r/m` (0F AF).
     ImulRRmW,
+    /// PUSH imm (68/6A; imm pre-extended).
+    PushImm,
+    /// IMUL `r, r/m, imm` (69/6B; imm pre-extended).
+    ImulRmImm,
+    /// XCHG `r/m8, r8` (86).
+    XchgRm8,
+    /// XCHG `r/m, r` (87).
+    XchgRmW,
+    /// XCHG eAX, r (90–97).
+    XchgAcc,
+    /// MOVZX `r, r/m8` (0F B6).
+    MovzxB,
+    /// MOVZX `r, r/m16` (0F B7).
+    MovzxW,
+    /// MOVSX `r, r/m8` (0F BE).
+    MovsxB,
+    /// MOVSX `r, r/m16` (0F BF).
+    MovsxW,
+    /// SETcc `r/m8` (0F 90–9F; `aux` = condition).
+    Setcc,
+    /// CMOVcc `r, r/m` (0F 40–4F, `extensions` only — which is a context
+    /// key bit, so a cached entry can never outlive the setting).
+    CmovW,
 }
 
 /// Operand shape of the decoded ModRM `rm` field.
@@ -428,6 +451,39 @@ impl Cpu {
                 d.imm = self.fetch_imm(bus)?;
             }
 
+            // --- PUSH imm / IMUL r,r/m,imm --------------------------------------
+            0x68 => {
+                d.op = Op::PushImm;
+                d.imm = self.fetch_imm(bus)?;
+            }
+            0x6A => {
+                d.op = Op::PushImm;
+                d.imm = self.fetch8(bus)? as i8 as i32 as u32;
+            }
+            0x69 | 0x6B => {
+                d.op = Op::ImulRmImm;
+                self.decode_modrm(bus, d)?;
+                d.imm = if opcode == 0x69 {
+                    self.fetch_imm(bus)?
+                } else {
+                    self.fetch8(bus)? as i8 as i32 as u32
+                };
+            }
+
+            // --- XCHG -----------------------------------------------------------
+            0x86 => {
+                d.op = Op::XchgRm8;
+                self.decode_modrm(bus, d)?;
+            }
+            0x87 => {
+                d.op = Op::XchgRmW;
+                self.decode_modrm(bus, d)?;
+            }
+            0x90..=0x97 => {
+                d.op = Op::XchgAcc;
+                d.reg = opcode & 7;
+            }
+
             // --- INC/DEC/PUSH/POP r -------------------------------------------
             0x40..=0x47 => {
                 d.op = Op::IncReg;
@@ -534,6 +590,32 @@ impl Cpu {
                     }
                     0xAF => {
                         d.op = Op::ImulRRmW;
+                        self.decode_modrm(bus, d)?;
+                    }
+                    0xB6 => {
+                        d.op = Op::MovzxB;
+                        self.decode_modrm(bus, d)?;
+                    }
+                    0xB7 => {
+                        d.op = Op::MovzxW;
+                        self.decode_modrm(bus, d)?;
+                    }
+                    0xBE => {
+                        d.op = Op::MovsxB;
+                        self.decode_modrm(bus, d)?;
+                    }
+                    0xBF => {
+                        d.op = Op::MovsxW;
+                        self.decode_modrm(bus, d)?;
+                    }
+                    0x90..=0x9F => {
+                        d.op = Op::Setcc;
+                        d.aux = op2 & 0xF;
+                        self.decode_modrm(bus, d)?;
+                    }
+                    0x40..=0x4F if self.extensions => {
+                        d.op = Op::CmovW;
+                        d.aux = op2 & 0xF;
                         self.decode_modrm(bus, d)?;
                     }
                     _ => return Ok(Decoded::Cold0F(op2)),
@@ -1079,8 +1161,117 @@ impl Cpu {
                 }
                 Ok(if op.is_mem() { 22 } else { 20 })
             }
+            Op::PushImm => {
+                self.push(bus, d.imm)?;
+                Ok(2)
+            }
+            Op::ImulRmImm => {
+                let op = self.ea_operand(d);
+                let a = self.read_op(bus, op)?;
+                if self.osize32 {
+                    let r = self.imul_trunc32(a, d.imm);
+                    self.regs.set_reg32(d.reg, r);
+                } else {
+                    let r = self.imul_trunc16(a as u16, d.imm as u16);
+                    self.regs.set_reg16(d.reg, r);
+                }
+                Ok(if op.is_mem() { 22 } else { 20 })
+            }
+            Op::XchgRm8 => {
+                let op = self.ea_operand(d);
+                let a = self.read_op8(bus, op)?;
+                let b = self.regs.reg8(d.reg);
+                self.write_op8(bus, op, b)?;
+                self.regs.set_reg8(d.reg, a);
+                Ok(if op.is_mem() { 5 } else { 3 })
+            }
+            Op::XchgRmW => {
+                let op = self.ea_operand(d);
+                let a = self.read_op(bus, op)?;
+                let b = self.regs.reg32(d.reg);
+                if self.osize32 {
+                    self.write_op32(bus, op, b)?;
+                    self.regs.set_reg32(d.reg, a);
+                } else {
+                    self.write_op16(bus, op, b as u16)?;
+                    self.regs.set_reg16(d.reg, a as u16);
+                }
+                Ok(if op.is_mem() { 5 } else { 3 })
+            }
+            Op::XchgAcc => {
+                let i = d.reg;
+                if self.osize32 {
+                    let t = self.regs.gpr[0];
+                    self.regs.gpr[0] = self.regs.reg32(i);
+                    self.regs.set_reg32(i, t);
+                } else {
+                    let t = self.regs.reg16(0);
+                    self.regs.set_reg16(0, self.regs.reg16(i));
+                    self.regs.set_reg16(i, t);
+                }
+                Ok(3)
+            }
+            Op::MovzxB => {
+                let op = self.ea_operand(d);
+                let v = self.read_op8(bus, op)? as u32;
+                if self.osize32 {
+                    self.regs.set_reg32(d.reg, v);
+                } else {
+                    self.regs.set_reg16(d.reg, v as u16);
+                }
+                Ok(if op.is_mem() { 6 } else { 3 })
+            }
+            Op::MovzxW => {
+                let op = self.ea_operand(d);
+                let v = self.read_op16(bus, op)? as u32;
+                if self.osize32 {
+                    self.regs.set_reg32(d.reg, v);
+                } else {
+                    self.regs.set_reg16(d.reg, v as u16);
+                }
+                Ok(if op.is_mem() { 6 } else { 3 })
+            }
+            Op::MovsxB => {
+                let op = self.ea_operand(d);
+                let v = self.read_op8(bus, op)? as i8 as i32 as u32;
+                if self.osize32 {
+                    self.regs.set_reg32(d.reg, v);
+                } else {
+                    self.regs.set_reg16(d.reg, v as u16);
+                }
+                Ok(if op.is_mem() { 6 } else { 3 })
+            }
+            Op::MovsxW => {
+                let op = self.ea_operand(d);
+                let v = self.read_op16(bus, op)? as i16 as i32 as u32;
+                if self.osize32 {
+                    self.regs.set_reg32(d.reg, v);
+                } else {
+                    self.regs.set_reg16(d.reg, v as u16);
+                }
+                Ok(if op.is_mem() { 6 } else { 3 })
+            }
+            Op::Setcc => {
+                let op = self.ea_operand(d);
+                let v = self.cond(d.aux) as u8;
+                self.write_op8(bus, op, v)?;
+                Ok(4)
+            }
+            Op::CmovW => {
+                let op = self.ea_operand(d);
+                let v = self.read_op(bus, op)?;
+                if self.cond(d.aux) {
+                    if self.osize32 {
+                        self.regs.set_reg32(d.reg, v);
+                    } else {
+                        self.regs.set_reg16(d.reg, v as u16);
+                    }
+                }
+                Ok(if op.is_mem() { 5 } else { 4 })
+            }
         }
     }
+
 }
 
 #[cfg(test)]
@@ -1202,11 +1393,21 @@ mod tests {
             0x8D, 0x47, 0x10,             // LEA AX, [BX+0x10]
             0x3C, 0x00,                   // CMP AL, 0
             0x75, 0x01,                   // JNZ +1
-            0x90,                         // NOP (cold path)
+            0x90,                         // NOP (XCHG AX,AX)
             0xE8, 0x02, 0x00,             // CALL +2
             0xEB, 0x02,                   // JMP +2 (over the RET)
             0x40,                         // INC AX   <- call target
             0xC3,                         // RET
+            0x68, 0x34, 0x12,             // PUSH 0x1234
+            0x6A, 0xF6,                   // PUSH -10
+            0x6B, 0xC2, 0x05,             // IMUL AX, DX, 5
+            0x86, 0x07,                   // XCHG [BX], AL
+            0x87, 0x17,                   // XCHG [BX], DX
+            0x91,                         // XCHG AX, CX
+            0x0F, 0xB6, 0xC1,             // MOVZX AX, CL
+            0x0F, 0xBE, 0x0F,             // MOVSX CX, byte [BX]
+            0x0F, 0x94, 0xC2,             // SETZ DL
+            0x0F, 0x44, 0xCA,             // CMOVZ CX, DX (extensions on)
             0xF4,                         // HLT
         ];
 
@@ -1217,6 +1418,7 @@ mod tests {
             let mut mem = LinearMemory::new();
             mem.load(0x1000, program);
             let mut cpu = Cpu::new();
+            cpu.extensions = true; // CMOVcc coverage
             cpu.fused_only = fused_only;
             let mut cycles = Vec::new();
             for _ in 0..2 {
