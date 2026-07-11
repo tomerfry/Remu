@@ -215,3 +215,70 @@ the pure-ALU gap reduced to the irreducible JIT-vs-interpreter difference.
 Acceptance per increment: all SingleStepTests suites still pass; `cargo
 test` green; benchmark table regenerated and appended to this doc with the
 delta.
+
+---
+
+## 6. Results of the P1 + P2 cycle (2026-07-11, same machine)
+
+The cycle landed as five increments on `performence-upscaling`, each
+validated against `cargo test` (171 tests, incl. new fault-rewind and
+fetch-boundary pins) and the 80386 MOO suite (1,758,700 cases, debug +
+release). New cross-checks: all 12 final-register values still match
+Unicorn exactly.
+
+What landed:
+
+- **P1 (both cores)** — the per-step whole-`Registers` snapshot is now a
+  GPR-only snapshot (32 B / 128 B); all cold-field writers (13 sites on the
+  386, 19 on x86-64) call a flag-guarded `prepare_cold_write()` that
+  captures the full file at most once per instruction. A permanent
+  debug-build differential assert replays the old rewind and compares —
+  every debug test run, including a 1.76M-case debug MOO run, validates the
+  escalation census bit-exactly. Three new tests pin cold-state rewind on
+  mid-instruction faults (IRET/IRETQ outer-SS fault after CS commit, call
+  gate + INT gate inner-stack fault after SS commit).
+- **P2 (x86-64 only)** — a one-entry *persistent* fetch-translation cache:
+  a tag compare replaces the per-byte NX-aware TLB lookup, and a hot loop
+  within one page pays zero translates. Only the translation is cached
+  (bytes are read live — SMC exact); invalidation rides the existing choke
+  points (TLB flushes, INVLPG, `prepare_cold_write` ⊇ every CPL/mode/CS
+  change). `fetch16/32/64` additionally issue one wide bus read when the
+  field fits in the cached page. Four new tests pin page-straddle #PF/CR2
+  (unmapped + NX), SMC-into-next-instruction, and a guest PD-rewrite +
+  INVLPG remap.
+- **P2 on the 386: measured and rejected.** Three window variants all
+  regressed the paging-off benchmarks (criterion: arith −9%, call_ret
+  −7.6%): with paging off the per-byte checks are cheaper than window
+  bookkeeping at `fetch8`'s many inline sites, and the per-instruction
+  refill call dominates 2-byte instructions. The 386 keeps its per-byte
+  fetch; its boundary tests were kept as regression pins. The per-page
+  *persistent* design would help the 386's paged mode, but no harness
+  measures it yet (see the paging-ON workload gap in §4).
+
+### MIPS, best of 5 — before → after
+
+| Mode | Workload | Before | After | Δ | Unicorn | Unicorn/Remu now |
+|---|---|---:|---:|---:|---:|---:|
+| 16 | tight_loop | 256 | 254 | — | 723 | 2.8× |
+| 16 | alu_mix | 198 | 199 | — | 690 | 3.5× |
+| 16 | mem_rw | 205 | 202 | — | 131 | **0.65× — Remu wins** |
+| 16 | call_ret | 257 | 258 | — | 132 | **0.51× — Remu wins** |
+| 32 | tight_loop | 146 | 187 | +28% | 904 | 4.8× |
+| 32 | alu_mix | 85 | 95 | +12% | 1418 | 14.9× |
+| 32 | mem_rw | 85 | 93 | +9% | 200 | 2.2× |
+| 32 | call_ret | 116 | 139 | +20% | 134 | **0.96× — Remu wins** |
+| 64 | tight_loop | 60 | 74 | +23% | 903 | 12.3× |
+| 64 | alu_mix | 43 | 52 | +21% | 1434 | 27.8× |
+| 64 | mem_rw | 45 | 55 | +22% | 55 | **~1.0× — parity** |
+| 64 | call_ret | 55 | 71 | +29% | 148 | 2.1× |
+
+(8086 core untouched by design — it has no snapshot and no per-byte fetch
+checks. Unicorn column unchanged: same machine, same version, warm cache.)
+
+Targets vs outcome: the x86-64 core reached parity-or-better on `mem_rw`
+(55–56 vs 54.9 across runs) as predicted; 32-bit `call_ret` now beats
+Unicorn outright, which the roadmap had not predicted. The P2 lesson —
+hoisting cheap checks costs more than it saves; only hoisting the TLB
+lookup pays, and only when it persists across instructions — narrows P3's
+design space usefully: a decoded-instruction cache must amortize *decode*,
+not fetch checks, to clear the bar.
