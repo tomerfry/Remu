@@ -327,6 +327,36 @@ pub enum HostTrap {
     Exception(Exception),
 }
 
+/// Why [`Cpu::run`] stopped before retiring all `n` requested step-units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive] // a JIT backend may add exit reasons
+pub enum RunExit {
+    /// All `n` units retired.
+    Completed,
+    /// [`Cpu::host_trap`] is set (syscall or trapped fault). Service and
+    /// `take()` it, then call [`Cpu::run`] again — no guest instruction has
+    /// executed past the trap.
+    HostTrap,
+    /// The CPU is halted with no wake event pending (no NMI, no INTR with
+    /// `IF`). Assert an interrupt (or give up), then call [`Cpu::run`]
+    /// again. Unlike [`Cpu::step`], which burns one idle cycle per call
+    /// while halted, [`Cpu::run`] returns instead of idling.
+    Halted,
+    /// Triple fault; only [`Cpu::reset`] recovers.
+    Shutdown,
+}
+
+/// The outcome of [`Cpu::run`]: how much ran, and why it stopped.
+#[derive(Debug, Clone, Copy)]
+pub struct RunResult {
+    /// [`Cpu::step`]-equivalents retired: instruction executions and
+    /// interrupt/trap deliveries each count one, exactly as one `step()`
+    /// call would.
+    pub executed: u64,
+    /// Why the run ended.
+    pub exit: RunExit,
+}
+
 /// Cycles consumed by servicing a hardware interrupt (nominal figure).
 const INTERRUPT_CYCLES: u32 = 40;
 
@@ -454,6 +484,11 @@ pub(crate) const EVT_INTR: u8 = 1 << 1;
 /// [`Cpu::events`] bit: interrupts (and traps) are inhibited for one
 /// instruction after `MOV SS` / `POP SS` / `STI`.
 pub(crate) const EVT_INHIBIT: u8 = 1 << 2;
+/// [`Cpu::events`] bit: a host trap was just recorded — a doorbell so the
+/// [`Cpu::run`] hot loop needs no separate `host_trap` probe per
+/// instruction. `Cpu::host_trap` itself stays the truth; the bit is cleared
+/// as soon as it is acted on (or found stale).
+pub(crate) const EVT_HOST_TRAP: u8 = 1 << 3;
 
 /// An x86-64 processor.
 ///
@@ -744,6 +779,64 @@ impl Cpu {
         self.step_fast(bus)
     }
 
+    /// Execute up to `n` [`Cpu::step`]-equivalents as one batch, so the
+    /// per-step boundary checks stay out of the embedder's loop. Semantics
+    /// match `n` individual `step()` calls, with two deliberate refinements:
+    /// the run stops (rather than executing further instructions) as soon as
+    /// [`Cpu::host_trap`] is set, and a halted CPU with no wake event
+    /// pending returns [`RunExit::Halted`] instead of burning idle cycles.
+    ///
+    /// The STI/`MOV SS` shadow and a pending single-step trap are CPU state,
+    /// so they carry correctly across `run` boundaries.
+    pub fn run<B: Bus>(&mut self, bus: &mut B, n: u64) -> RunResult {
+        // A trap the embedder has not yet taken stops the run before
+        // anything executes.
+        if self.host_trap.is_some() {
+            return RunResult {
+                executed: 0,
+                exit: RunExit::HostTrap,
+            };
+        }
+        let mut executed = 0u64;
+        while executed < n {
+            // One predicate on the hot path: recording a host trap rings
+            // EVT_HOST_TRAP, so no separate `host_trap` probe is needed.
+            if self.boundary_pending() {
+                if let Some(exit) = self.run_boundary(bus) {
+                    return RunResult { executed, exit };
+                }
+            } else {
+                self.step_fast(bus);
+            }
+            executed += 1;
+        }
+        RunResult {
+            executed,
+            exit: RunExit::Completed,
+        }
+    }
+
+    /// [`Cpu::run`]'s boundary arm, out of line to keep the run loop's body
+    /// as lean as the step() loop's: either resolves the boundary as an exit
+    /// reason, or performs one slow step-unit (delivery, wake, shadow or
+    /// trap-flag work) and returns `None`.
+    #[cold]
+    #[inline(never)]
+    fn run_boundary<B: Bus>(&mut self, bus: &mut B) -> Option<RunExit> {
+        if self.host_trap.is_some() {
+            self.events &= !EVT_HOST_TRAP;
+            return Some(RunExit::HostTrap);
+        }
+        if self.shutdown {
+            return Some(RunExit::Shutdown);
+        }
+        if self.halted && !self.interrupt_pending() {
+            return Some(RunExit::Halted);
+        }
+        self.step_slow(bus);
+        None
+    }
+
     /// Whether the next instruction boundary needs [`Cpu::step_slow`]: a
     /// latched event, HLT/shutdown state, or a pending single-step trap.
     ///
@@ -769,6 +862,9 @@ impl Cpu {
     #[cold]
     #[inline(never)]
     fn step_slow<B: Bus>(&mut self, bus: &mut B) -> u32 {
+        // A stale run() doorbell (trap already taken, or the embedder drives
+        // step() directly) must not pin every step onto this slow path.
+        self.events &= !EVT_HOST_TRAP;
         if self.shutdown {
             self.cycles += 1;
             return 1;
@@ -932,7 +1028,7 @@ impl Cpu {
         // OS-emulation hook: hand the (rewound, restartable) fault to
         // the host instead of vectoring through the IDT.
         if self.trap_faults {
-            self.host_trap = Some(HostTrap::Exception(e));
+            self.set_host_trap(HostTrap::Exception(e));
             self.cycles += INTERRUPT_CYCLES as u64;
             return None;
         }
@@ -1237,6 +1333,13 @@ impl Cpu {
     pub(crate) fn interrupt_pending(&self) -> bool {
         self.events & EVT_NMI != 0
             || (self.events & EVT_INTR != 0 && self.regs.rflags.contains(RFlags::IF))
+    }
+
+    /// Record a host trap and ring the [`Cpu::run`] doorbell bit.
+    #[inline]
+    pub(crate) fn set_host_trap(&mut self, t: HostTrap) {
+        self.host_trap = Some(t);
+        self.events |= EVT_HOST_TRAP;
     }
 
     // --- Canonical addresses -----------------------------------------------------

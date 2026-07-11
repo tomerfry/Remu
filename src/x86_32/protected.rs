@@ -1021,7 +1021,7 @@ impl Cpu {
         // caught here — before any IDT/gate/TSS logic — so it works at CPL 3
         // with no IDT installed. EIP already points past the INT instruction.
         if self.syscall_int == Some(vector) {
-            self.host_trap = Some(super::HostTrap::Syscall);
+            self.set_host_trap(super::HostTrap::Syscall);
             return Ok(());
         }
         self.raise(

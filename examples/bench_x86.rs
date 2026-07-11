@@ -280,10 +280,13 @@ fn bench_386_inner(
     for _ in 0..RUNS {
         cpu.regs.eip = 0x1000;
         let t = Instant::now();
-        for _ in 0..instructions {
-            cpu.step(&mut mem);
-        }
+        let r = cpu.run(&mut mem, instructions);
         times.push(t.elapsed().as_secs_f64());
+        assert_eq!(
+            r.executed, instructions,
+            "{name}: run() stopped early ({:?})",
+            r.exit
+        );
         assert_eq!(cpu.regs.eip, end, "{name}: did not land on the end address");
         assert!(!cpu.halted && !cpu.shutdown, "{name}: halted/shutdown");
     }
@@ -353,10 +356,13 @@ fn bench_x64(name: &str, program: &[u8], instructions: u64, check: fn(&x86_64::C
     for _ in 0..RUNS {
         cpu.regs.rip = 0x1_0000;
         let t = Instant::now();
-        for _ in 0..instructions {
-            cpu.step(&mut mem);
-        }
+        let r = cpu.run(&mut mem, instructions);
         times.push(t.elapsed().as_secs_f64());
+        assert_eq!(
+            r.executed, instructions,
+            "{name}: run() stopped early ({:?})",
+            r.exit
+        );
         assert_eq!(cpu.regs.rip, end, "{name}: did not land on the end address");
         assert!(!cpu.halted && !cpu.shutdown, "{name}: halted/shutdown");
     }
