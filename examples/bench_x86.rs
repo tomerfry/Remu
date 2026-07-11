@@ -195,6 +195,22 @@ const CALL32: &[u8] = &[
 ];                                // 1016: end
 
 fn bench_386(name: &str, program: &[u8], instructions: u64, check: fn(&x86_32::Cpu) -> u64) {
+    bench_386_inner(name, program, instructions, false, check);
+}
+
+/// The same 386 rig with CR0.PG set and identity 4 KiB page tables for the
+/// low 4 MiB (accessed/dirty preset), exercising the TLB paths.
+fn bench_386_paged(name: &str, program: &[u8], instructions: u64, check: fn(&x86_32::Cpu) -> u64) {
+    bench_386_inner(name, program, instructions, true, check);
+}
+
+fn bench_386_inner(
+    name: &str,
+    program: &[u8],
+    instructions: u64,
+    paging: bool,
+    check: fn(&x86_32::Cpu) -> u64,
+) {
     use x86_32::{SegReg, cr0, reg};
 
     let mut mem = x86_32::LinearMemory::new();
@@ -206,6 +222,18 @@ fn bench_386(name: &str, program: &[u8], instructions: u64, check: fn(&x86_32::C
     // (same trick as the usermode layer, ring 0 instead of ring 3).
     let mut cpu = x86_32::Cpu::new();
     cpu.regs.cr0 |= cr0::PE;
+    if paging {
+        // PD at 3 MiB, one PT mapping 0..4 MiB identity (P|RW|US|A|D so the
+        // steady state performs no A/D write-backs). Same tables as the
+        // Unicorn harness.
+        mem.load(0x30_0000, &(0x30_1000u32 | 0x67).to_le_bytes());
+        for page in 0..1024u32 {
+            let pte = (page << 12) | 0x67;
+            mem.load(0x30_1000 + page * 4, &pte.to_le_bytes());
+        }
+        cpu.regs.cr3 = 0x30_0000;
+        cpu.regs.cr0 |= cr0::PG;
+    }
     cpu.regs.seg[reg::CS as usize] = SegReg {
         sel: 0x08,
         base: 0,
@@ -325,6 +353,10 @@ fn main() {
     bench_386("alu_mix", ALU32, 2 + 7 * ALU_N, |c| c.regs.gpr[EAX as usize] as u64);
     bench_386("mem_rw", MEM32, 3 + 6 * MEM_N, |c| c.regs.gpr[EAX as usize] as u64);
     bench_386("call_ret", CALL32, 3 + 5 * CALL_N, |c| c.regs.gpr[EAX as usize] as u64);
+    bench_386_paged("tight_loop_pg", TIGHT32, 1 + 2 * TIGHT_N, |c| {
+        c.regs.gpr[ECX as usize] as u64
+    });
+    bench_386_paged("mem_rw_pg", MEM32, 3 + 6 * MEM_N, |c| c.regs.gpr[EAX as usize] as u64);
 
     use x86_64::reg::{RAX, RCX};
     bench_x64("tight_loop", TIGHT64, 1 + 2 * TIGHT_N, |c| c.regs.gpr[RCX as usize]);

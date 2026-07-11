@@ -22,6 +22,7 @@ from unicorn.x86_const import (
     UC_X86_REG_AX, UC_X86_REG_CX, UC_X86_REG_IP,
     UC_X86_REG_EAX, UC_X86_REG_ECX, UC_X86_REG_EIP,
     UC_X86_REG_RAX, UC_X86_REG_RCX, UC_X86_REG_RIP,
+    UC_X86_REG_CR0, UC_X86_REG_CR3,
 )
 
 # Timed runs per workload; best is reported (warm translation cache).
@@ -184,11 +185,21 @@ CALL64 = bytes([
 
 
 def bench(mode_name, mode, pc_reg, check_reg, base, map_size, src_addr, src_len,
-          name, code, instructions):
+          name, code, instructions, paging=False):
     mu = Uc(UC_ARCH_X86, mode)
     mu.mem_map(0, map_size)
     mu.mem_write(base, code)
     mu.mem_write(src_addr, pat(src_len))
+
+    if paging:
+        # Identity 4 KiB tables for the low 4 MiB: PD at 3 MiB, one PT,
+        # entries P|RW|US|A|D — same tables as bench_x86.rs.
+        mu.mem_write(0x300000, (0x301000 | 0x67).to_bytes(4, "little"))
+        pt = b"".join(((page << 12) | 0x67).to_bytes(4, "little")
+                      for page in range(1024))
+        mu.mem_write(0x301000, pt)
+        mu.reg_write(UC_X86_REG_CR3, 0x300000)
+        mu.reg_write(UC_X86_REG_CR0, mu.reg_read(UC_X86_REG_CR0) | 0x8000_0001)
 
     end = base + len(code)
     times = []
@@ -231,6 +242,10 @@ def main():
           name="mem_rw", code=MEM32, instructions=3 + 6 * MEM_N)
     bench(**m32, check_reg=UC_X86_REG_EAX,
           name="call_ret", code=CALL32, instructions=3 + 5 * CALL_N)
+    bench(**m32, check_reg=UC_X86_REG_ECX, paging=True,
+          name="tight_loop_pg", code=TIGHT32, instructions=1 + 2 * TIGHT_N)
+    bench(**m32, check_reg=UC_X86_REG_EAX, paging=True,
+          name="mem_rw_pg", code=MEM32, instructions=3 + 6 * MEM_N)
 
     m64 = dict(mode_name="64", mode=UC_MODE_64, pc_reg=UC_X86_REG_RIP,
                base=0x10000, map_size=0x400000, src_addr=0x100000, src_len=0x1008)
