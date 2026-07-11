@@ -56,6 +56,29 @@ cpu.step(&mut mem);
 assert_eq!(cpu.regs.gpr[0], 0x1234_5678);
 ```
 
+## User-mode emulation (qemu-user style)
+
+`remu-user` runs statically linked Linux i386 ELF executables on the 80386
+core, on any host: the image is mapped into a sparse 4 GiB address space, the
+CPU runs flat ring-3 protected mode, and `INT 0x80` Linux syscalls are
+emulated by the host (`write`, `read`, `brk`, `mmap2`, `set_thread_area`
+TLS via a real guest GDT, and friends):
+
+```sh
+cargo run --release --bin remu-user -- [--strace] [--trace] [--env K=V] \
+    <program.elf> [guest args...]
+```
+
+The guest's exit status becomes the host exit code; a crash prints a register
+dump. The layer is written against the small `remu::usermode::UserArch`
+adapter trait, so adding another CPU architecture means one new adapter.
+Current limits (v1): `ET_EXEC` only (no dynamic linking/PIE), integer-only
+binaries built with `-march=i386` (no x87, and no 486+ instructions — stock
+musl static binaries need `lock cmpxchg`), no signals, no threads. See
+`tests/data/README.md` for building compatible test programs.
+
+## Tests
+
 ```sh
 cargo test
 ```

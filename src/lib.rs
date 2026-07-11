@@ -9,6 +9,10 @@
 //! cores), so the same cores power unit tests, integration images, and
 //! (eventually) full emulated machines.
 //!
+//! The [`usermode`] layer runs statically linked Linux i386 ELF executables
+//! on the 80386 core, emulating their syscalls on the host (qemu-user
+//! style) — see the `remu-user` binary.
+//!
 //! ```
 //! use remu::{Cpu, memory::FlatMemory, bus::Bus};
 //!
@@ -30,6 +34,7 @@ pub mod memory;
 pub mod os;
 #[cfg(feature = "python")]
 mod python;
+pub mod usermode;
 pub mod x86;
 pub mod x86_32;
 
