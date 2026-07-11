@@ -30,6 +30,7 @@ impl Cpu {
     /// Execute the instruction whose (non-prefix) opcode byte is `opcode`.
     /// Returns the cycles consumed.
     pub(crate) fn dispatch<B: Bus>(&mut self, bus: &mut B, opcode: u8) -> Exec<u32> {
+        self.stat(|s| s.opcode_hist[opcode as usize] += 1);
         match opcode {
             // --- ALU: ADD OR ADC SBB AND SUB XOR CMP, six forms each --------
             0x00 | 0x08 | 0x10 | 0x18 | 0x20 | 0x28 | 0x30 | 0x38 => {
@@ -1428,7 +1429,7 @@ impl Cpu {
         Ok(if op.is_mem() { 7 } else { 3 })
     }
 
-    fn shift_dispatch8(&mut self, sub: u8, v: u8, n: u32) -> u8 {
+    pub(crate) fn shift_dispatch8(&mut self, sub: u8, v: u8, n: u32) -> u8 {
         match sub {
             0 => self.rol8(v, n),
             1 => self.ror8(v, n),
@@ -1454,7 +1455,7 @@ impl Cpu {
         Ok(if op.is_mem() { 7 } else { 3 })
     }
 
-    fn shift_dispatch(&mut self, sub: u8, v: u32, n: u32) -> u32 {
+    pub(crate) fn shift_dispatch(&mut self, sub: u8, v: u32, n: u32) -> u32 {
         if self.osize32 {
             match sub {
                 0 => self.rol32(v, n),

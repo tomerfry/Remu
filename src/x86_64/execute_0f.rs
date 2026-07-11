@@ -11,6 +11,7 @@ use super::{Bus, Cpu, Exception, Exec};
 
 impl Cpu {
     pub(crate) fn dispatch_0f<B: Bus>(&mut self, bus: &mut B, opcode: u8) -> Exec<u32> {
+        self.stat(|s| s.opcode_0f_hist[opcode as usize] += 1);
         // Decode-time LOCK legality: the bit-set group, the atomic
         // primitives, and group 9 (CMPXCHG8B/16B).
         if self.lock

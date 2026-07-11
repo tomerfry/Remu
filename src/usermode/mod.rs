@@ -60,6 +60,11 @@ pub trait UserArch {
         None
     }
 
+    /// Drop any decoded-code caches. Called after every serviced syscall:
+    /// the handlers write guest memory host-side (read buffers, mmap, brk),
+    /// bypassing the CPU's own store tracking.
+    fn invalidate_code(&mut self) {}
+
     /// Take a pending trapped CPU exception, if any (clears it); the string
     /// describes it for a fault report. Register state has been rewound to
     /// the faulting instruction, so `pc()`/`dump()` point at the culprit.
@@ -128,6 +133,9 @@ impl<A: UserArch> Usermode<A> {
                 linux::Control::Ret(v) => self.cpu.set_syscall_ret(v),
                 linux::Control::Exit(code) => return Some(Exit::Exited(code)),
             }
+            // Syscall handlers write guest memory host-side (read buffers,
+            // mmap zero-fill, brk) — stale decoded code must not survive.
+            self.cpu.invalidate_code();
         }
         if let Some(f) = self.cpu.take_fault() {
             return Some(Exit::Fault(format!("{f}\n{}", self.cpu.dump())));

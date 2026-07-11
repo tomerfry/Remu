@@ -22,6 +22,9 @@ from unicorn.x86_const import (
     UC_X86_REG_AX, UC_X86_REG_CX, UC_X86_REG_IP,
     UC_X86_REG_EAX, UC_X86_REG_ECX, UC_X86_REG_EIP,
     UC_X86_REG_RAX, UC_X86_REG_RCX, UC_X86_REG_RIP,
+    UC_X86_REG_CR0, UC_X86_REG_CR3, UC_X86_REG_GDTR,
+    UC_X86_REG_CS, UC_X86_REG_DS, UC_X86_REG_ES,
+    UC_X86_REG_FS, UC_X86_REG_GS, UC_X86_REG_SS,
 )
 
 # Timed runs per workload; best is reported (warm translation cache).
@@ -31,6 +34,7 @@ RUNS = 5
 INNER16 = 0xFFFF
 TIGHT16_OUTER, ALU16_OUTER, MEM16_OUTER, CALL16_OUTER = 80, 25, 25, 30
 TIGHT_N, ALU_N, MEM_N, CALL_N = 20_000_000, 3_000_000, 4_000_000, 4_000_000
+REP_OUTER = 50_000
 
 
 def per16(body, outer):
@@ -139,6 +143,19 @@ CALL32 = bytes([
     0xC3,                          # 1015: RET
 ])                                 # 1016: end
 
+# 50,000 x REP MOVSD of 4 KiB; a REP counts as one instruction in both
+# harnesses, so the MIPS column is relative string throughput.
+REP32 = bytes([
+    0xBA, 0x50, 0xC3, 0x00, 0x00,  # 1000: MOV EDX, 50000
+    0xBE, 0x00, 0x00, 0x10, 0x00,  # 1005: MOV ESI, 0x100000 (src)
+    0xBF, 0x00, 0x40, 0x10, 0x00,  # 100A: MOV EDI, 0x104000 (dst)
+    0xB9, 0x00, 0x04, 0x00, 0x00,  # 100F: MOV ECX, 1024
+    0xF3, 0xA5,                    # 1014: REP MOVSD
+    0x4A,                          # 1016: DEC EDX
+    0x75, 0xEC,                    # 1017: JNZ 1005
+    0xA1, 0xFC, 0x4F, 0x10, 0x00,  # 1019: MOV EAX, [0x104FFC] (last dword)
+])                                 # 101E: end
+
 # --- 64-bit long mode, programs at 0x10000 -----------------------------------
 
 TIGHT64 = bytes([
@@ -183,12 +200,42 @@ CALL64 = bytes([
 ])                                             # 1001E: end
 
 
+def gdt_entry(access):
+    """Flat 4 GiB descriptor: limit 0xFFFFF, base 0, G+D flags."""
+    return bytes([0xFF, 0xFF, 0, 0, 0, access, 0xCF, 0])
+
+
 def bench(mode_name, mode, pc_reg, check_reg, base, map_size, src_addr, src_len,
-          name, code, instructions):
+          name, code, instructions, paging=False, ring3=False):
     mu = Uc(UC_ARCH_X86, mode)
     mu.mem_map(0, map_size)
     mu.mem_write(base, code)
     mu.mem_write(src_addr, pat(src_len))
+
+    if ring3:
+        # Flat user-privilege segments via a real GDT (null, code DPL3 at
+        # 0x0B, data DPL3 at 0x13) — mirrors bench_x86.rs's ring-3 rig.
+        # Data segments load first (a DPL-3 data load is legal at any CPL),
+        # CS last; SS stays at its ring-0 default — these workloads never
+        # touch the stack, and Unicorn refuses cross-privilege SS loads.
+        gdt = bytes(8) + gdt_entry(0xFB) + gdt_entry(0xF3)
+        gdt_addr = 0x3F0000
+        mu.mem_write(gdt_addr, gdt)
+        mu.reg_write(UC_X86_REG_GDTR, (0, gdt_addr, len(gdt) - 1, 0))
+        for seg in (UC_X86_REG_DS, UC_X86_REG_ES, UC_X86_REG_FS,
+                    UC_X86_REG_GS):
+            mu.reg_write(seg, 0x13)
+        mu.reg_write(UC_X86_REG_CS, 0x0B)
+
+    if paging:
+        # Identity 4 KiB tables for the low 4 MiB: PD at 3 MiB, one PT,
+        # entries P|RW|US|A|D — same tables as bench_x86.rs.
+        mu.mem_write(0x300000, (0x301000 | 0x67).to_bytes(4, "little"))
+        pt = b"".join(((page << 12) | 0x67).to_bytes(4, "little")
+                      for page in range(1024))
+        mu.mem_write(0x301000, pt)
+        mu.reg_write(UC_X86_REG_CR3, 0x300000)
+        mu.reg_write(UC_X86_REG_CR0, mu.reg_read(UC_X86_REG_CR0) | 0x8000_0001)
 
     end = base + len(code)
     times = []
@@ -231,6 +278,16 @@ def main():
           name="mem_rw", code=MEM32, instructions=3 + 6 * MEM_N)
     bench(**m32, check_reg=UC_X86_REG_EAX,
           name="call_ret", code=CALL32, instructions=3 + 5 * CALL_N)
+    bench(**m32, check_reg=UC_X86_REG_ECX, paging=True,
+          name="tight_loop_pg", code=TIGHT32, instructions=1 + 2 * TIGHT_N)
+    bench(**m32, check_reg=UC_X86_REG_EAX, paging=True,
+          name="mem_rw_pg", code=MEM32, instructions=3 + 6 * MEM_N)
+    bench(**m32, check_reg=UC_X86_REG_ECX, ring3=True,
+          name="tight_loop_r3", code=TIGHT32, instructions=1 + 2 * TIGHT_N)
+    bench(**m32, check_reg=UC_X86_REG_EAX, ring3=True,
+          name="mem_rw_r3", code=MEM32, instructions=3 + 6 * MEM_N)
+    bench(**m32, check_reg=UC_X86_REG_EAX,
+          name="rep_movs", code=REP32, instructions=2 + 6 * REP_OUTER)
 
     m64 = dict(mode_name="64", mode=UC_MODE_64, pc_reg=UC_X86_REG_RIP,
                base=0x10000, map_size=0x400000, src_addr=0x100000, src_len=0x1008)

@@ -54,6 +54,20 @@ impl Tlb {
             e.tag = EMPTY;
         }
     }
+
+    /// Non-faulting read probe: the cached physical address for `lin` if a
+    /// matching entry exists and permits a read at the given privilege
+    /// (mirrors `translate`'s read rule). No walk, no A/D updates.
+    #[inline(always)]
+    pub fn peek(&self, lin: u32, user: bool) -> Option<u32> {
+        let page = lin >> 12;
+        let e = &self.entries[(page as usize) & (TLB_SIZE - 1)];
+        if e.tag == page && (!user || e.user) {
+            Some(e.phys | (lin & 0xFFF))
+        } else {
+            None
+        }
+    }
 }
 
 /// Page-table entry bits shared by PDEs and PTEs.
@@ -132,6 +146,9 @@ impl Cpu {
 
         if pde & pte::A == 0 {
             pde |= pte::A;
+            // A guest can execute from its own page tables, so even the
+            // A/D write-backs stamp the icache (cold path, costs nothing).
+            self.icache.stamp_write(pde_addr);
             bus.write32(pde_addr, pde);
         }
         let need_dirty = write && ptev & pte::D == 0;
@@ -140,6 +157,7 @@ impl Cpu {
             if write {
                 ptev |= pte::D;
             }
+            self.icache.stamp_write(pte_addr);
             bus.write32(pte_addr, ptev);
         }
 
@@ -157,7 +175,7 @@ impl Cpu {
 
     /// Whether paging is active.
     #[inline]
-    fn paging(&self) -> bool {
+    pub(crate) fn paging(&self) -> bool {
         self.regs.cr0 & cr0::PG != 0
     }
 
@@ -247,10 +265,12 @@ impl Cpu {
     #[inline]
     pub(crate) fn lin_write8<B: Bus>(&mut self, bus: &mut B, lin: u32, v: u8) -> Exec<()> {
         if !self.paging() {
+            self.icache.stamp_write(lin);
             bus.write(lin, v);
             return Ok(());
         }
         let phys = self.translate(bus, lin, true)?;
+        self.icache.stamp_write(phys);
         bus.write(phys, v);
         Ok(())
     }
@@ -258,11 +278,13 @@ impl Cpu {
     #[inline]
     pub(crate) fn lin_write16<B: Bus>(&mut self, bus: &mut B, lin: u32, v: u16) -> Exec<()> {
         if !self.paging() {
+            self.icache.stamp_write_span(lin, lin.wrapping_add(1));
             bus.write16(lin, v);
             return Ok(());
         }
         if lin & 0xFFF < 0xFFF {
             let phys = self.translate(bus, lin, true)?;
+            self.icache.stamp_write(phys);
             bus.write16(phys, v);
             Ok(())
         } else {
@@ -270,6 +292,7 @@ impl Cpu {
             // the second page leaves the first untouched.
             let p0 = self.translate(bus, lin, true)?;
             let p1 = self.translate(bus, lin.wrapping_add(1), true)?;
+            self.icache.stamp_write_span(p0, p1);
             bus.write(p0, v as u8);
             bus.write(p1, (v >> 8) as u8);
             Ok(())
@@ -279,11 +302,13 @@ impl Cpu {
     #[inline]
     pub(crate) fn lin_write32<B: Bus>(&mut self, bus: &mut B, lin: u32, v: u32) -> Exec<()> {
         if !self.paging() {
+            self.icache.stamp_write_span(lin, lin.wrapping_add(3));
             bus.write32(lin, v);
             return Ok(());
         }
         if lin & 0xFFF < 0xFFD {
             let phys = self.translate(bus, lin, true)?;
+            self.icache.stamp_write(phys);
             bus.write32(phys, v);
             Ok(())
         } else {
@@ -292,6 +317,7 @@ impl Cpu {
             for (i, p) in phys.iter_mut().enumerate() {
                 *p = self.translate(bus, lin.wrapping_add(i as u32), true)?;
             }
+            self.icache.stamp_write_span(phys[0], phys[3]);
             for (i, p) in phys.iter().enumerate() {
                 bus.write(*p, (v >> (8 * i)) as u8);
             }

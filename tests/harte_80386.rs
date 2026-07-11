@@ -322,6 +322,11 @@ fn run_file(path: &PathBuf, revoked: &HashSet<String>) -> (usize, usize) {
     let mut bus = RigBus {
         mem: LinearMemory::new(),
     };
+    // One CPU reused across cases: `reset()` restores power-on state and
+    // invalidates the caches (the reseeded RAM is a host-side write), and
+    // `set_initial` overwrites the whole register file. Constructing a CPU
+    // per case would allocate a fresh icache 1.76M times.
+    let mut cpu = Cpu::new();
     for t in &tests {
         let hash_hex: String = t.hash.iter().map(|b| format!("{b:02x}")).collect();
         if revoked.contains(&hash_hex) {
@@ -344,7 +349,7 @@ fn run_file(path: &PathBuf, revoked: &HashSet<String>) -> (usize, usize) {
             bus.mem.ram[addr as usize & 0xFF_FFFF] = val;
         }
 
-        let mut cpu = Cpu::new();
+        cpu.reset();
         set_initial(&mut cpu, &t.init);
         let mut steps = 0;
         while !cpu.halted && steps < 1000 {

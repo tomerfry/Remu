@@ -26,8 +26,10 @@
 //! ```
 
 mod alu;
+mod decode;
 mod execute;
 mod execute_0f;
+mod icache;
 mod modrm;
 mod msr;
 mod paging;
@@ -368,6 +370,83 @@ pub(crate) enum OpSize {
 
 pub(crate) use OpSize::{O16, O32, O64};
 
+/// Decode/dispatch profile counters, collected only with the `perf-stats`
+/// feature. They quantify per-instruction decode work (the target of the
+/// decoded-instruction-cache effort) and are reported by
+/// [`PerfStats::report`].
+#[derive(Debug, Clone)]
+pub struct PerfStats {
+    /// Instructions executed (`exec_one` entries).
+    pub insns: u64,
+    /// Prefix bytes consumed by the decode loop (REX included).
+    pub prefix_bytes: u64,
+    /// `modrm()` decodes (ModRM + SIB + displacement fetches).
+    pub modrm_calls: u64,
+    /// Operand-size immediates fetched via `fetch_imm`.
+    pub imm_fetches: u64,
+    /// One-byte-opcode dispatch histogram.
+    pub opcode_hist: [u64; 256],
+    /// Two-byte (`0F xx`) dispatch histogram.
+    pub opcode_0f_hist: [u64; 256],
+    /// Decoded-instruction-cache hits.
+    pub icache_hits: u64,
+    /// Decoded-instruction-cache fills.
+    pub icache_fills: u64,
+    /// Decoded instructions rejected by the cache (page-crossers).
+    pub icache_uncacheable: u64,
+}
+
+impl Default for PerfStats {
+    fn default() -> Self {
+        PerfStats {
+            insns: 0,
+            prefix_bytes: 0,
+            modrm_calls: 0,
+            imm_fetches: 0,
+            opcode_hist: [0; 256],
+            opcode_0f_hist: [0; 256],
+            icache_hits: 0,
+            icache_fills: 0,
+            icache_uncacheable: 0,
+        }
+    }
+}
+
+impl PerfStats {
+    /// Multi-line summary: per-instruction averages, then every executed
+    /// opcode sorted by frequency.
+    pub fn report(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        let n = self.insns.max(1) as f64;
+        let _ = writeln!(
+            out,
+            "insns {}  prefix/i {:.3}  modrm/i {:.3}  imm/i {:.3}  \
+             icache hit/i {:.3} fills {} uncacheable {}",
+            self.insns,
+            self.prefix_bytes as f64 / n,
+            self.modrm_calls as f64 / n,
+            self.imm_fetches as f64 / n,
+            self.icache_hits as f64 / n,
+            self.icache_fills,
+            self.icache_uncacheable,
+        );
+        let one = self.opcode_hist.iter().enumerate();
+        let two = self.opcode_0f_hist.iter().enumerate();
+        let mut ops: Vec<(String, u64)> = one
+            .map(|(op, &c)| (format!("{op:02X}"), c))
+            .chain(two.map(|(op, &c)| (format!("0F {op:02X}"), c)))
+            .filter(|&(_, c)| c > 0)
+            .collect();
+        ops.sort_by(|a, b| b.1.cmp(&a.1));
+        for (name, count) in ops {
+            let pct = count as f64 / n * 100.0;
+            let _ = writeln!(out, "  {name:>5}  {count:>12}  {pct:5.1}%");
+        }
+        out
+    }
+}
+
 /// An x86-64 processor.
 ///
 /// As with the other cores, the CPU does not own its bus — call [`Cpu::step`]
@@ -461,6 +540,8 @@ pub struct Cpu {
     supervisor_override: bool,
     /// TLB for paged address translation (see `paging.rs`).
     tlb: paging::Tlb,
+    /// Decoded-instruction cache (see `icache.rs`).
+    icache: icache::ICache,
 
     // --- Host (OS-emulation) hooks — all inert at their defaults -------------
     /// If set, `INT n` for this vector does not vector through the IDT;
@@ -486,6 +567,15 @@ pub struct Cpu {
     /// [`syscall_int`]: Cpu::syscall_int
     /// [`trap_syscall`]: Cpu::trap_syscall
     pub host_trap: Option<HostTrap>,
+
+    /// Profile counters (present only with the `perf-stats` feature).
+    #[cfg(feature = "perf-stats")]
+    pub stats: PerfStats,
+
+    /// Test-only switch forcing the fused decode path, for differential
+    /// tests of the decoupled decoder.
+    #[cfg(test)]
+    pub(crate) fused_only: bool,
 }
 
 impl Cpu {
@@ -520,11 +610,25 @@ impl Cpu {
             used_rip_rel: false,
             supervisor_override: false,
             tlb: paging::Tlb::new(),
+            icache: icache::ICache::new(),
             syscall_int: None,
             trap_syscall: false,
             trap_faults: false,
             host_trap: None,
+            #[cfg(feature = "perf-stats")]
+            stats: PerfStats::default(),
+            #[cfg(test)]
+            fused_only: false,
         }
+    }
+
+    /// Bump a profile counter; compiles to nothing without `perf-stats`.
+    #[inline(always)]
+    pub(crate) fn stat(&mut self, f: impl FnOnce(&mut PerfStats)) {
+        #[cfg(feature = "perf-stats")]
+        f(&mut self.stats);
+        #[cfg(not(feature = "perf-stats"))]
+        let _ = f;
     }
 
     /// Perform a RESET: registers to power-on state, pending interrupts and
@@ -539,6 +643,7 @@ impl Cpu {
         self.supervisor_override = false;
         self.fetch_invalidate();
         self.tlb.flush();
+        self.icache.invalidate_all();
         self.host_trap = None;
     }
 
@@ -559,6 +664,8 @@ impl Cpu {
     /// through `bus` — real firmware does the same dance, just less tersely.
     pub fn setup_long_flat<B: Bus>(&mut self, bus: &mut B, rip: u64, rsp: u64) {
         self.fetch_invalidate();
+        // The table writes below go straight to the bus (host-side writes).
+        self.icache.invalidate_all();
         // PML4[0] -> PDPT at 0x2000; PDPT[n] = n GiB, present/write/user/PS.
         // The user bit keeps ring-3 test code runnable through the flat map.
         bus.write64(0x1000, 0x2000 | 0x07);
@@ -768,6 +875,53 @@ impl Cpu {
     /// Decode prefixes and execute the instruction at `CS:RIP`.
     fn exec_one<B: Bus>(&mut self, bus: &mut B) -> Exec<u32> {
         self.start_rip = self.regs.rip;
+        // Refreshed before the probe: the context key, the probe's address
+        // masking and every handler read it.
+        self.m64 = self.mode64();
+        self.stat(|s| s.insns += 1);
+
+        #[cfg(test)]
+        let try_hot = !self.fused_only;
+        #[cfg(not(test))]
+        let try_hot = true;
+
+        // Decoded-instruction-cache probe: on a hit, skip the fetch, prefix
+        // scan and dispatch entirely (see icache.rs for the validity rules).
+        let probe_phys = if try_hot { self.icache_phys() } else { None };
+        if let Some(phys) = probe_phys {
+            let slot = phys as usize & (icache::ICACHE_ENTRIES - 1);
+            let e = &self.icache.entries[slot];
+            if e.key == (phys | self.icache_ctx())
+                && e.version >= self.icache.stamps[(phys >> 12) as usize & (icache::STAMP_SLOTS - 1)]
+                && e.version >= self.icache.inval
+                // Per-hit revalidation replacing the per-byte fetch_check:
+                // canonicality in 64-bit mode (the canonical boundary is
+                // page-aligned, and page-crossers are never cached), the CS
+                // limit in legacy/compat modes.
+                && if self.m64 {
+                    Self::canonical(
+                        self.regs.seg[reg::CS as usize]
+                            .base
+                            .wrapping_add(self.start_rip),
+                    )
+                } else {
+                    self.start_rip.saturating_add((e.insn.len - 1) as u64)
+                        <= self.regs.seg[reg::CS as usize].limit as u64
+                }
+            {
+                let d = e.insn;
+                #[cfg(any(test, debug_assertions))]
+                {
+                    self.icache.hits += 1;
+                }
+                self.stat(|s| s.icache_hits += 1);
+                #[cfg(debug_assertions)]
+                self.icache_differential(bus, &d);
+                self.begin_decoded(&d);
+                return self.exec_decoded(bus, &d).map(|c| c + d.npfx() as u32);
+            }
+        }
+
         self.ilen = 0;
         self.seg_override = None;
         self.rep = None;
@@ -780,12 +934,59 @@ impl Cpu {
         self.supervisor_override = false;
         self.imm_len = 0;
         self.used_rip_rel = false;
-        self.m64 = self.mode64();
+
+        let (opcode, npfx) = self.scan_prefixes(bus)?;
+        let mut cycles = npfx;
+
+        // LOCK legality is a decode-time check: an opcode that can never
+        // lock raises #UD before any side effect. Candidate opcodes verify
+        // their operand form (memory destination, group sub-opcode) right
+        // after ModRM decode via `lock_check`.
+        if self.lock && opcode != 0x0F && !LOCK_CANDIDATE[opcode as usize] {
+            return Err(Exception::ud());
+        }
+
+        // Decoupled decode-then-execute for the hot subset. LOCK/REP forms
+        // and everything outside the subset run the fused path unchanged;
+        // a decode failure rewinds and re-runs fused, so fault ordering is
+        // bit-identical (see decode.rs).
+        if try_hot && !self.lock && self.rep.is_none() {
+            let mut d = decode::DecodedInsn::default();
+            match self.try_decode(bus, opcode, npfx, &mut d)? {
+                decode::Decoded::Hot => {
+                    if let Some(phys) = probe_phys {
+                        self.icache_fill(phys, &d);
+                    }
+                    return Ok(cycles + self.exec_decoded(bus, &d)?);
+                }
+                decode::Decoded::Cold0F(op2) => {
+                    return Ok(cycles + self.dispatch_0f(bus, op2)?);
+                }
+                decode::Decoded::Cold => {}
+            }
+        }
+
+        cycles += self.dispatch(bus, opcode)?;
+
+        // Backstop: a candidate whose handler never validated the prefix.
+        if self.lock && !self.lock_ok {
+            return Err(Exception::ud());
+        }
+        Ok(cycles)
+    }
+
+    /// Consume the prefix (and REX) bytes at `CS:RIP`, recording their
+    /// effects and resolving the effective sizes; returns the opcode byte
+    /// and the number of *legacy* prefixes consumed (REX bytes cost no
+    /// cycle, as before). The caller resets the remaining decode state and
+    /// refreshes `m64` first.
+    #[inline(always)]
+    fn scan_prefixes<B: Bus>(&mut self, bus: &mut B) -> Exec<(u8, u32)> {
         let db = self.regs.seg[reg::CS as usize].db();
         let mut p66 = false;
         let mut p67 = false;
 
-        let mut cycles = 0u32;
+        let mut npfx = 0u32;
         let opcode = loop {
             let b = self.fetch8(bus)?;
             match b {
@@ -794,6 +995,7 @@ impl Cpu {
                 // prefix byte voids the recorded one.
                 0x40..=0x4F if self.m64 => {
                     self.rex = Some(b);
+                    self.stat(|s| s.prefix_bytes += 1);
                     continue;
                 }
                 0x26 => self.seg_override = Some(reg::ES),
@@ -810,7 +1012,8 @@ impl Cpu {
                 _ => break b,
             }
             self.rex = None;
-            cycles += 1;
+            self.stat(|s| s.prefix_bytes += 1);
+            npfx += 1;
         };
         self.prefix66 = p66;
 
@@ -836,22 +1039,7 @@ impl Cpu {
             self.osize = if db != p66 { O32 } else { O16 };
             self.asize = if db != p67 { O32 } else { O16 };
         }
-
-        // LOCK legality is a decode-time check: an opcode that can never
-        // lock raises #UD before any side effect. Candidate opcodes verify
-        // their operand form (memory destination, group sub-opcode) right
-        // after ModRM decode via `lock_check`.
-        if self.lock && opcode != 0x0F && !LOCK_CANDIDATE[opcode as usize] {
-            return Err(Exception::ud());
-        }
-
-        cycles += self.dispatch(bus, opcode)?;
-
-        // Backstop: a candidate whose handler never validated the prefix.
-        if self.lock && !self.lock_ok {
-            return Err(Exception::ud());
-        }
-        Ok(cycles)
+        Ok((opcode, npfx))
     }
 
     /// Validate the LOCK prefix for a candidate instruction once its operand
@@ -1268,6 +1456,7 @@ impl Cpu {
     /// operand size fetches an imm32 and sign-extends it.
     #[inline]
     pub(crate) fn fetch_imm<B: Bus>(&mut self, bus: &mut B) -> Exec<u64> {
+        self.stat(|s| s.imm_fetches += 1);
         match self.osize {
             O16 => Ok(self.fetch16(bus)? as u64),
             O32 => Ok(self.fetch32(bus)? as u64),

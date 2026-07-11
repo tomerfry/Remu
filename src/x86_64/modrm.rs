@@ -55,7 +55,7 @@ impl ModRm {
 /// 8/16/32/64-bit by the handler) or a memory location as an unresolved
 /// `segment-register:offset` pair (resolution happens per access, so
 /// canonical/limit checks and paging apply naturally).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Operand {
     Reg(u8),
     Mem { seg: u8, off: u64 },
@@ -74,6 +74,7 @@ impl Cpu {
     /// Fetch and decode a ModRM byte (plus SIB/displacement), resolving the
     /// `rm` operand for the current address size.
     pub(crate) fn modrm<B: Bus>(&mut self, bus: &mut B) -> Exec<(ModRm, Operand)> {
+        self.stat(|s| s.modrm_calls += 1);
         let m = ModRm {
             byte: self.fetch8(bus)?,
             r: self.rex_r() << 3,

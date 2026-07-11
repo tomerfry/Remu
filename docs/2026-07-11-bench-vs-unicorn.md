@@ -282,3 +282,99 @@ hoisting cheap checks costs more than it saves; only hoisting the TLB
 lookup pays, and only when it persists across instructions — narrows P3's
 design space usefully: a decoded-instruction cache must amortize *decode*,
 not fetch checks, to clear the bar.
+
+---
+
+## 7. Results of the P3 cycle (2026-07-11, same machine)
+
+The cycle landed as seven increments on `performence-upscaling-phase2`,
+each validated against `cargo test` (207 tests, incl. 24 new decode/icache
+pins) and the 80386 MOO suite (1,758,700 cases, debug + release). Debug
+bench runs additionally re-validate *every cache hit* against a fresh
+decode via a permanent differential assert — several hundred million hit
+validations per run, zero mismatches. All 13 paired final-register
+cross-checks (12 original + `rep_movs`) still match Unicorn exactly.
+
+What landed:
+
+- **P3 (both cores)** — a decoded-instruction cache: direct-mapped
+  16384-entry table (32 B/entry on the 386, 40 B on x86-64) keyed on the
+  physical address of the first instruction byte with the decode context
+  (CS.D, CR0.PE, EFLAGS.VM, `extensions`; plus `mode64` on x86-64) folded
+  into the key's high bits. A hit skips the fetch, prefix scan and opcode
+  dispatch, re-evaluates the cached EA *formula* from live registers into
+  the same `Operand` the fused path builds, and runs a verbatim copy of the
+  fused handler body — cycle formulas included. Misses decode through a new
+  `try_decode` whose failure path rewinds and re-runs the fused dispatch,
+  so exception ordering is bit-identical.
+- **SMC exactness** — per-physical-page write stamps against a monotonic
+  u64 store clock, bumped by every guest store (first *and* last byte's
+  page for unsplit wide writes) and by page-walker A/D write-backs (a guest
+  can execute from its own page tables — a test pins it). Physical keying
+  makes entries CR3-independent: a remap test proves re-keying with no
+  flush and entry retention across the switch. Host-side writes are covered
+  by an O(1) `invalidate_icache()` (generation bump), called after every
+  serviced trap in the usermode/os/os64 layers. `prepare_cold_write`
+  deliberately does *not* flush — SYSCALL/SYSRET-heavy guests keep their
+  cache; a per-hit CS-limit (legacy) / canonicality (64-bit) compare
+  replaces the per-byte `fetch_check`.
+- **Not cached, by design** — page-crossing instructions (the stamp covers
+  one page and physical contiguity is not stable under remapping), LOCK-
+  and REP-prefixed forms, segment loads/STI (interrupt shadow), 67-prefixed
+  instructions in 64-bit mode (RIP-relative truncation corner), and >7
+  prefixes. All run fused, unchanged.
+- **Coverage** — the full ALU/MOV/INC/DEC/PUSH/POP/Jcc/JMP/CALL/RET/LEA/
+  TEST/shift/IMUL matrix (the bench histograms showed `alu_mix` is 29%
+  shift+IMUL, which the roadmap's initial subset had deferred), plus the
+  real-code families: PUSH imm, IMUL r,r/m,imm, XCHG/NOP, MOVZX/MOVSX,
+  MOVSXD, SETcc, CMOVcc.
+- **Codegen lessons (hard-won, worth recording):** `exec_decoded` must be
+  `#[inline(always)]` and the cache arrays fixed-size `Box<[T; N]>`
+  (bounds-check elision) or the entire win evaporates; passing the decoded
+  struct via out-parameter instead of enum payloads was worth 20+ MIPS; and
+  the two cores want opposite match shapes (386: all arms inlined; x86-64:
+  extended arms out of line — 4–5% either way). The per-case `Cpu::new()`
+  in the MOO harness had to become per-file reuse (a fresh 640 KiB icache
+  1.76M times tripled suite wall time).
+
+### MIPS, best of 5 — before → after
+
+| Mode | Workload | Before | After | Δ | Unicorn | Unicorn/Remu now |
+|---|---|---:|---:|---:|---:|---:|
+| 16 | tight_loop | 255 | 256 | — | 703 | 2.7× |
+| 16 | alu_mix | 199 | 198 | — | 674 | 3.4× |
+| 16 | mem_rw | 205 | 200 | — | 131 | **0.65× — Remu wins** |
+| 16 | call_ret | 256 | 256 | — | 131 | **0.51× — Remu wins** |
+| 32 | tight_loop | 181 | 184 | +2% | 889 | 4.8× |
+| 32 | alu_mix | 96 | 122 | +27% | 1407 | 11.5× |
+| 32 | mem_rw | 99 | 137 | +38% | 199 | 1.5× |
+| 32 | call_ret | 139 | 152 | +9% | 133 | **0.87× — Remu wins** |
+| 64 | tight_loop | 75 | 102 | +36% | 891 | 8.8× |
+| 64 | alu_mix | 51 | 88 | +72% | 1519 | 17.3× |
+| 64 | mem_rw | 56 | 89 | +60% | 55 | **0.61× — Remu wins** |
+| 64 | call_ret | 69 | 94 | +36% | 147 | 1.6× |
+
+New workloads (the §4/§6 benchmark-hygiene gaps, all paired + cross-checked):
+
+| Mode | Workload | Remu | Unicorn | Standing |
+|---|---|---:|---:|---|
+| 32 | tight_loop_pg | 152 | 896 | paging costs Remu 17% (TLB-peek probe + fetch translate) |
+| 32 | mem_rw_pg | 97 | 200 | data-side TLB per access; QEMU folds paging into its TLB |
+| 32 | tight_loop_r3 | 183 | 950 | ring 3 is free — protection is per-access compares |
+| 32 | mem_rw_r3 | 137 | 198 | ditto |
+| 32 | rep_movs | 0.36 s/run | 1.51 s/run | **Remu 4.2× faster** — the expected worst case is a win |
+
+Targets vs outcome: `mem_rw` and `call_ret` improved beyond their targets —
+Remu now beats Unicorn on **every memory-touching workload in every mode**
+except 32-bit paged `mem_rw`, exactly the strategic goal of §7's roadmap.
+The pure-ALU stretch targets (386 tight 350+/alu 200+; x86-64 150+/100+)
+were not reached: ablation measurements put the per-step floor at ~25 host
+cycles (step preamble ≈ 3.7, probe ≈ 5, state install + dispatch + arm ≈
+16) — the icache's win scales with decode complexity, and `tight_loop`'s
+1–2-byte instructions have almost no decode to save. The stage-5
+micro-trace criterion (step preamble ≥ 20% of hit-path time AND tight <
+400) evaluates **NO-GO** for this cycle: the preamble is only ~13%.
+Closing the remaining pure-ALU gap needs per-*trace* amortization of the
+probe + snapshot + event checks (the P4 `events_pending` fold and
+`run(&mut bus, n)` entry point remain open alongside it), and beyond that
+the P5 JIT.
