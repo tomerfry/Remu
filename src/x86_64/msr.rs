@@ -54,6 +54,7 @@ impl Cpu {
     /// WRMSR: write the MSR selected by ECX. #GP(0) on unknown addresses,
     /// reserved bits, and illegal EFER transitions.
     pub(crate) fn wrmsr(&mut self, index: u32, v: u64) -> Exec<()> {
+        self.prepare_cold_write(); // msr.* / FS.base / GS.base
         match index {
             addr::TSC => self.cycles = v,
             addr::APIC_BASE => self.regs.msr.apic_base = v,

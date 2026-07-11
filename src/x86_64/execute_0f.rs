@@ -30,6 +30,7 @@ impl Cpu {
             0x06 => {
                 // CLTS.
                 self.require_ring0()?;
+                self.prepare_cold_write(); // cr0
                 self.regs.cr0 &= !cr0::TS;
                 Ok(5)
             }
@@ -92,6 +93,7 @@ impl Cpu {
                     5 => 7,
                     n => n,
                 } as usize;
+                self.prepare_cold_write(); // dr
                 self.regs.dr[n] = self.read_gpr_mode(m.rm());
                 Ok(16)
             }
@@ -385,6 +387,7 @@ impl Cpu {
 
     /// MOV to control register `n`, with the transition rules.
     fn write_cr(&mut self, n: u8, v: u64) -> Exec<()> {
+        self.prepare_cold_write(); // cr0/cr3/cr4/cr8, efer.LMA
         match n {
             0 => {
                 // Reserved-high bits and PG-without-PE reject.
@@ -652,6 +655,7 @@ impl Cpu {
     }
 
     fn lldt<B: Bus>(&mut self, bus: &mut B, sel: u16) -> Exec<()> {
+        self.prepare_cold_write(); // ldtr
         if sel & 0xFFFC == 0 {
             // Null LDT: valid, but unusable.
             self.regs.ldtr.sel = sel;
@@ -678,6 +682,7 @@ impl Cpu {
     }
 
     fn ltr<B: Bus>(&mut self, bus: &mut B, sel: u16) -> Exec<()> {
+        self.prepare_cold_write(); // tr
         if sel & 0xFFFC == 0 || sel & 4 != 0 {
             return Err(Exception::gp(sel & 0xFFFC));
         }
@@ -785,6 +790,7 @@ impl Cpu {
                     }
                     b as u64
                 };
+                self.prepare_cold_write(); // gdtr/idtr
                 if m.sub() == 2 {
                     self.regs.gdtr = super::DescTable { base, limit };
                 } else {
@@ -807,6 +813,7 @@ impl Cpu {
                 // LMSW: loads MP/EM/TS and can set (never clear) PE.
                 self.require_ring0()?;
                 let v = self.read_op16(bus, op)? as u64;
+                self.prepare_cold_write(); // cr0
                 let pe = (self.regs.cr0 | v) & cr0::PE;
                 self.regs.cr0 = (self.regs.cr0 & !(cr0::MP | cr0::EM | cr0::TS | cr0::PE))
                     | (v & (cr0::MP | cr0::EM | cr0::TS))
