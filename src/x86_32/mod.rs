@@ -352,6 +352,13 @@ pub struct Cpu {
     commit_on_fault: bool,
     /// Bytes consumed by the current instruction (15-byte limit).
     ilen: u8,
+    /// Full register file captured by [`Cpu::prepare_cold_write`] at the
+    /// first cold-register write of the current instruction; meaningful only
+    /// while `cold_saved` is set.
+    fault_regs: Registers,
+    /// The current instruction wrote (or is about to write) a cold register,
+    /// so a fault must rewind from `fault_regs`, not just the GPR snapshot.
+    cold_saved: bool,
     /// Forces paging to treat the current access as a supervisor access
     /// regardless of CPL. The 386 performs its *implicit* accesses — reads of
     /// the descriptor tables, the IDT and the TSS, the accessed/busy bit
@@ -406,6 +413,8 @@ impl Cpu {
             start_eip: 0,
             commit_on_fault: false,
             ilen: 0,
+            fault_regs: Registers::new(),
+            cold_saved: false,
             supervisor_override: false,
             tlb: paging::Tlb::new(),
             syscall_int: None,
@@ -509,12 +518,16 @@ impl Cpu {
         // TF was set when it started.
         let trap = self.regs.eflags.contains(EFlags::TF);
 
-        // Faults restore register state so the instruction can restart.
-        // EFLAGS keeps whatever the faulting computation left behind (the
+        // Faults restore register state so the instruction can restart. Only
+        // the GPRs are snapshotted here: EIP rewinds via `start_eip`, EFLAGS
+        // keeps whatever the faulting computation left behind (the
         // divide-fault frame pushes those flags, and LOCK-#UD is decided at
-        // decode time before anything runs), and CR2 keeps the page-fault
-        // address. The snapshot is a plain copy.
-        let saved = self.regs;
+        // decode time before anything runs), CR2 keeps the page-fault
+        // address, and every other field is cold — its writers call
+        // `prepare_cold_write` first, which captures the full register file.
+        let saved_gpr = self.regs.gpr;
+        #[cfg(debug_assertions)]
+        let saved_all = self.regs;
         let mut cycles = match self.exec_one(bus) {
             Ok(c) => c,
             Err(e) => {
@@ -522,10 +535,28 @@ impl Cpu {
                     // String/PUSHA-style progress stays; only EIP rewinds.
                     self.regs.eip = self.start_eip;
                 } else {
-                    let (eflags, cr2) = (self.regs.eflags, self.regs.cr2);
-                    self.regs = saved;
-                    self.regs.eflags = eflags;
-                    self.regs.cr2 = cr2;
+                    if self.cold_saved {
+                        let (eflags, cr2) = (self.regs.eflags, self.regs.cr2);
+                        self.regs = self.fault_regs;
+                        self.regs.eflags = eflags;
+                        self.regs.cr2 = cr2;
+                    }
+                    self.regs.gpr = saved_gpr;
+                    self.regs.eip = self.start_eip;
+                    #[cfg(debug_assertions)]
+                    {
+                        // Differential check against the old whole-file
+                        // rewind: a mismatch means a cold-register writer is
+                        // missing its `prepare_cold_write` call.
+                        let mut want = saved_all;
+                        want.eflags = self.regs.eflags;
+                        want.cr2 = self.regs.cr2;
+                        assert_eq!(
+                            self.regs, want,
+                            "fault rewind mismatch at {:#x}",
+                            self.start_eip
+                        );
+                    }
                 }
                 // OS-emulation hook: hand the (rewound, restartable) fault to
                 // the host instead of vectoring through the IDT.
@@ -555,6 +586,18 @@ impl Cpu {
         cycles
     }
 
+    /// Capture the register file before the first write to a cold register
+    /// (anything besides `gpr`/`eip`/`eflags`/`cr2`) during the current
+    /// instruction, so a later fault in the same instruction can rewind it.
+    /// Every function that writes such a register must call this first.
+    #[inline]
+    pub(crate) fn prepare_cold_write(&mut self) {
+        if !self.cold_saved {
+            self.cold_saved = true;
+            self.fault_regs = self.regs;
+        }
+    }
+
     /// Decode prefixes and execute the instruction at `CS:EIP`.
     fn exec_one<B: Bus>(&mut self, bus: &mut B) -> Exec<u32> {
         self.start_eip = self.regs.eip;
@@ -564,6 +607,7 @@ impl Cpu {
         self.lock = false;
         self.lock_ok = false;
         self.commit_on_fault = false;
+        self.cold_saved = false;
         self.supervisor_override = false;
         let db = self.regs.seg[reg::CS as usize].db();
         self.osize32 = db;
@@ -1068,6 +1112,7 @@ impl Cpu {
     /// Real-mode interrupt: push FLAGS/CS/IP (16-bit), clear IF/TF, and load
     /// `CS:IP` from the vector table described by IDTR.
     fn interrupt_real<B: Bus>(&mut self, bus: &mut B, vector: u8, class: Event) -> Exec<()> {
+        self.prepare_cold_write(); // CS cache
         let entry = vector as u32 * 4;
         if entry + 3 > self.regs.idtr.limit as u32 {
             let ext = (class == Event::External) as u16;

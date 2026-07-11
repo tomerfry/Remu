@@ -216,6 +216,7 @@ impl Cpu {
 
     /// Install descriptor `d` into segment register `idx`.
     fn commit_seg(&mut self, idx: u8, sel: u16, d: &Descriptor) {
+        self.prepare_cold_write();
         self.regs.seg[idx as usize] = SegReg {
             sel,
             base: d.base,
@@ -228,6 +229,7 @@ impl Cpu {
 
     /// Load segment register `idx` (not CS) with `sel`, per the current mode.
     pub(crate) fn load_seg<B: Bus>(&mut self, bus: &mut B, idx: u8, sel: u16) -> Exec<()> {
+        self.prepare_cold_write(); // segment cache
         if self.regs.cr0 & cr0::PE == 0 {
             // Real mode: base tracks the selector; limit/attrs are sticky.
             let s = &mut self.regs.seg[idx as usize];
@@ -452,6 +454,7 @@ impl Cpu {
     /// Real/V86 far transfer: selector reloads the base, offset checked
     /// against the (sticky) limit.
     fn far_real(&mut self, sel: u16, off: u64) -> Exec<()> {
+        self.prepare_cold_write(); // CS cache
         let cs = &mut self.regs.seg[reg::CS as usize];
         if off > cs.limit as u64 {
             return Err(Exception::gp(0));
@@ -656,6 +659,7 @@ impl Cpu {
     /// Load SS with a null selector carrying `rpl` (long-mode inner
     /// transitions).
     fn set_null_ss(&mut self, rpl: u8) {
+        self.prepare_cold_write(); // SS cache
         self.regs.seg[reg::SS as usize] = SegReg {
             sel: rpl as u16,
             base: 0,
@@ -828,6 +832,7 @@ impl Cpu {
     /// After dropping privilege, data segment registers that are no longer
     /// reachable are silently nulled.
     fn validate_data_segs(&mut self, cpl: u8) {
+        self.prepare_cold_write(); // segment caches
         for idx in [reg::ES, reg::DS, reg::FS, reg::GS] {
             let s = self.regs.seg[idx as usize];
             let present = s.attrs & 0x80 != 0;
@@ -965,6 +970,7 @@ impl Cpu {
 
     /// IRETD with VM=1: restore the V86 frame (EIP CS EFLAGS ESP SS ES DS FS GS).
     fn iret_to_v86<B: Bus>(&mut self, bus: &mut B, ip: u64, cs: u16, fl: u64) -> Exec<u32> {
+        self.prepare_cold_write(); // segment caches
         let sp = self.pop32(bus)?;
         let ss = self.pop32(bus)? as u16;
         let es = self.pop32(bus)? as u16;
@@ -1296,6 +1302,7 @@ impl Cpu {
         if gd.dpl() != 0 || gd.is_conforming() {
             return Err(Exception::gp(gsel & 0xFFFC | ext));
         }
+        self.prepare_cold_write(); // segment caches
         let (nss, nsp) = self.tss_stack(bus, 0)?;
         let old = self.regs;
         let osp = self.stack_ptr();
@@ -1374,6 +1381,7 @@ impl Cpu {
             return Ok(2);
         }
 
+        self.prepare_cold_write(); // CS/SS caches
         let star = self.regs.msr.star;
         let sel = (star >> 32) as u16 & 0xFFFC;
         self.regs.seg[reg::CS as usize] = SegReg {
@@ -1414,6 +1422,7 @@ impl Cpu {
         } else {
             (base | 3, 0x0C_FBu16, rip as u32 as u64) // compat ring-3 code
         };
+        self.prepare_cold_write(); // CS/SS caches
         self.regs.seg[reg::CS as usize] = SegReg {
             sel,
             base: 0,
@@ -1440,6 +1449,7 @@ impl Cpu {
         if self.cpl() != 0 {
             return Err(Exception::gp(0));
         }
+        self.prepare_cold_write(); // GS.base / kernel_gs_base
         core::mem::swap(
             &mut self.regs.seg[reg::GS as usize].base,
             &mut self.regs.msr.kernel_gs_base,

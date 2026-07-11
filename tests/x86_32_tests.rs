@@ -683,6 +683,128 @@ fn paging_translation_and_fault() {
     assert_eq!(mem.ram[sp], 0x02);
 }
 
+// --- Fetch-window boundary tests ------------------------------------------------
+
+#[test]
+fn fetch_across_page_boundary_faults_on_the_second_page() {
+    // MOV EAX, imm32 at 0x4FFC: opcode + 3 imm bytes on page 4, last imm
+    // byte on the unmapped page 5. The fetch must #PF with CR2 = 0x5000 and
+    // EIP rewound to the instruction start; once the page is mapped, the
+    // same instruction executes.
+    let (mut cpu, mut mem) = setup_pm();
+    mem.load(0x10000, &0x0001_1003u32.to_le_bytes()); // PDE 0: table @ 11000
+    for i in 0..1024u32 {
+        let pte: u32 = if i == 5 { 0 } else { (i << 12) | 3 };
+        mem.load(0x11000 + i * 4, &pte.to_le_bytes());
+    }
+    cpu.regs.cr3 = 0x10000;
+    cpu.regs.cr0 |= remu::x86_32::cr0::PG;
+    cpu.trap_faults = true;
+
+    mem.load(0x4FFC, &[0xB8, 0x78, 0x56, 0x34, 0x12]); // MOV EAX, 12345678h
+    cpu.regs.eip = 0x4FFC;
+
+    cpu.step(&mut mem);
+    match cpu.host_trap.take() {
+        Some(HostTrap::Exception(e)) => {
+            assert_eq!(e.vector, 14, "expected #PF");
+            assert_eq!(e.error, Some(0), "not-present supervisor read");
+        }
+        other => panic!("expected a trapped #PF, got {other:?}"),
+    }
+    assert_eq!(cpu.regs.cr2, 0x5000, "CR2 is the second page");
+    assert_eq!(cpu.regs.eip, 0x4FFC, "EIP rewinds to the instruction start");
+
+    // Map page 5 and restart: the refill sees the new mapping immediately.
+    mem.load(0x11000 + 5 * 4, &0x0000_5003u32.to_le_bytes());
+    cpu.step(&mut mem);
+    assert!(cpu.host_trap.is_none());
+    assert_eq!(cpu.regs.gpr[reg::EAX as usize], 0x1234_5678);
+    assert_eq!(cpu.regs.eip, 0x5001);
+}
+
+#[test]
+fn cs_limit_checks_fetch_at_the_exact_byte() {
+    let (mut cpu, mut mem) = setup_pm();
+    cpu.trap_faults = true;
+    mem.load(0x2000, &[0xB8, 0x78, 0x56, 0x34, 0x12, 0x90]); // MOV EAX, imm32; NOP
+
+    // Limit 0x2004: the 5-byte instruction ends exactly at the limit and
+    // must execute...
+    cpu.regs.seg[reg::CS as usize].limit = 0x2004;
+    cpu.step(&mut mem);
+    assert!(cpu.host_trap.is_none(), "ending at the limit is legal");
+    assert_eq!(cpu.regs.gpr[reg::EAX as usize], 0x1234_5678);
+    assert_eq!(cpu.regs.eip, 0x2005);
+
+    // ...and the very next fetch #GPs at offset 0x2005.
+    cpu.step(&mut mem);
+    match cpu.host_trap.take() {
+        Some(HostTrap::Exception(e)) => {
+            assert_eq!(e.vector, 13, "expected #GP");
+            assert_eq!(e.error, Some(0));
+        }
+        other => panic!("expected a trapped #GP, got {other:?}"),
+    }
+    assert_eq!(cpu.regs.eip, 0x2005);
+
+    // Limit 0x2003: the same instruction now ends past the limit and must
+    // fault mid-decode, rewound to its start.
+    cpu.regs.seg[reg::CS as usize].limit = 0x2003;
+    cpu.regs.eip = 0x2000;
+    cpu.step(&mut mem);
+    match cpu.host_trap.take() {
+        Some(HostTrap::Exception(e)) => assert_eq!(e.vector, 13, "expected #GP"),
+        other => panic!("expected a trapped #GP, got {other:?}"),
+    }
+    assert_eq!(cpu.regs.eip, 0x2000);
+}
+
+#[test]
+fn store_into_the_next_instruction_is_fetched_fresh() {
+    // Self-modifying code: the first instruction overwrites the immediate of
+    // the second; the fetch must observe the new byte (no stale window).
+    let (mut cpu, mut mem) = setup_pm();
+    mem.load(
+        0x2000,
+        &[
+            0xC6, 0x05, 0x08, 0x20, 0x00, 0x00, 0x42, // MOV byte [2008h], 42h
+            0xB0, 0x37, // MOV AL, 37h (imm at 0x2008)
+        ],
+    );
+    cpu.step(&mut mem);
+    cpu.step(&mut mem);
+    assert_eq!(
+        cpu.regs.gpr[reg::EAX as usize] & 0xFF,
+        0x42,
+        "the freshly stored immediate must be fetched"
+    );
+}
+
+#[test]
+fn fifteen_byte_limit_still_uds() {
+    // 15 segment-override prefixes + NOP = 16 bytes -> #UD at the 16th byte;
+    // 14 prefixes + NOP = 15 bytes is legal.
+    let mut program = [0x26u8; 16];
+    program[15] = 0x90;
+    let (mut cpu, mut mem) = setup(&program);
+    cpu.trap_faults = true;
+    cpu.step(&mut mem);
+    match cpu.host_trap.take() {
+        Some(HostTrap::Exception(e)) => assert_eq!(e.vector, 6, "expected #UD"),
+        other => panic!("expected a trapped #UD, got {other:?}"),
+    }
+    assert_eq!(cpu.regs.eip, 0x1100, "EIP rewinds to the instruction start");
+
+    let mut program = [0x26u8; 15];
+    program[14] = 0x90;
+    let (mut cpu, mut mem) = setup(&program);
+    cpu.trap_faults = true;
+    cpu.step(&mut mem);
+    assert!(cpu.host_trap.is_none(), "15 bytes exactly is legal");
+    assert_eq!(cpu.regs.eip, 0x1100 + 15);
+}
+
 // --- Privilege-transition regression tests ------------------------------------
 //
 // These cover the paths the SingleStepTests suite cannot reach (it is real
@@ -923,6 +1045,126 @@ fn iret_does_not_commit_eflags_when_the_outer_stack_faults() {
         !cpu.regs.eflags.contains(EFlags::DF),
         "the returned-to EFLAGS image must not be committed before the SS load"
     );
+}
+
+#[test]
+fn iret_outer_ss_fault_restores_cs_cache() {
+    // IRET to an outer ring commits the CS descriptor cache before the outer
+    // SS load can still fault; the fault rewind must restore the full CS
+    // cache (hidden base/limit/attrs, and with it CPL), not just EIP.
+    let (mut cpu, mut mem) = setup_pm();
+    mem.load(0x0520, &descriptor(0, 0xF_FFFF, 0xFA, 0xC)); // 20: ring-3 code
+    cpu.trap_faults = true;
+
+    // Frame: EIP, CS=23h, EFLAGS, ESP, SS=0FFFCh (RPL 0 != 3 -> #GP).
+    flat_ss(&mut cpu, 0x7000);
+    let frame: [u32; 5] = [0x4000, 0x23, 2, 0x6000, 0xFFFC];
+    for (i, v) in frame.iter().enumerate() {
+        mem.load(0x7000 + i as u32 * 4, &v.to_le_bytes());
+    }
+    mem.load(0x2000, &[0xCF]); // IRETD
+
+    let cs_before = cpu.regs.seg[reg::CS as usize];
+    let ss_before = cpu.regs.seg[reg::SS as usize];
+    cpu.step(&mut mem);
+    match cpu.host_trap {
+        Some(HostTrap::Exception(e)) => assert_eq!(e.vector, 13, "expected #GP"),
+        ref other => panic!("expected a trapped #GP, got {other:?}"),
+    }
+    assert_eq!(
+        cpu.regs.seg[reg::CS as usize],
+        cs_before,
+        "the committed CS cache must be rewound after the outer-SS fault"
+    );
+    assert_eq!(cpu.regs.seg[reg::SS as usize], ss_before);
+    assert_eq!(cpu.cpl(), 0);
+    assert_eq!(cpu.regs.eip, 0x2000, "EIP rewinds to the IRETD");
+    assert_eq!(cpu.regs.gpr[reg::ESP as usize], 0x7000, "pops rewound");
+}
+
+/// Drop straight to ring 3 with flat 4 GiB code/data caches (the descriptor
+/// tables are only consulted on the *next* segment load).
+fn enter_ring3(cpu: &mut Cpu, eip: u32, esp: u32) {
+    cpu.regs.seg[reg::CS as usize] = SegReg {
+        sel: 0x23,
+        base: 0,
+        limit: 0xFFFF_FFFF,
+        attrs: 0x0CFA,
+    };
+    cpu.regs.seg[reg::SS as usize] = SegReg {
+        sel: 0x2B,
+        base: 0,
+        limit: 0xFFFF_FFFF,
+        attrs: 0x0CF2,
+    };
+    cpu.regs.eip = eip;
+    cpu.regs.gpr[reg::ESP as usize] = esp;
+}
+
+#[test]
+fn call_gate_inner_stack_fault_restores_outer_ss() {
+    // A ring-3 CALL through a ring-0 call gate switches to the inner stack
+    // (SS:ESP committed from the TSS) before pushing the gate frame. With
+    // ESP0 = 2 the first push straddles the 4 GiB limit -> #SS; the rewind
+    // must restore the outer ring-3 SS cache and ESP.
+    let (mut cpu, mut mem) = setup_pm();
+    mem.load(0x0520, &descriptor(0, 0xF_FFFF, 0xFA, 0xC)); // 20: ring-3 code
+    mem.load(0x0528, &descriptor(0, 0xF_FFFF, 0xF2, 0xC)); // 28: ring-3 data
+    mem.load(0x0538, &gate(0x5000, 0x08, 0xEC)); // 38: call gate, DPL 3 -> ring-0 code
+    mem.load(0x3000, &tss(2, 0x10)); // ring-0 stack: 10h:00000002
+    attach_idt_tss(&mut cpu, 0x0800, 0x3000, 0x30);
+    cpu.trap_faults = true;
+
+    enter_ring3(&mut cpu, 0x4000, 0x6000);
+    mem.load(0x4000, &[0x9A, 0x00, 0x00, 0x00, 0x00, 0x38, 0x00]); // CALL 0038:0
+    mem.load(0x5000, &[0x90]);
+
+    let cs_before = cpu.regs.seg[reg::CS as usize];
+    let ss_before = cpu.regs.seg[reg::SS as usize];
+    cpu.step(&mut mem);
+    match cpu.host_trap {
+        Some(HostTrap::Exception(e)) => assert_eq!(e.vector, 12, "expected #SS"),
+        ref other => panic!("expected a trapped #SS, got {other:?}"),
+    }
+    assert_eq!(
+        cpu.regs.seg[reg::SS as usize],
+        ss_before,
+        "the committed inner SS cache must be rewound after the push fault"
+    );
+    assert_eq!(cpu.regs.gpr[reg::ESP as usize], 0x6000, "outer ESP restored");
+    assert_eq!(cpu.regs.seg[reg::CS as usize], cs_before);
+    assert_eq!(cpu.cpl(), 3);
+    assert_eq!(cpu.regs.eip, 0x4000, "EIP rewinds to the CALL");
+}
+
+#[test]
+fn int_gate_stack_switch_fault_restores_ss() {
+    // INT n from ring 3 through a ring-0 interrupt gate: the stack switch
+    // commits the inner SS, then the frame push faults on ESP0 = 2. Delivery
+    // is atomic (raise() rolls back) and the step-level rewind restarts the
+    // INT; the outer SS cache and ESP must survive untouched.
+    let (mut cpu, mut mem) = setup_pm();
+    mem.load(0x0520, &descriptor(0, 0xF_FFFF, 0xFA, 0xC)); // 20: ring-3 code
+    mem.load(0x0528, &descriptor(0, 0xF_FFFF, 0xF2, 0xC)); // 28: ring-3 data
+    mem.load(0x0800 + 0x40 * 8, &gate(0x5000, 0x08, 0xEE)); // INT 40h, DPL 3
+    mem.load(0x3000, &tss(2, 0x10)); // ring-0 stack: 10h:00000002
+    attach_idt_tss(&mut cpu, 0x0800, 0x3000, 0x30);
+    cpu.trap_faults = true;
+
+    enter_ring3(&mut cpu, 0x4000, 0x6000);
+    mem.load(0x4000, &[0xCD, 0x40]); // INT 40h
+    mem.load(0x5000, &[0x90]);
+
+    let ss_before = cpu.regs.seg[reg::SS as usize];
+    cpu.step(&mut mem);
+    match cpu.host_trap {
+        Some(HostTrap::Exception(e)) => assert_eq!(e.vector, 12, "expected #SS"),
+        ref other => panic!("expected a trapped #SS, got {other:?}"),
+    }
+    assert_eq!(cpu.regs.seg[reg::SS as usize], ss_before);
+    assert_eq!(cpu.regs.gpr[reg::ESP as usize], 0x6000);
+    assert_eq!(cpu.cpl(), 3);
+    assert_eq!(cpu.regs.eip, 0x4000, "EIP rewinds to the INT");
 }
 
 #[test]

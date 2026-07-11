@@ -101,11 +101,13 @@ mod pte {
 impl Cpu {
     /// Flush the TLB (CR3 load, CR0/CR4/EFER paging-relevant changes).
     pub(crate) fn flush_tlb(&mut self) {
+        self.fetch_invalidate();
         self.tlb.flush();
     }
 
     /// Drop the TLB entry for one page (INVLPG).
     pub(crate) fn invlpg(&mut self, lin: u64) {
+        self.fetch_invalidate();
         self.tlb.invalidate(lin);
     }
 
@@ -356,20 +358,18 @@ impl Cpu {
 
     /// Whether paging is active.
     #[inline]
-    fn paging(&self) -> bool {
+    pub(crate) fn paging(&self) -> bool {
         self.regs.cr0 & cr0::PG != 0
     }
 
     // --- Linear-address access (post-segmentation) ---------------------------
 
-    /// Fetch one code byte at linear `lin` (honors NX).
+    /// Physical address of the code byte at linear `lin` (NX-aware `Fetch`
+    /// access, so a #PF error code carries the instruction-fetch bit). Used
+    /// by the fetch window to translate once per page instead of per byte.
     #[inline]
-    pub(crate) fn lin_fetch8<B: Bus>(&mut self, bus: &mut B, lin: u64) -> Exec<u8> {
-        if !self.paging() {
-            return Ok(bus.read(lin));
-        }
-        let phys = self.translate(bus, lin, Access::Fetch)?;
-        Ok(bus.read(phys))
+    pub(crate) fn fetch_translate<B: Bus>(&mut self, bus: &mut B, lin: u64) -> Exec<u64> {
+        self.translate(bus, lin, Access::Fetch)
     }
 
     #[inline]
