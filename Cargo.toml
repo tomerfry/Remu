@@ -29,6 +29,9 @@ path = "src/bin/remu-user64.rs"
 [dependencies]
 bitflags = "2"
 pyo3 = { version = "0.29.0", features = ["abi3-py39"], optional = true }
+# Runtime x86-64 assembler for the optional template JIT (feature `jit`).
+dynasm = { version = "3", optional = true }
+dynasmrt = { version = "3", optional = true }
 
 [dev-dependencies]
 criterion = "0.8.2"
@@ -55,3 +58,7 @@ python = ["dep:pyo3"]
 # performance work: `cargo run --release --features perf-stats --example
 # bench_x86`. Off by default; compiles to nothing.
 perf-stats = []
+# Template JIT (dynamic binary translation) for the x86-64 core, reached via
+# `Cpu::run`. Host must be x86-64. The interpreter stays the reference; off by
+# default. See src/x86_64/jit/.
+jit = ["dep:dynasm", "dep:dynasmrt"]

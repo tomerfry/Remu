@@ -30,6 +30,8 @@ mod decode;
 mod execute;
 mod execute_0f;
 mod icache;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+mod jit;
 mod modrm;
 mod msr;
 mod paging;
@@ -586,6 +588,10 @@ pub struct Cpu {
     tlb: paging::Tlb,
     /// Decoded-instruction cache (see `icache.rs`).
     icache: icache::ICache,
+    /// Optional template-JIT state, reached through [`Cpu::run`]. Cloning a
+    /// CPU yields a fresh empty cache (see `jit`).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    jit: jit::JitState,
 
     // --- Host (OS-emulation) hooks — all inert at their defaults -------------
     /// If set, `INT n` for this vector does not vector through the IDT;
@@ -654,6 +660,8 @@ impl Cpu {
             supervisor_override: false,
             tlb: paging::Tlb::new(),
             icache: icache::ICache::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            jit: jit::JitState::new(),
             syscall_int: None,
             trap_syscall: false,
             trap_faults: false,
@@ -686,6 +694,8 @@ impl Cpu {
         self.fetch_invalidate();
         self.tlb.flush();
         self.icache.invalidate_all();
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        self.jit.flush();
         self.host_trap = None;
     }
 
@@ -788,7 +798,25 @@ impl Cpu {
     ///
     /// The STI/`MOV SS` shadow and a pending single-step trap are CPU state,
     /// so they carry correctly across `run` boundaries.
+    ///
+    /// With the `jit` feature this dispatches to the template JIT, whose
+    /// observable behavior is identical (the interpreter is its reference and
+    /// its fallback).
     pub fn run<B: Bus>(&mut self, bus: &mut B, n: u64) -> RunResult {
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        {
+            self.run_jit(bus, n)
+        }
+        #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+        {
+            self.run_interp(bus, n)
+        }
+    }
+
+    /// The pure-interpreter batch loop (also the JIT's fallback semantics;
+    /// unused when the `jit` feature routes `run` through the translator).
+    #[cfg_attr(all(feature = "jit", target_arch = "x86_64"), allow(dead_code))]
+    pub(crate) fn run_interp<B: Bus>(&mut self, bus: &mut B, n: u64) -> RunResult {
         // A trap the embedder has not yet taken stops the run before
         // anything executes.
         if self.host_trap.is_some() {
