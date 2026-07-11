@@ -28,16 +28,25 @@ const PAGE_MASK: u64 = PAGE_SIZE - 1;
 /// matching the CPU core's paging unit.
 const PHYS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
-/// Round `addr` up to the next page boundary.
+/// Round `addr` up to the next page boundary. Saturating, so a malformed
+/// (near-`u64::MAX`) length can never overflow the rounding itself.
 #[inline]
 fn page_up(addr: u64) -> u64 {
-    (addr + PAGE_MASK) & !PAGE_MASK
+    addr.saturating_add(PAGE_MASK) & !PAGE_MASK
 }
 
 /// Round `addr` down to its page base.
 #[inline]
 fn page_down(addr: u64) -> u64 {
     addr & !PAGE_MASK
+}
+
+/// Page-rounded exclusive end of `[start, start+len)`, saturating so a
+/// guest- or ELF-supplied length can never overflow the address computation
+/// (a debug-build panic / release wraparound on hostile input).
+#[inline]
+fn range_end(start: u64, len: u64) -> u64 {
+    page_up(start.saturating_add(len))
 }
 
 // --- Protection flags (match Linux PROT_*) -----------------------------------
@@ -62,6 +71,9 @@ pub const STACK_LIMIT: u64 = STACK_TOP - 0x0080_0000;
 /// Base of the `mmap` arena (grows up toward the stack). Any base works: the
 /// dynamic linker uses whatever `mmap` returns.
 pub const MMAP_BASE: u64 = 0x0000_7F00_0000_0000;
+/// Exclusive top of the canonical lower half — the highest address a user
+/// mapping may reach. The loader rejects segments that would cross it.
+pub const USER_END: u64 = 0x0000_8000_0000_0000;
 
 /// Sparse guest-physical memory: 4 KiB frames created on first touch. Reads of
 /// never-written frames return 0 (open-bus-like), matching the infallible x86
@@ -347,7 +359,7 @@ impl AddressSpace {
     /// ELF segments sharing a boundary page never lose write access regardless
     /// of mapping order. `user` sets the U/S bit.
     fn map_range(&mut self, mem: &mut PhysMem, start: u64, len: u64, prot: u32, user: bool) {
-        let e = page_up(start + len);
+        let e = range_end(start, len);
         let mut lin = page_down(start);
         while lin < e {
             let (phys, prot) = match self.resolve(mem, lin) {
@@ -371,7 +383,7 @@ impl AddressSpace {
         self.map_range(mem, start, len, prot, true);
         self.vmas.push(Vma {
             start: page_down(start),
-            end: page_up(start + len),
+            end: range_end(start, len),
             prot,
             kind,
         });
@@ -432,7 +444,7 @@ impl AddressSpace {
     pub fn mmap(&mut self, mem: &mut PhysMem, len: u64, prot: u32) -> u64 {
         let addr = self.mmap_top;
         let size = page_up(len);
-        if addr + size > STACK_LIMIT {
+        if addr.saturating_add(size) > STACK_LIMIT {
             return 0;
         }
         self.map(mem, addr, size, prot, VmaKind::Mapping);
@@ -443,13 +455,13 @@ impl AddressSpace {
     /// `mmap` at a fixed address (`MAP_FIXED`), for file-backed segments.
     pub fn mmap_fixed(&mut self, mem: &mut PhysMem, addr: u64, len: u64, prot: u32) {
         self.map(mem, addr, len, prot, VmaKind::Mapping);
-        self.mmap_top = self.mmap_top.max(page_up(addr + len));
+        self.mmap_top = self.mmap_top.max(range_end(addr, len));
     }
 
     /// `mprotect`: change the protection of already-mapped pages in the range.
     /// Unmapped pages are skipped. The caller must invalidate the CPU TLB.
     pub fn protect(&mut self, mem: &mut PhysMem, start: u64, len: u64, prot: u32) {
-        let e = page_up(start + len);
+        let e = range_end(start, len);
         let mut lin = page_down(start);
         while lin < e {
             if let Some(phys) = self.resolve(mem, lin) {
@@ -463,7 +475,7 @@ impl AddressSpace {
     /// invalidate the CPU TLB.
     pub fn unmap(&mut self, mem: &mut PhysMem, start: u64, len: u64) {
         let s = page_down(start);
-        let e = page_up(start + len);
+        let e = range_end(start, len);
         let mut lin = s;
         while lin < e {
             let idx = Self::indices(lin);
@@ -574,6 +586,19 @@ mod tests {
         assert!(a.resolve(&mem, m + 0x2FFF).is_some());
         let m2 = a.mmap(&mut mem, 1, PROT_READ);
         assert_eq!(m2, MMAP_BASE + 0x3000, "page-rounded bump");
+    }
+
+    #[test]
+    fn huge_sizes_saturate_without_panic() {
+        // Hostile lengths must not overflow the page-rounding arithmetic (a
+        // debug-build panic). These run in debug, so a regression would panic.
+        let mut mem = PhysMem::new();
+        let mut a = AddressSpace::new(&mut mem);
+        assert_eq!(a.mmap(&mut mem, u64::MAX, PROT_READ), 0, "absurd mmap is rejected");
+        a.init_brk(0x40_0000);
+        assert_eq!(a.set_brk(&mut mem, u64::MAX), 0x40_0000, "absurd brk is a no-op");
+        // A map whose start+len wraps must not panic; it maps a saturated range.
+        a.map(&mut mem, u64::MAX - 0x100, 0x1000, PROT_READ, VmaKind::Mapping);
     }
 
     #[test]

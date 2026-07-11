@@ -7,7 +7,7 @@
 //! right after `p_type` (offset 4), and the 64-bit fields follow.
 
 use crate::os64::abi::elf;
-use crate::os64::memory::{AddressSpace, PROT_EXEC, PROT_READ, PROT_WRITE, PhysMem, VmaKind};
+use crate::os64::memory::{AddressSpace, PROT_EXEC, PROT_READ, PROT_WRITE, PhysMem, USER_END, VmaKind};
 
 /// Load base for a PIE / `ET_DYN` main executable (Linux's usual PIE base).
 pub const EXE_PIE_BASE: u64 = 0x5555_5555_5000;
@@ -110,6 +110,17 @@ pub fn load(
         match p_type {
             elf::PT_LOAD => {
                 let vaddr = p_vaddr.wrapping_add(bias);
+                // Reject malformed geometry before it reaches the memory
+                // manager: filesz must fit within memsz, and the mapped range
+                // must stay inside the canonical lower half (this also rules
+                // out the vaddr+memsz overflow that would otherwise wrap).
+                if p_filesz > p_memsz {
+                    return Err("PT_LOAD filesz exceeds memsz".into());
+                }
+                let mem_end = vaddr
+                    .checked_add(p_memsz)
+                    .filter(|&e| e <= USER_END)
+                    .ok_or("PT_LOAD maps outside the user address space")?;
                 aspace.map(mem, vaddr, p_memsz, prot_of(p_flags), VmaKind::Image);
                 let end = p_offset.checked_add(p_filesz).ok_or("PT_LOAD overflow")?;
                 let file = data
@@ -118,7 +129,7 @@ pub fn load(
                 if !aspace.write_bytes(mem, vaddr, file) {
                     return Err("PT_LOAD target unmapped".into());
                 }
-                load_end = load_end.max(vaddr.wrapping_add(p_memsz));
+                load_end = load_end.max(mem_end);
                 if e_phoff >= p_offset && e_phoff < p_offset + p_filesz {
                     phdr_in_load = Some(vaddr + (e_phoff - p_offset));
                 }

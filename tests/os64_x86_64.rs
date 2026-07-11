@@ -10,13 +10,13 @@ const VBASE: u64 = 0x0040_0000;
 const EHDR: usize = 64;
 const PHDR: usize = 56;
 
-fn put_u16(v: &mut Vec<u8>, off: usize, x: u16) {
+fn put_u16(v: &mut [u8], off: usize, x: u16) {
     v[off..off + 2].copy_from_slice(&x.to_le_bytes());
 }
-fn put_u32(v: &mut Vec<u8>, off: usize, x: u32) {
+fn put_u32(v: &mut [u8], off: usize, x: u32) {
     v[off..off + 4].copy_from_slice(&x.to_le_bytes());
 }
-fn put_u64(v: &mut Vec<u8>, off: usize, x: u64) {
+fn put_u64(v: &mut [u8], off: usize, x: u64) {
     v[off..off + 8].copy_from_slice(&x.to_le_bytes());
 }
 
@@ -110,4 +110,15 @@ fn bad_write_buffer_returns_efault() {
     let code = emu.run_capped(10_000);
     assert_eq!(code, 0, "guest exits normally; the bad write just returns EFAULT");
     assert!(emu.vfs.sink_data(1).unwrap().is_empty(), "nothing written");
+}
+
+#[test]
+fn malformed_elf_huge_memsz_rejected() {
+    // A crafted PT_LOAD with an absurd p_memsz must be rejected by the loader,
+    // not overflow-panic or map an insane range. p_memsz is at phdr offset 40.
+    let mut elf = hello_elf(b"x");
+    let memsz_off = EHDR + 40;
+    elf[memsz_off..memsz_off + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+    let r = Emulator::load_image(&elf, &["x".into()], &[], None);
+    assert!(r.is_err(), "segment escaping the address space must be rejected");
 }

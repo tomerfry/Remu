@@ -218,10 +218,17 @@ impl Emulator {
     /// `readv`/`writev`: gather/scatter over an `iovec[]` (each entry is a
     /// 16-byte `{ base: u64, len: u64 }`).
     fn sys_iov(&mut self, write: bool) -> i64 {
+        /// Linux `UIO_MAXIOV`: the kernel rejects longer iovec arrays with
+        /// `EINVAL`. Bounding the count also keeps `i * 16` well clear of
+        /// overflow.
+        const UIO_MAXIOV: u64 = 1024;
         let (fd, iov, cnt) = (self.arg(0) as i64, self.arg(1), self.arg(2));
+        if cnt > UIO_MAXIOV {
+            return -errno::EINVAL;
+        }
         let mut total = 0i64;
         for i in 0..cnt {
-            let ent = iov + i * 16;
+            let ent = iov.wrapping_add(i * 16);
             let (Some(ptr), Some(len)) = (self.g_u64(ent), self.g_u64(ent + 8)) else {
                 return if total > 0 { total } else { -errno::EFAULT };
             };
