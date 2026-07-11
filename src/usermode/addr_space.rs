@@ -76,8 +76,11 @@ impl AddressSpace {
     }
 
     // --- CPU-facing accessors (bus hot path) --------------------------------
-    // Wide accessors require the caller not to cross a 4 KiB page boundary
-    // (the x86_32 bus contract); every 4 KiB page lies inside one chunk.
+    // Wide accessors take a fast slice path within a chunk and fall back to
+    // per-byte access across a chunk boundary. Paging is off for user-mode
+    // guests, so the CPU never splits a wide access at a page boundary (that
+    // only happens with paging on) and may hand us any alignment, including
+    // one straddling a 64 KiB chunk.
 
     /// Read one byte; unmapped reads return 0 and latch a [`Segv`].
     #[inline]
@@ -100,53 +103,67 @@ impl AddressSpace {
         }
     }
 
-    /// Read a little-endian word (must not cross a 4 KiB page).
+    /// Read a little-endian word (any alignment).
     #[inline]
     pub fn read16(&mut self, addr: u32) -> u16 {
-        debug_assert!(addr & 0xFFF <= 0xFFE, "page-crossing read16");
         let off = (addr & CHUNK_MASK) as usize;
-        match &self.chunks[(addr >> CHUNK_SHIFT) as usize] {
-            Some(c) => u16::from_le_bytes(c[off..off + 2].try_into().unwrap()),
-            None => {
-                self.note_segv(addr, false);
-                0
+        if off <= CHUNK_SIZE - 2 {
+            match &self.chunks[(addr >> CHUNK_SHIFT) as usize] {
+                Some(c) => u16::from_le_bytes(c[off..off + 2].try_into().unwrap()),
+                None => {
+                    self.note_segv(addr, false);
+                    0
+                }
             }
+        } else {
+            self.read8(addr) as u16 | (self.read8(addr.wrapping_add(1)) as u16) << 8
         }
     }
 
-    /// Read a little-endian dword (must not cross a 4 KiB page).
+    /// Read a little-endian dword (any alignment).
     #[inline]
     pub fn read32(&mut self, addr: u32) -> u32 {
-        debug_assert!(addr & 0xFFF <= 0xFFC, "page-crossing read32");
         let off = (addr & CHUNK_MASK) as usize;
-        match &self.chunks[(addr >> CHUNK_SHIFT) as usize] {
-            Some(c) => u32::from_le_bytes(c[off..off + 4].try_into().unwrap()),
-            None => {
-                self.note_segv(addr, false);
-                0
+        if off <= CHUNK_SIZE - 4 {
+            match &self.chunks[(addr >> CHUNK_SHIFT) as usize] {
+                Some(c) => u32::from_le_bytes(c[off..off + 4].try_into().unwrap()),
+                None => {
+                    self.note_segv(addr, false);
+                    0
+                }
             }
+        } else {
+            self.read16(addr) as u32 | (self.read16(addr.wrapping_add(2)) as u32) << 16
         }
     }
 
-    /// Write a little-endian word (must not cross a 4 KiB page).
+    /// Write a little-endian word (any alignment).
     #[inline]
     pub fn write16(&mut self, addr: u32, value: u16) {
-        debug_assert!(addr & 0xFFF <= 0xFFE, "page-crossing write16");
         let off = (addr & CHUNK_MASK) as usize;
-        match &mut self.chunks[(addr >> CHUNK_SHIFT) as usize] {
-            Some(c) => c[off..off + 2].copy_from_slice(&value.to_le_bytes()),
-            None => self.note_segv(addr, true),
+        if off <= CHUNK_SIZE - 2 {
+            match &mut self.chunks[(addr >> CHUNK_SHIFT) as usize] {
+                Some(c) => c[off..off + 2].copy_from_slice(&value.to_le_bytes()),
+                None => self.note_segv(addr, true),
+            }
+        } else {
+            self.write8(addr, value as u8);
+            self.write8(addr.wrapping_add(1), (value >> 8) as u8);
         }
     }
 
-    /// Write a little-endian dword (must not cross a 4 KiB page).
+    /// Write a little-endian dword (any alignment).
     #[inline]
     pub fn write32(&mut self, addr: u32, value: u32) {
-        debug_assert!(addr & 0xFFF <= 0xFFC, "page-crossing write32");
         let off = (addr & CHUNK_MASK) as usize;
-        match &mut self.chunks[(addr >> CHUNK_SHIFT) as usize] {
-            Some(c) => c[off..off + 4].copy_from_slice(&value.to_le_bytes()),
-            None => self.note_segv(addr, true),
+        if off <= CHUNK_SIZE - 4 {
+            match &mut self.chunks[(addr >> CHUNK_SHIFT) as usize] {
+                Some(c) => c[off..off + 4].copy_from_slice(&value.to_le_bytes()),
+                None => self.note_segv(addr, true),
+            }
+        } else {
+            self.write16(addr, value as u16);
+            self.write16(addr.wrapping_add(2), (value >> 16) as u16);
         }
     }
 
@@ -342,14 +359,28 @@ mod tests {
     fn wide_access_at_chunk_boundary_pages() {
         let mut m = AddressSpace::new();
         m.map(0x0001_0000, 0x2_0000);
-        // Highest non-crossing dword of a 4 KiB page inside a chunk.
+        // Highest non-crossing dword of the chunk.
         m.write32(0x0001_FFFC, 0xDEAD_BEEF);
         assert_eq!(m.read32(0x0001_FFFC), 0xDEAD_BEEF);
-        // And bytes straddling the chunk boundary via the generic helpers.
-        m.write_bytes(0x0001_FFFE, &[1, 2, 3, 4]).unwrap();
-        let mut b = [0u8; 4];
-        m.read_bytes(0x0001_FFFE, &mut b).unwrap();
-        assert_eq!(b, [1, 2, 3, 4]);
+        // A wide access straddling the 64 KiB chunk boundary must byte-split,
+        // not panic: paging is off for guests, so the CPU can hand us this.
+        m.write32(0x0001_FFFE, 0x1122_3344);
+        assert_eq!(m.read32(0x0001_FFFE), 0x1122_3344);
+        assert_eq!(m.read8(0x0001_FFFF), 0x33, "second LE byte, last of chunk 1");
+        assert_eq!(m.read8(0x0002_0000), 0x22, "third LE byte, first of chunk 2");
+        m.write16(0x0001_FFFF, 0xA55A);
+        assert_eq!(m.read16(0x0001_FFFF), 0xA55A);
+        assert!(m.take_segv().is_none(), "both chunks are mapped");
+    }
+
+    #[test]
+    fn wide_access_crossing_into_unmapped_latches_segv() {
+        let mut m = AddressSpace::new();
+        m.map(0x0001_0000, 0x1_0000); // only the first chunk
+        // The high half falls in the unmapped next chunk: byte-split latches
+        // the segv rather than slice-panicking.
+        assert_eq!(m.read32(0x0001_FFFE), 0x0000, "unmapped bytes read as 0");
+        assert_eq!(m.take_segv(), Some(Segv { addr: 0x0002_0000, write: false }));
     }
 
     #[test]

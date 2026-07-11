@@ -252,6 +252,25 @@ fn guest_write_reaches_the_fd_table() {
 }
 
 #[test]
+fn guest_wide_access_across_a_chunk_boundary_does_not_panic() {
+    // A dword store+load straddling a 64 KiB chunk boundary. Paging is off,
+    // so the CPU issues the wide bus access unsplit; before the byte-split
+    // fallback this panicked the emulator. 0x0804_FFFE is the top of chunk
+    // 0x0804 (the low 2 bytes) reaching into chunk 0x0805 (the high 2). The
+    // ~36 KiB of bss maps both chunks.
+    let code = [
+        0xB8, 0xFE, 0xFF, 0x04, 0x08, // MOV EAX, 0x0804FFFE (chunk-crossing)
+        0xC7, 0x00, 0x44, 0x33, 0x22, 0x11, // MOV DWORD [EAX], 11223344h
+        0x8B, 0x18, // MOV EBX, [EAX]  (read back, also crossing)
+        0x81, 0xEB, 0x44, 0x33, 0x22, 0x11, // SUB EBX, 11223344h -> 0 iff ok
+        0xB8, 0xFC, 0x00, 0x00, 0x00, // MOV EAX, 252 (exit_group)
+        0xCD, 0x80, // INT 80h
+    ];
+    let (_, exit) = run_elf(&code, 0x9000);
+    assert!(matches!(exit, Exit::Exited(0)), "wide crossing round-trips — got {exit:?}");
+}
+
+#[test]
 fn guest_invalid_opcode_reports_a_precise_fault() {
     let code = [0x0F, 0x0B]; // UD2
     let (_, exit) = run_elf(&code, 0);
