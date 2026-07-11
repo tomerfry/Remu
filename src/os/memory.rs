@@ -111,6 +111,25 @@ impl PhysMem {
             }
         }
     }
+
+    /// Copy `buf.len()` bytes out of physical memory starting at `addr`; the
+    /// caller guarantees the span stays within one frame.
+    #[inline]
+    fn copy_out(&self, addr: u32, buf: &mut [u8]) {
+        let off = (addr & PAGE_MASK) as usize;
+        match self.frame(addr >> 12) {
+            Some(f) => buf.copy_from_slice(&f[off..off + buf.len()]),
+            None => buf.fill(0),
+        }
+    }
+
+    /// Copy `data` into physical memory starting at `addr`; the caller
+    /// guarantees the span stays within one frame.
+    #[inline]
+    fn copy_in(&mut self, addr: u32, data: &[u8]) {
+        let off = (addr & PAGE_MASK) as usize;
+        self.frame_mut(addr >> 12)[off..off + data.len()].copy_from_slice(data);
+    }
 }
 
 impl Bus for PhysMem {
@@ -265,18 +284,36 @@ impl AddressSpace {
         mem.store32(pt + ((lin >> 12) & 0x3FF) * 4, phys | flags);
     }
 
+    /// Read the raw page-table entry for `lin` (0 if unmapped).
+    fn pte_entry(&self, mem: &PhysMem, lin: u32) -> u32 {
+        let pde = mem.load32(self.cr3 + (lin >> 22) * 4);
+        if pde & pte::P == 0 {
+            return 0;
+        }
+        mem.load32((pde & !PAGE_MASK) + ((lin >> 12) & 0x3FF) * 4)
+    }
+
     /// Map `[start, start+len)` (page-rounded) with `prot`, allocating fresh
     /// frames but *not* recording a VMA. Pages already mapped keep their frame
-    /// and widen their protection (so adjacent ELF segments sharing a page are
-    /// safe). `user` sets the U/S bit.
+    /// and *widen* their protection — the union of old and new — so adjacent
+    /// ELF segments sharing a boundary page never lose write access regardless
+    /// of mapping order. `user` sets the U/S bit.
     fn map_range(&mut self, mem: &mut PhysMem, start: u32, len: u32, prot: u32, user: bool) {
         let s = page_down(start);
         let e = page_up(start as u64 + len as u64);
         let mut lin = s;
         while lin < e {
-            let phys = match self.resolve(mem, lin) {
-                None => self.alloc_frame(mem),
-                Some(p) => p & !PAGE_MASK, // keep frame, widen prot below
+            let (phys, prot) = match self.resolve(mem, lin) {
+                None => (self.alloc_frame(mem), prot),
+                Some(p) => {
+                    // Union the existing write permission into the new prot.
+                    let widened = if self.pte_entry(mem, lin) & pte::RW != 0 {
+                        prot | PROT_WRITE
+                    } else {
+                        prot
+                    };
+                    (p & !PAGE_MASK, widened)
+                }
             };
             self.set_pte(mem, lin, phys, prot, user);
             lin += PAGE_SIZE;
@@ -307,26 +344,35 @@ impl AddressSpace {
     }
 
     /// Copy `data` into guest memory at linear `lin` (kernel privilege: bypasses
-    /// user page protection, so read-only segments can be filled). Returns
-    /// `false` if any target page is unmapped.
+    /// user page protection, so read-only segments can be filled). Walks the
+    /// page tables once per page, not per byte. Returns `false` if any target
+    /// page is unmapped.
     pub fn write_bytes(&self, mem: &mut PhysMem, lin: u32, data: &[u8]) -> bool {
-        for (i, &b) in data.iter().enumerate() {
-            match self.resolve(mem, lin.wrapping_add(i as u32)) {
-                Some(p) => mem.store8(p, b),
-                None => return false,
-            }
+        let mut done = 0usize;
+        while done < data.len() {
+            let addr = lin.wrapping_add(done as u32);
+            let Some(phys) = self.resolve(mem, addr) else {
+                return false;
+            };
+            let n = (PAGE_SIZE - (addr & PAGE_MASK)).min((data.len() - done) as u32) as usize;
+            mem.copy_in(phys, &data[done..done + n]);
+            done += n;
         }
         true
     }
 
-    /// Read `buf.len()` bytes from guest memory at linear `lin`. Returns `false`
-    /// if any source page is unmapped (the caller reports `-EFAULT`).
+    /// Read `buf.len()` bytes from guest memory at linear `lin`. Walks the page
+    /// tables once per page. Returns `false` if any source page is unmapped.
     pub fn read_bytes(&self, mem: &PhysMem, lin: u32, buf: &mut [u8]) -> bool {
-        for (i, b) in buf.iter_mut().enumerate() {
-            match self.resolve(mem, lin.wrapping_add(i as u32)) {
-                Some(p) => *b = mem.load8(p),
-                None => return false,
-            }
+        let mut done = 0usize;
+        while done < buf.len() {
+            let addr = lin.wrapping_add(done as u32);
+            let Some(phys) = self.resolve(mem, addr) else {
+                return false;
+            };
+            let n = (PAGE_SIZE - (addr & PAGE_MASK)).min((buf.len() - done) as u32) as usize;
+            mem.copy_out(phys, &mut buf[done..done + n]);
+            done += n;
         }
         true
     }
@@ -347,10 +393,14 @@ impl AddressSpace {
     }
 
     /// `mmap` an anonymous (or to-be-filled) region of `len` bytes with `prot`.
-    /// Bump-allocates from the arena; returns the base address.
+    /// Bump-allocates from the arena; returns the base address, or 0 if the
+    /// arena would collide with the stack region (the caller reports `-ENOMEM`).
     pub fn mmap(&mut self, mem: &mut PhysMem, len: u32, prot: u32) -> u32 {
         let addr = self.mmap_top;
         let size = page_up(len as u64);
+        if addr as u64 + size as u64 > STACK_LIMIT as u64 {
+            return 0;
+        }
         self.map(mem, addr, size, prot, VmaKind::Mapping);
         self.mmap_top = self.mmap_top.wrapping_add(size);
         addr

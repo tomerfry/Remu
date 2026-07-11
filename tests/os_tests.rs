@@ -67,6 +67,9 @@ const EAX: u8 = 0;
 const ECX: u8 = 1;
 const EDX: u8 = 2;
 const EBX: u8 = 3;
+const EBP: u8 = 5;
+const ESI: u8 = 6;
+const EDI: u8 = 7;
 
 fn write_temp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(name);
@@ -236,6 +239,75 @@ fn brk_allocates_heap() {
     let mut emu = Emulator::load(&path, &["/b".into()], &[], None).unwrap();
     let code = emu.run_capped(100_000);
     assert_eq!(code, 0x37);
+}
+
+#[test]
+fn mprotect_is_enforced() {
+    // mmap a RW page, write to it, mprotect it read-only, then write again:
+    // the second write must #PF -> SIGSEGV. This also proves the TLB is flushed
+    // after mprotect (a stale writable entry would let the write through).
+    let elf = build_elf(|_data| {
+        let mut code = Vec::new();
+        code.extend(mov_imm(EAX, 192)); // mmap2
+        code.extend([0x31, 0xDB]); // xor ebx, ebx  (addr = 0)
+        code.extend(mov_imm(ECX, 0x1000)); // len
+        code.extend(mov_imm(EDX, 3)); // PROT_READ|PROT_WRITE
+        code.extend(mov_imm(ESI, 0x22)); // MAP_PRIVATE|MAP_ANONYMOUS
+        code.extend(mov_imm(EDI, 0xFFFF_FFFF)); // fd = -1
+        code.extend(mov_imm(EBP, 0)); // offset
+        code.extend([0xCD, 0x80]); // int 0x80 -> eax = base
+        code.extend([0x89, 0xC7]); // mov edi, eax  (save base)
+        code.extend([0xC6, 0x07, 0x55]); // mov byte [edi], 0x55  (ok, writable)
+        code.extend(mov_imm(EAX, 125)); // mprotect
+        code.extend([0x89, 0xFB]); // mov ebx, edi  (addr)
+        code.extend(mov_imm(ECX, 0x1000)); // len
+        code.extend(mov_imm(EDX, 1)); // PROT_READ
+        code.extend([0xCD, 0x80]); // int 0x80
+        code.extend([0xC6, 0x07, 0x66]); // mov byte [edi], 0x66  -> #PF -> SIGSEGV
+        code.extend(mov_imm(EAX, 252)); // (unreached) exit_group(0)
+        code.extend([0x31, 0xDB]);
+        code.extend([0xCD, 0x80]);
+        (code, Vec::new())
+    });
+    let path = write_temp("remu_mprotect.elf", &elf);
+    let mut emu = Emulator::load(&path, &["/mp".into()], &[], None).unwrap();
+    let code = emu.run_capped(100_000);
+    assert_eq!(code, 139, "write to a read-only page must SIGSEGV");
+}
+
+#[test]
+fn load_rejects_non_elf() {
+    let path = write_temp("remu_notelf.bin", b"this is definitely not an ELF binary");
+    let err = Emulator::load(&path, &["/x".into()], &[], None);
+    assert!(err.is_err(), "loading a non-ELF file should fail");
+}
+
+#[test]
+fn sandbox_contains_parent_traversal() {
+    // A rootfs-relative open of "/../escape.txt" must resolve inside the rootfs
+    // (ENOENT here) and never reach a real file outside it.
+    let root = std::env::temp_dir().join("remu_rootfs_test");
+    std::fs::create_dir_all(&root).unwrap();
+    // A tempting file OUTSIDE the rootfs (a sibling); the guest must not open it.
+    std::fs::write(root.parent().unwrap().join("remu_escape_target.txt"), b"secret").unwrap();
+
+    let path_str = b"/../remu_escape_target.txt\0";
+    let elf = build_elf(|data_addr| {
+        let mut code = Vec::new();
+        code.extend(mov_imm(EAX, 5)); // open
+        code.extend(mov_imm(EBX, data_addr)); // path
+        code.extend([0x31, 0xC9]); // xor ecx, ecx  (O_RDONLY)
+        code.extend([0xCD, 0x80]); // int 0x80 -> eax = fd or -errno
+        code.extend([0x89, 0xC3]); // mov ebx, eax
+        code.extend(mov_imm(EAX, 252)); // exit_group(eax)
+        code.extend([0xCD, 0x80]);
+        (code, path_str.to_vec())
+    });
+    let path = write_temp("remu_sandbox.elf", &elf);
+    let mut emu = Emulator::load(&path, &["/s".into()], &[], Some(root)).unwrap();
+    let code = emu.run_capped(100_000);
+    // -ENOENT (-2) low byte = 0xFE = 254; a successful open would give a small fd.
+    assert_eq!(code, 254, "traversal escaped the rootfs (got a valid fd)");
 }
 
 /// Run a real binary from an i386 rootfs, if one is provided.

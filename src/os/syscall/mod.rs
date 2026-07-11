@@ -4,9 +4,13 @@
 //! `EAX`.
 
 use super::Emulator;
-use crate::os::abi::{errno, mmap, sys};
+use crate::os::abi::{errno, gdt, mmap, sys};
 use crate::os::arch::{I386, TargetArch};
 use crate::os::memory::{PROT_EXEC, PROT_READ, PROT_WRITE};
+
+/// Bytes moved per host-side buffer chunk. Transfers loop over this so a
+/// guest-supplied length never drives an unbounded host allocation.
+const XFER_CHUNK: usize = 64 * 1024;
 
 /// `S_IF*` file-type bits.
 mod mode {
@@ -48,6 +52,57 @@ impl Emulator {
     fn g_string(&self, lin: u32) -> Option<String> {
         self.g_cstr(lin, 4096)
             .map(|b| String::from_utf8_lossy(&b).into_owned())
+    }
+
+    /// Copy up to `len` bytes from `fd` into guest memory at `lin`, in bounded
+    /// chunks. Returns bytes moved or `-errno`.
+    fn transfer_read(&mut self, fd: i32, lin: u32, len: usize) -> i32 {
+        let mut buf = vec![0u8; XFER_CHUNK.min(len.max(1))];
+        let (mut total, mut off, mut left) = (0i32, 0u32, len);
+        while left > 0 {
+            let n = left.min(XFER_CHUNK);
+            let got = self.vfs.read(fd, &mut buf[..n]);
+            if got < 0 {
+                return if total > 0 { total } else { got };
+            }
+            if got == 0 {
+                break;
+            }
+            if !self.g_write(lin + off, &buf[..got as usize]) {
+                return if total > 0 { total } else { -errno::EFAULT };
+            }
+            total += got;
+            off += got as u32;
+            left -= got as usize;
+            if (got as usize) < n {
+                break;
+            }
+        }
+        total
+    }
+
+    /// Copy up to `len` bytes from guest memory at `lin` to `fd`, in bounded
+    /// chunks. Returns bytes moved or `-errno`.
+    fn transfer_write(&mut self, fd: i32, lin: u32, len: usize) -> i32 {
+        let mut buf = vec![0u8; XFER_CHUNK.min(len.max(1))];
+        let (mut total, mut off, mut left) = (0i32, 0u32, len);
+        while left > 0 {
+            let n = left.min(XFER_CHUNK);
+            if !self.g_read(lin + off, &mut buf[..n]) {
+                return if total > 0 { total } else { -errno::EFAULT };
+            }
+            let w = self.vfs.write(fd, &buf[..n]);
+            if w < 0 {
+                return if total > 0 { total } else { w };
+            }
+            total += w;
+            off += w as u32;
+            left -= w as usize;
+            if (w as usize) < n {
+                break; // short write: stop here
+            }
+        }
+        total
     }
 
     // --- dispatch -----------------------------------------------------------
@@ -169,26 +224,14 @@ impl Emulator {
         let fd = self.arg(0) as i32;
         let ptr = self.arg(1);
         let len = self.arg(2) as usize;
-        let mut buf = vec![0u8; len];
-        let n = self.vfs.read(fd, &mut buf);
-        if n <= 0 {
-            return n;
-        }
-        if !self.g_write(ptr, &buf[..n as usize]) {
-            return -errno::EFAULT;
-        }
-        n
+        self.transfer_read(fd, ptr, len)
     }
 
     fn sys_write(&mut self) -> i32 {
         let fd = self.arg(0) as i32;
         let ptr = self.arg(1);
         let len = self.arg(2) as usize;
-        let mut buf = vec![0u8; len];
-        if !self.g_read(ptr, &mut buf) {
-            return -errno::EFAULT;
-        }
-        self.vfs.write(fd, &buf)
+        self.transfer_write(fd, ptr, len)
     }
 
     fn sys_writev(&mut self) -> i32 {
@@ -199,23 +242,22 @@ impl Emulator {
         for i in 0..cnt {
             let base = iov + i * 8;
             let Some(ptr) = self.g_u32(base) else {
-                return -errno::EFAULT;
+                return if total > 0 { total } else { -errno::EFAULT };
             };
             let Some(len) = self.g_u32(base + 4) else {
-                return -errno::EFAULT;
+                return if total > 0 { total } else { -errno::EFAULT };
             };
             if len == 0 {
                 continue;
             }
-            let mut buf = vec![0u8; len as usize];
-            if !self.g_read(ptr, &mut buf) {
-                return -errno::EFAULT;
-            }
-            let n = self.vfs.write(fd, &buf);
+            let n = self.transfer_write(fd, ptr, len as usize);
             if n < 0 {
                 return if total > 0 { total } else { n };
             }
             total += n;
+            if (n as u32) < len {
+                break; // short write: stop the gather
+            }
         }
         total
     }
@@ -289,18 +331,20 @@ impl Emulator {
             self.aspace.mmap_fixed(&mut self.mem, addr, len, prot);
             addr
         } else {
-            self.aspace.mmap(&mut self.mem, len, prot)
+            let b = self.aspace.mmap(&mut self.mem, len, prot);
+            if b == 0 {
+                return -errno::ENOMEM;
+            }
+            b
         };
 
-        // File-backed: populate from the fd (needed for dynamic linking).
+        // File-backed: populate from the fd (needed for dynamic linking). The
+        // transfer is chunked, so a large mapping does not allocate a big host
+        // buffer.
         if flags & mmap::MAP_ANONYMOUS == 0 && fd >= 0 {
             let saved = self.vfs.lseek(fd, 0, 1);
             self.vfs.lseek(fd, file_off as i64, 0);
-            let mut buf = vec![0u8; len as usize];
-            let n = self.vfs.read(fd, &mut buf);
-            if n > 0 {
-                self.g_write(base, &buf[..n as usize]);
-            }
+            self.transfer_read(fd, base, len as usize);
             if saved >= 0 {
                 self.vfs.lseek(fd, saved, 0);
             }
@@ -412,11 +456,16 @@ impl Emulator {
         let flags = self.g_u32(uinfo + 12).unwrap_or(0);
 
         let entry = if entry_number == 0xFFFF_FFFF {
+            if self.tls_next >= gdt::TLS_MIN + gdt::TLS_COUNT {
+                return -errno::EINVAL; // out of TLS slots
+            }
             let e = self.tls_next;
             self.tls_next += 1;
             e
-        } else {
+        } else if (entry_number as u16) < gdt::ENTRIES {
             entry_number as u16
+        } else {
+            return -errno::EINVAL;
         };
         let limit_in_pages = flags & (1 << 4) != 0;
         let writable = flags & (1 << 3) == 0; // read_exec_only clear → writable
@@ -439,16 +488,22 @@ impl Emulator {
     fn sys_getrandom(&mut self) -> i32 {
         let buf = self.arg(0);
         let len = self.arg(1) as usize;
+        // Deterministic PRNG (not cryptographic), emitted in bounded chunks.
         let mut x = 0x1234_5678u32 ^ (self.cpu.cycles as u32);
-        let mut out = vec![0u8; len];
-        for b in out.iter_mut() {
-            x ^= x << 13;
-            x ^= x >> 17;
-            x ^= x << 5;
-            *b = x as u8;
-        }
-        if !self.g_write(buf, &out) {
-            return -errno::EFAULT;
+        let mut chunk = vec![0u8; XFER_CHUNK.min(len.max(1))];
+        let mut off = 0usize;
+        while off < len {
+            let n = (len - off).min(XFER_CHUNK);
+            for b in chunk[..n].iter_mut() {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                *b = x as u8;
+            }
+            if !self.g_write(buf + off as u32, &chunk[..n]) {
+                return -errno::EFAULT;
+            }
+            off += n;
         }
         len as i32
     }

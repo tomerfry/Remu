@@ -53,6 +53,8 @@ pub enum Fd {
 pub struct Vfs {
     /// Host directory serving as guest `/` (None → only virtual + std fds).
     rootfs: Option<PathBuf>,
+    /// Canonicalized rootfs, for the symlink-escape containment check.
+    canon_root: Option<PathBuf>,
     /// Guest current working directory (absolute, normalized).
     cwd: String,
     /// Descriptor table (indexed by fd).
@@ -70,8 +72,10 @@ pub struct Vfs {
 
 impl Vfs {
     pub fn new(rootfs: Option<PathBuf>) -> Self {
+        let canon_root = rootfs.as_ref().and_then(|r| r.canonicalize().ok());
         Vfs {
             rootfs,
+            canon_root,
             cwd: "/".into(),
             fds: vec![Some(Fd::Std(0)), Some(Fd::Std(1)), Some(Fd::Std(2))],
             exec_path: "/a.out".into(),
@@ -141,10 +145,26 @@ impl Vfs {
     }
 
     /// Map a normalized guest path to a host path under the rootfs (sandboxed).
+    ///
+    /// `normalize` already collapses guest `..`, so the guest cannot escape by
+    /// path. This additionally guards against host symlinks inside the rootfs
+    /// that point outside it: the canonicalized target (or, for a not-yet-created
+    /// file, its nearest existing ancestor) must remain under the rootfs.
     fn host_path(&self, guest: &str) -> Option<PathBuf> {
         let root = self.rootfs.as_ref()?;
-        let rel = guest.trim_start_matches('/');
-        Some(root.join(rel))
+        let cand = root.join(guest.trim_start_matches('/'));
+        if let Some(canon_root) = &self.canon_root {
+            let resolved = cand
+                .canonicalize()
+                .ok()
+                .or_else(|| cand.parent().and_then(|p| p.canonicalize().ok()));
+            if let Some(r) = resolved
+                && !r.starts_with(canon_root)
+            {
+                return None; // symlink escape → treat as absent
+            }
+        }
+        Some(cand)
     }
 
     /// Generate the content of a virtual `/proc` file, if `guest` names one.
