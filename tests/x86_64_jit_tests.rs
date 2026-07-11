@@ -134,6 +134,58 @@ fn dec32_zero_extends_upper() {
 }
 
 #[test]
+fn alu_mix_loop() {
+    // The bench's alu_mix body: ADD/XOR imm, ROL imm, IMUL, SUB reg, DEC/JNZ.
+    // Exercises the flag-exactness machine (XOR's undefined AF, ROL's undefined
+    // OF and IMUL's undefined SF/ZF/PF are all dead by the DEC at the exit).
+    #[rustfmt::skip]
+    let mut p = vec![
+        0x48, 0xC7, 0xC1, 0x00, 0x08, 0x00, 0x00, // MOV RCX, 2048
+        0x48, 0xB8, 0x78, 0x56, 0x34, 0x12, 0xEF, 0xCD, 0xAB, 0x89, // MOV RAX, imm64
+    ];
+    let loop_start = p.len();
+    p.extend_from_slice(&[0x48, 0x05, 0xB9, 0x79, 0x37, 0x9E]); // ADD RAX, -0x61C88647
+    p.extend_from_slice(&[0x48, 0x35, 0x5A, 0x5A, 0x5A, 0x5A]); // XOR RAX, 0x5A5A5A5A
+    p.extend_from_slice(&[0x48, 0xC1, 0xC0, 0x07]); // ROL RAX, 7
+    p.extend_from_slice(&[0x48, 0x0F, 0xAF, 0xC0]); // IMUL RAX, RAX
+    p.extend_from_slice(&[0x48, 0x29, 0xC8]); // SUB RAX, RCX
+    p.extend_from_slice(&[0x48, 0xFF, 0xC9]); // DEC RCX
+    let back = -((p.len() + 2 - loop_start) as i64) as i8;
+    p.extend_from_slice(&[0x75, back as u8]); // JNZ loop_start
+    // 2 setup + 7 body instructions per iteration × 2048.
+    let total = 2 + 7 * 2048;
+    for chunk in [1u64, 3, 29, 337, 7919] {
+        lockstep(&p, total, chunk);
+    }
+}
+
+#[test]
+fn alu_ops_and_shifts() {
+    // A straight sweep of ALU/shift forms wrapped in a DEC/JNZ loop, so several
+    // registers and every status flag change each iteration.
+    #[rustfmt::skip]
+    let mut p = vec![
+        0x48, 0xC7, 0xC1, 0x1E, 0x00, 0x00, 0x00, // MOV RCX, 30
+        0x48, 0xC7, 0xC0, 0xFF, 0x00, 0x00, 0x00, // MOV RAX, 255
+        0x48, 0xC7, 0xC3, 0x0F, 0x00, 0x00, 0x00, // MOV RBX, 15
+    ];
+    let loop_start = p.len();
+    p.extend_from_slice(&[0x48, 0x01, 0xD8]); // ADD RAX, RBX
+    p.extend_from_slice(&[0x48, 0x21, 0xD8]); // AND RAX, RBX
+    p.extend_from_slice(&[0x48, 0x09, 0xD8]); // OR RAX, RBX
+    p.extend_from_slice(&[0x48, 0xC1, 0xE0, 0x03]); // SHL RAX, 3
+    p.extend_from_slice(&[0x48, 0xC1, 0xE8, 0x02]); // SHR RAX, 2
+    p.extend_from_slice(&[0x48, 0x83, 0xF0, 0x11]); // XOR RAX, 0x11 (grp imm)
+    p.extend_from_slice(&[0x48, 0xFF, 0xC9]); // DEC RCX
+    let back = -((p.len() + 2 - loop_start) as i64) as i8;
+    p.extend_from_slice(&[0x75, back as u8]); // JNZ
+    let total = 3 + 8 * 30;
+    for chunk in [1u64, 11, 121] {
+        lockstep(&p, total, chunk);
+    }
+}
+
+#[test]
 fn smc_invalidates_jit_block() {
     // Run a tight loop enough to translate it, then overwrite the loop body
     // with a HLT via a guest store and confirm the CPU sees the new code
