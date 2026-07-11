@@ -298,4 +298,82 @@ impl Cpu {
             Ok(())
         }
     }
+
+    // --- Public host accessors (for OS-emulation syscall marshaling) ----------
+    // A host syscall layer must read/write the guest's *virtual* buffers the
+    // same way the CPU does — through segmentation-flat linear addresses and
+    // the page tables. These expose the tested `lin_*` path with the public
+    // `Exception` error type; a fault (an inaccessible buffer) surfaces as
+    // `Err`, which the caller maps to `-EFAULT`.
+
+    /// Read a byte from guest linear address `lin`, honoring paging.
+    #[inline]
+    pub fn read_linear8<B: Bus>(&mut self, bus: &mut B, lin: u32) -> Result<u8, Exception> {
+        self.lin_read8(bus, lin)
+    }
+
+    /// Read a little-endian word from guest linear address `lin`.
+    #[inline]
+    pub fn read_linear16<B: Bus>(&mut self, bus: &mut B, lin: u32) -> Result<u16, Exception> {
+        self.lin_read16(bus, lin)
+    }
+
+    /// Read a little-endian double-word from guest linear address `lin`.
+    #[inline]
+    pub fn read_linear32<B: Bus>(&mut self, bus: &mut B, lin: u32) -> Result<u32, Exception> {
+        self.lin_read32(bus, lin)
+    }
+
+    /// Write a byte to guest linear address `lin`, honoring paging.
+    #[inline]
+    pub fn write_linear8<B: Bus>(&mut self, bus: &mut B, lin: u32, v: u8) -> Result<(), Exception> {
+        self.lin_write8(bus, lin, v)
+    }
+
+    /// Write a little-endian word to guest linear address `lin`.
+    #[inline]
+    pub fn write_linear16<B: Bus>(
+        &mut self,
+        bus: &mut B,
+        lin: u32,
+        v: u16,
+    ) -> Result<(), Exception> {
+        self.lin_write16(bus, lin, v)
+    }
+
+    /// Write a little-endian double-word to guest linear address `lin`.
+    #[inline]
+    pub fn write_linear32<B: Bus>(
+        &mut self,
+        bus: &mut B,
+        lin: u32,
+        v: u32,
+    ) -> Result<(), Exception> {
+        self.lin_write32(bus, lin, v)
+    }
+
+    /// Invalidate the whole translation cache. A host (OS-emulation) layer that
+    /// edits page tables directly and then reloads `CR3` as a field — rather
+    /// than via `MOV CR3` — must call this so stale entries do not linger (the
+    /// 386 has no `INVLPG`, so a full flush is the only option anyway).
+    #[inline]
+    pub fn invalidate_tlb(&mut self) {
+        self.flush_tlb();
+    }
+
+    /// Translate guest linear address `lin` to a physical address using the
+    /// current page tables (`write` selects the write-permission rule).
+    /// Returns `Err` (a `#PF`, with `CR2` set) if it is not accessible.
+    #[inline]
+    pub fn translate_linear<B: Bus>(
+        &mut self,
+        bus: &mut B,
+        lin: u32,
+        write: bool,
+    ) -> Result<u32, Exception> {
+        if !self.paging() {
+            return Ok(lin);
+        }
+        self.translate(bus, lin, write)
+    }
 }
