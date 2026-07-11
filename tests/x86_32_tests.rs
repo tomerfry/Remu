@@ -683,6 +683,128 @@ fn paging_translation_and_fault() {
     assert_eq!(mem.ram[sp], 0x02);
 }
 
+// --- Fetch-window boundary tests ------------------------------------------------
+
+#[test]
+fn fetch_across_page_boundary_faults_on_the_second_page() {
+    // MOV EAX, imm32 at 0x4FFC: opcode + 3 imm bytes on page 4, last imm
+    // byte on the unmapped page 5. The fetch must #PF with CR2 = 0x5000 and
+    // EIP rewound to the instruction start; once the page is mapped, the
+    // same instruction executes.
+    let (mut cpu, mut mem) = setup_pm();
+    mem.load(0x10000, &0x0001_1003u32.to_le_bytes()); // PDE 0: table @ 11000
+    for i in 0..1024u32 {
+        let pte: u32 = if i == 5 { 0 } else { (i << 12) | 3 };
+        mem.load(0x11000 + i * 4, &pte.to_le_bytes());
+    }
+    cpu.regs.cr3 = 0x10000;
+    cpu.regs.cr0 |= remu::x86_32::cr0::PG;
+    cpu.trap_faults = true;
+
+    mem.load(0x4FFC, &[0xB8, 0x78, 0x56, 0x34, 0x12]); // MOV EAX, 12345678h
+    cpu.regs.eip = 0x4FFC;
+
+    cpu.step(&mut mem);
+    match cpu.host_trap.take() {
+        Some(HostTrap::Exception(e)) => {
+            assert_eq!(e.vector, 14, "expected #PF");
+            assert_eq!(e.error, Some(0), "not-present supervisor read");
+        }
+        other => panic!("expected a trapped #PF, got {other:?}"),
+    }
+    assert_eq!(cpu.regs.cr2, 0x5000, "CR2 is the second page");
+    assert_eq!(cpu.regs.eip, 0x4FFC, "EIP rewinds to the instruction start");
+
+    // Map page 5 and restart: the refill sees the new mapping immediately.
+    mem.load(0x11000 + 5 * 4, &0x0000_5003u32.to_le_bytes());
+    cpu.step(&mut mem);
+    assert!(cpu.host_trap.is_none());
+    assert_eq!(cpu.regs.gpr[reg::EAX as usize], 0x1234_5678);
+    assert_eq!(cpu.regs.eip, 0x5001);
+}
+
+#[test]
+fn cs_limit_checks_fetch_at_the_exact_byte() {
+    let (mut cpu, mut mem) = setup_pm();
+    cpu.trap_faults = true;
+    mem.load(0x2000, &[0xB8, 0x78, 0x56, 0x34, 0x12, 0x90]); // MOV EAX, imm32; NOP
+
+    // Limit 0x2004: the 5-byte instruction ends exactly at the limit and
+    // must execute...
+    cpu.regs.seg[reg::CS as usize].limit = 0x2004;
+    cpu.step(&mut mem);
+    assert!(cpu.host_trap.is_none(), "ending at the limit is legal");
+    assert_eq!(cpu.regs.gpr[reg::EAX as usize], 0x1234_5678);
+    assert_eq!(cpu.regs.eip, 0x2005);
+
+    // ...and the very next fetch #GPs at offset 0x2005.
+    cpu.step(&mut mem);
+    match cpu.host_trap.take() {
+        Some(HostTrap::Exception(e)) => {
+            assert_eq!(e.vector, 13, "expected #GP");
+            assert_eq!(e.error, Some(0));
+        }
+        other => panic!("expected a trapped #GP, got {other:?}"),
+    }
+    assert_eq!(cpu.regs.eip, 0x2005);
+
+    // Limit 0x2003: the same instruction now ends past the limit and must
+    // fault mid-decode, rewound to its start.
+    cpu.regs.seg[reg::CS as usize].limit = 0x2003;
+    cpu.regs.eip = 0x2000;
+    cpu.step(&mut mem);
+    match cpu.host_trap.take() {
+        Some(HostTrap::Exception(e)) => assert_eq!(e.vector, 13, "expected #GP"),
+        other => panic!("expected a trapped #GP, got {other:?}"),
+    }
+    assert_eq!(cpu.regs.eip, 0x2000);
+}
+
+#[test]
+fn store_into_the_next_instruction_is_fetched_fresh() {
+    // Self-modifying code: the first instruction overwrites the immediate of
+    // the second; the fetch must observe the new byte (no stale window).
+    let (mut cpu, mut mem) = setup_pm();
+    mem.load(
+        0x2000,
+        &[
+            0xC6, 0x05, 0x08, 0x20, 0x00, 0x00, 0x42, // MOV byte [2008h], 42h
+            0xB0, 0x37, // MOV AL, 37h (imm at 0x2008)
+        ],
+    );
+    cpu.step(&mut mem);
+    cpu.step(&mut mem);
+    assert_eq!(
+        cpu.regs.gpr[reg::EAX as usize] & 0xFF,
+        0x42,
+        "the freshly stored immediate must be fetched"
+    );
+}
+
+#[test]
+fn fifteen_byte_limit_still_uds() {
+    // 15 segment-override prefixes + NOP = 16 bytes -> #UD at the 16th byte;
+    // 14 prefixes + NOP = 15 bytes is legal.
+    let mut program = [0x26u8; 16];
+    program[15] = 0x90;
+    let (mut cpu, mut mem) = setup(&program);
+    cpu.trap_faults = true;
+    cpu.step(&mut mem);
+    match cpu.host_trap.take() {
+        Some(HostTrap::Exception(e)) => assert_eq!(e.vector, 6, "expected #UD"),
+        other => panic!("expected a trapped #UD, got {other:?}"),
+    }
+    assert_eq!(cpu.regs.eip, 0x1100, "EIP rewinds to the instruction start");
+
+    let mut program = [0x26u8; 15];
+    program[14] = 0x90;
+    let (mut cpu, mut mem) = setup(&program);
+    cpu.trap_faults = true;
+    cpu.step(&mut mem);
+    assert!(cpu.host_trap.is_none(), "15 bytes exactly is legal");
+    assert_eq!(cpu.regs.eip, 0x1100 + 15);
+}
+
 // --- Privilege-transition regression tests ------------------------------------
 //
 // These cover the paths the SingleStepTests suite cannot reach (it is real
