@@ -154,6 +154,9 @@ impl Emulator {
                     HostTrap::Syscall => self.dispatch_syscall(),
                     HostTrap::Exception(e) => self.handle_fault(e),
                 }
+                // Trap service writes guest memory host-side (read buffers,
+                // mmap, stack growth) — stale decoded code must not survive.
+                self.cpu.invalidate_icache();
             } else if self.cpu.shutdown {
                 self.exit_code = 139;
                 break;

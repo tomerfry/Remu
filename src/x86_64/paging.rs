@@ -222,6 +222,9 @@ impl Cpu {
         }
 
         if !large && pde & pte::A == 0 {
+            // A/D write-backs are guest-visible stores; a guest can execute
+            // from its own page tables, so they stamp the icache too.
+            self.icache.stamp_write(pde_addr);
             bus.write32(pde_addr, (pde | pte::A) as u32);
             pde |= pte::A;
         }
@@ -232,6 +235,7 @@ impl Cpu {
             if write {
                 leaf |= pte::D;
             }
+            self.icache.stamp_write(leaf_addr);
             bus.write32(leaf_addr, leaf as u32);
         }
 
@@ -325,6 +329,7 @@ impl Cpu {
                 v |= pte::D;
             }
             if v != e {
+                self.icache.stamp_write(addr);
                 bus.write64(addr, v);
             }
         }
@@ -429,10 +434,12 @@ impl Cpu {
     #[inline]
     pub(crate) fn lin_write8<B: Bus>(&mut self, bus: &mut B, lin: u64, v: u8) -> Exec<()> {
         if !self.paging() {
+            self.icache.stamp_write(lin);
             bus.write(lin, v);
             return Ok(());
         }
         let phys = self.translate(bus, lin, Access::Write)?;
+        self.icache.stamp_write(phys);
         bus.write(phys, v);
         Ok(())
     }
@@ -440,11 +447,13 @@ impl Cpu {
     #[inline]
     pub(crate) fn lin_write16<B: Bus>(&mut self, bus: &mut B, lin: u64, v: u16) -> Exec<()> {
         if !self.paging() {
+            self.icache.stamp_write_span(lin, lin.wrapping_add(1));
             bus.write16(lin, v);
             return Ok(());
         }
         if lin & 0xFFF < 0xFFF {
             let phys = self.translate(bus, lin, Access::Write)?;
+            self.icache.stamp_write(phys);
             bus.write16(phys, v);
             Ok(())
         } else {
@@ -452,6 +461,7 @@ impl Cpu {
             // the second page leaves the first untouched.
             let p0 = self.translate(bus, lin, Access::Write)?;
             let p1 = self.translate(bus, lin.wrapping_add(1), Access::Write)?;
+            self.icache.stamp_write_span(p0, p1);
             bus.write(p0, v as u8);
             bus.write(p1, (v >> 8) as u8);
             Ok(())
@@ -461,11 +471,13 @@ impl Cpu {
     #[inline]
     pub(crate) fn lin_write32<B: Bus>(&mut self, bus: &mut B, lin: u64, v: u32) -> Exec<()> {
         if !self.paging() {
+            self.icache.stamp_write_span(lin, lin.wrapping_add(3));
             bus.write32(lin, v);
             return Ok(());
         }
         if lin & 0xFFF < 0xFFD {
             let phys = self.translate(bus, lin, Access::Write)?;
+            self.icache.stamp_write(phys);
             bus.write32(phys, v);
             Ok(())
         } else {
@@ -474,6 +486,7 @@ impl Cpu {
             for (i, p) in phys.iter_mut().enumerate() {
                 *p = self.translate(bus, lin.wrapping_add(i as u64), Access::Write)?;
             }
+            self.icache.stamp_write_span(phys[0], phys[3]);
             for (i, p) in phys.iter().enumerate() {
                 bus.write(*p, (v >> (8 * i)) as u8);
             }
@@ -484,11 +497,13 @@ impl Cpu {
     #[inline]
     pub(crate) fn lin_write64<B: Bus>(&mut self, bus: &mut B, lin: u64, v: u64) -> Exec<()> {
         if !self.paging() {
+            self.icache.stamp_write_span(lin, lin.wrapping_add(7));
             bus.write64(lin, v);
             return Ok(());
         }
         if lin & 0xFFF < 0xFF9 {
             let phys = self.translate(bus, lin, Access::Write)?;
+            self.icache.stamp_write(phys);
             bus.write64(phys, v);
             Ok(())
         } else {
@@ -496,6 +511,7 @@ impl Cpu {
             for (i, p) in phys.iter_mut().enumerate() {
                 *p = self.translate(bus, lin.wrapping_add(i as u64), Access::Write)?;
             }
+            self.icache.stamp_write_span(phys[0], phys[7]);
             for (i, p) in phys.iter().enumerate() {
                 bus.write(*p, (v >> (8 * i)) as u8);
             }
