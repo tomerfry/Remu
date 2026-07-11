@@ -712,6 +712,54 @@ fn interrupt_uses_ist_and_iretq_returns() {
     assert_eq!(cpu.regs.gpr[reg::RSP as usize], rsp0);
 }
 
+#[test]
+fn iretq_outer_ss_fault_restores_cs_cache() {
+    // IRETQ from ring 0 to ring 3 commits the CS descriptor cache before the
+    // outer SS load can still fault; the rewind must restore the full CS
+    // cache (and with it CPL), not just RIP.
+    let mut mem = LinearMemory::new();
+    let mut cpu = Cpu::new();
+    cpu.setup_long_flat(&mut mem, CODE, STACK);
+    cpu.trap_faults = true;
+
+    // GDT at 0x8000: 08 = ring-0 code64, 10 = data, 20 = ring-3 code64.
+    // Limit 0x27 leaves the popped SS selector 0x2B (index 0x28) unmapped.
+    let gdt = 0x8000u64;
+    mem.write64(gdt + 8, 0x00A0_9A00_0000_0000);
+    mem.write64(gdt + 16, 0x00C0_9200_0000_FFFF);
+    mem.write64(gdt + 32, 0x00A0_FA00_0000_0000);
+    cpu.regs.gdtr = DescTable {
+        base: gdt,
+        limit: 0x27,
+    };
+
+    // Frame: RIP, CS=23h (ring-3 code), RFLAGS, RSP, SS=2Bh (past the GDT
+    // limit -> #GP once CS is already committed).
+    for (i, v) in [0x13_0000u64, 0x23, 2, 0x18_0000, 0x2B].iter().enumerate() {
+        mem.write64(STACK + i as u64 * 8, *v);
+    }
+    mem.load(CODE, &[0x48, 0xCF]); // IRETQ
+
+    let cs_before = cpu.regs.seg[reg::CS as usize];
+    let ss_before = cpu.regs.seg[reg::SS as usize];
+    cpu.step(&mut mem);
+    match cpu.host_trap {
+        Some(remu::x86_64::HostTrap::Exception(e)) => {
+            assert_eq!(e.vector, 13, "expected #GP on the bad outer SS")
+        }
+        ref other => panic!("expected a trapped #GP, got {other:?}"),
+    }
+    assert_eq!(
+        cpu.regs.seg[reg::CS as usize],
+        cs_before,
+        "the committed CS cache must be rewound after the outer-SS fault"
+    );
+    assert_eq!(cpu.regs.seg[reg::SS as usize], ss_before);
+    assert_eq!(cpu.cpl(), 0);
+    assert_eq!(cpu.regs.rip, CODE, "RIP rewinds to the IRETQ");
+    assert_eq!(cpu.regs.gpr[reg::RSP as usize], STACK, "pops rewound");
+}
+
 // --- 64-bit-mode #UD list -----------------------------------------------------
 
 #[test]

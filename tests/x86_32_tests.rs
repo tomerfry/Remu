@@ -926,6 +926,126 @@ fn iret_does_not_commit_eflags_when_the_outer_stack_faults() {
 }
 
 #[test]
+fn iret_outer_ss_fault_restores_cs_cache() {
+    // IRET to an outer ring commits the CS descriptor cache before the outer
+    // SS load can still fault; the fault rewind must restore the full CS
+    // cache (hidden base/limit/attrs, and with it CPL), not just EIP.
+    let (mut cpu, mut mem) = setup_pm();
+    mem.load(0x0520, &descriptor(0, 0xF_FFFF, 0xFA, 0xC)); // 20: ring-3 code
+    cpu.trap_faults = true;
+
+    // Frame: EIP, CS=23h, EFLAGS, ESP, SS=0FFFCh (RPL 0 != 3 -> #GP).
+    flat_ss(&mut cpu, 0x7000);
+    let frame: [u32; 5] = [0x4000, 0x23, 2, 0x6000, 0xFFFC];
+    for (i, v) in frame.iter().enumerate() {
+        mem.load(0x7000 + i as u32 * 4, &v.to_le_bytes());
+    }
+    mem.load(0x2000, &[0xCF]); // IRETD
+
+    let cs_before = cpu.regs.seg[reg::CS as usize];
+    let ss_before = cpu.regs.seg[reg::SS as usize];
+    cpu.step(&mut mem);
+    match cpu.host_trap {
+        Some(HostTrap::Exception(e)) => assert_eq!(e.vector, 13, "expected #GP"),
+        ref other => panic!("expected a trapped #GP, got {other:?}"),
+    }
+    assert_eq!(
+        cpu.regs.seg[reg::CS as usize],
+        cs_before,
+        "the committed CS cache must be rewound after the outer-SS fault"
+    );
+    assert_eq!(cpu.regs.seg[reg::SS as usize], ss_before);
+    assert_eq!(cpu.cpl(), 0);
+    assert_eq!(cpu.regs.eip, 0x2000, "EIP rewinds to the IRETD");
+    assert_eq!(cpu.regs.gpr[reg::ESP as usize], 0x7000, "pops rewound");
+}
+
+/// Drop straight to ring 3 with flat 4 GiB code/data caches (the descriptor
+/// tables are only consulted on the *next* segment load).
+fn enter_ring3(cpu: &mut Cpu, eip: u32, esp: u32) {
+    cpu.regs.seg[reg::CS as usize] = SegReg {
+        sel: 0x23,
+        base: 0,
+        limit: 0xFFFF_FFFF,
+        attrs: 0x0CFA,
+    };
+    cpu.regs.seg[reg::SS as usize] = SegReg {
+        sel: 0x2B,
+        base: 0,
+        limit: 0xFFFF_FFFF,
+        attrs: 0x0CF2,
+    };
+    cpu.regs.eip = eip;
+    cpu.regs.gpr[reg::ESP as usize] = esp;
+}
+
+#[test]
+fn call_gate_inner_stack_fault_restores_outer_ss() {
+    // A ring-3 CALL through a ring-0 call gate switches to the inner stack
+    // (SS:ESP committed from the TSS) before pushing the gate frame. With
+    // ESP0 = 2 the first push straddles the 4 GiB limit -> #SS; the rewind
+    // must restore the outer ring-3 SS cache and ESP.
+    let (mut cpu, mut mem) = setup_pm();
+    mem.load(0x0520, &descriptor(0, 0xF_FFFF, 0xFA, 0xC)); // 20: ring-3 code
+    mem.load(0x0528, &descriptor(0, 0xF_FFFF, 0xF2, 0xC)); // 28: ring-3 data
+    mem.load(0x0538, &gate(0x5000, 0x08, 0xEC)); // 38: call gate, DPL 3 -> ring-0 code
+    mem.load(0x3000, &tss(2, 0x10)); // ring-0 stack: 10h:00000002
+    attach_idt_tss(&mut cpu, 0x0800, 0x3000, 0x30);
+    cpu.trap_faults = true;
+
+    enter_ring3(&mut cpu, 0x4000, 0x6000);
+    mem.load(0x4000, &[0x9A, 0x00, 0x00, 0x00, 0x00, 0x38, 0x00]); // CALL 0038:0
+    mem.load(0x5000, &[0x90]);
+
+    let cs_before = cpu.regs.seg[reg::CS as usize];
+    let ss_before = cpu.regs.seg[reg::SS as usize];
+    cpu.step(&mut mem);
+    match cpu.host_trap {
+        Some(HostTrap::Exception(e)) => assert_eq!(e.vector, 12, "expected #SS"),
+        ref other => panic!("expected a trapped #SS, got {other:?}"),
+    }
+    assert_eq!(
+        cpu.regs.seg[reg::SS as usize],
+        ss_before,
+        "the committed inner SS cache must be rewound after the push fault"
+    );
+    assert_eq!(cpu.regs.gpr[reg::ESP as usize], 0x6000, "outer ESP restored");
+    assert_eq!(cpu.regs.seg[reg::CS as usize], cs_before);
+    assert_eq!(cpu.cpl(), 3);
+    assert_eq!(cpu.regs.eip, 0x4000, "EIP rewinds to the CALL");
+}
+
+#[test]
+fn int_gate_stack_switch_fault_restores_ss() {
+    // INT n from ring 3 through a ring-0 interrupt gate: the stack switch
+    // commits the inner SS, then the frame push faults on ESP0 = 2. Delivery
+    // is atomic (raise() rolls back) and the step-level rewind restarts the
+    // INT; the outer SS cache and ESP must survive untouched.
+    let (mut cpu, mut mem) = setup_pm();
+    mem.load(0x0520, &descriptor(0, 0xF_FFFF, 0xFA, 0xC)); // 20: ring-3 code
+    mem.load(0x0528, &descriptor(0, 0xF_FFFF, 0xF2, 0xC)); // 28: ring-3 data
+    mem.load(0x0800 + 0x40 * 8, &gate(0x5000, 0x08, 0xEE)); // INT 40h, DPL 3
+    mem.load(0x3000, &tss(2, 0x10)); // ring-0 stack: 10h:00000002
+    attach_idt_tss(&mut cpu, 0x0800, 0x3000, 0x30);
+    cpu.trap_faults = true;
+
+    enter_ring3(&mut cpu, 0x4000, 0x6000);
+    mem.load(0x4000, &[0xCD, 0x40]); // INT 40h
+    mem.load(0x5000, &[0x90]);
+
+    let ss_before = cpu.regs.seg[reg::SS as usize];
+    cpu.step(&mut mem);
+    match cpu.host_trap {
+        Some(HostTrap::Exception(e)) => assert_eq!(e.vector, 12, "expected #SS"),
+        ref other => panic!("expected a trapped #SS, got {other:?}"),
+    }
+    assert_eq!(cpu.regs.seg[reg::SS as usize], ss_before);
+    assert_eq!(cpu.regs.gpr[reg::ESP as usize], 0x6000);
+    assert_eq!(cpu.cpl(), 3);
+    assert_eq!(cpu.regs.eip, 0x4000, "EIP rewinds to the INT");
+}
+
+#[test]
 fn iretd_at_cpl3_ignores_a_set_vm_bit() {
     // VM is not writable at CPL > 0, so IRETD simply ignores it (no #GP).
     let (mut cpu, mut mem) = setup_pm();
