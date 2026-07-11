@@ -16,6 +16,11 @@ crate-type = ["rlib", "cdylib"]
 name = "remu-cli"
 path = "src/main.rs"
 
+[[bin]]
+# Linux i386 user-mode runner (qemu-user style).
+name = "remu-user"
+path = "src/bin/remu-user.rs"
+
 [dependencies]
 bitflags = "2"
 pyo3 = { version = "0.29.0", features = ["abi3-py39"], optional = true }

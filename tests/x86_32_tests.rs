@@ -3,7 +3,7 @@
 //! protected-mode plumbing. These give readable failures before reaching for
 //! the exhaustive SingleStepTests suite.
 
-use remu::x86_32::{Cpu, DescTable, EFlags, LinearMemory, SegReg, reg};
+use remu::x86_32::{Cpu, DescTable, EFlags, HostTrap, LinearMemory, SegReg, reg};
 
 /// Build a CPU + flat memory with `program` at `0000:1100`, a sane stack and
 /// real-mode defaults (mirrors the SingleStepTests rig conventions).
@@ -960,6 +960,53 @@ fn iretd_at_cpl3_ignores_a_set_vm_bit() {
     assert_eq!(cpu.regs.eip, 0x4100, "the return must not raise #GP");
     assert!(!cpu.regs.eflags.contains(EFlags::VM));
     assert_eq!(cpu.cpl(), 3);
+}
+
+// --- Software-interrupt trap hook (user-mode syscall seam) ------------------
+
+#[test]
+fn syscall_int_latches_int_n_without_ivt_dispatch() {
+    let (mut cpu, mut mem) = setup(&[0xCD, 0x80, 0x90]); // INT 80h; NOP
+    cpu.syscall_int = Some(0x80);
+    let sp0 = cpu.regs.gpr[reg::ESP as usize];
+
+    cpu.step(&mut mem);
+    assert_eq!(cpu.regs.eip, 0x1102, "EIP points past INT imm8");
+    assert_eq!(cpu.regs.gpr[reg::ESP as usize], sp0, "no frame was pushed");
+    assert_eq!(cpu.host_trap.take(), Some(HostTrap::Syscall), "latched");
+    assert_eq!(cpu.host_trap, None, "take clears the latch");
+
+    cpu.step(&mut mem); // NOP: execution simply continues
+    assert_eq!(cpu.regs.eip, 0x1103);
+    assert_eq!(cpu.host_trap, None);
+}
+
+#[test]
+fn syscall_int_leaves_other_vectors_on_the_ivt_path() {
+    let (mut cpu, mut mem) = setup(&[0xCD, 0x21]); // INT 21h
+    cpu.syscall_int = Some(0x80);
+    mem.load(0x21 * 4, &[0x00, 0x20, 0x00, 0x30]); // IVT[21h] = 3000:2000
+    let sp0 = cpu.regs.gpr[reg::ESP as usize];
+
+    cpu.step(&mut mem);
+    assert_eq!(cpu.regs.eip, 0x2000, "delivered through the IVT");
+    assert_eq!(cpu.regs.seg[reg::CS as usize].sel, 0x3000);
+    assert_eq!(
+        cpu.regs.gpr[reg::ESP as usize],
+        sp0 - 6,
+        "FLAGS/CS/IP pushed"
+    );
+    assert_eq!(cpu.host_trap, None);
+}
+
+#[test]
+fn syscall_int_covers_the_one_byte_int_forms() {
+    // INT3 funnels through the same seam, so Some(3) latches it too.
+    let (mut cpu, mut mem) = setup(&[0xCC]); // INT3
+    cpu.syscall_int = Some(3);
+    cpu.step(&mut mem);
+    assert_eq!(cpu.regs.eip, 0x1101);
+    assert_eq!(cpu.host_trap.take(), Some(HostTrap::Syscall));
 }
 
 #[test]
