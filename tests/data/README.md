@@ -16,7 +16,8 @@ gcc -m32 -march=i386 -O1 -nostdlib -static -fno-pie -no-pie \
     -o hello-nolibc hello.c
 ```
 
-`-march=i386` matters: the emulated CPU is a genuine 80386, so 486+
-instructions (`CMPXCHG`, `XADD`, `BSWAP`) and later ones (`CMOV`, `CPUID`)
-raise #UD. This also rules out stock musl/glibc static binaries for now —
-musl's i386 atomics use `lock cmpxchg` unconditionally.
+The user-mode runner enables the core's `extensions` opcodes (`CMPXCHG`,
+`XADD`, `BSWAP`, `CMOVcc`, `CPUID`, ...), so integer binaries built for
+486+/686 generally run too — `-march=i386` is just the most conservative
+choice. There is still no x87 FPU: floating-point instructions are silent
+no-ops, so keep test programs integer-only.

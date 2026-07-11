@@ -252,6 +252,39 @@ fn guest_write_reaches_the_fd_table() {
 }
 
 #[test]
+fn guest_invalid_opcode_reports_a_precise_fault() {
+    let code = [0x0F, 0x0B]; // UD2
+    let (_, exit) = run_elf(&code, 0);
+    let Exit::Fault(msg) = exit else {
+        panic!("expected a fault, got {exit:?}")
+    };
+    assert!(msg.contains("#UD"), "{msg}");
+    let eip = format!("EIP={:08x}", BASE + CODE_OFF);
+    assert!(
+        msg.contains(&eip),
+        "EIP rewound to the faulting instruction: {msg}"
+    );
+}
+
+#[test]
+fn extension_opcodes_run_under_user_mode() {
+    // BSWAP is a 486 instruction; the adapter enables `extensions`.
+    let code = [
+        0xB8, 0x78, 0x56, 0x34, 0x12, // MOV EAX, 12345678h
+        0x0F, 0xC8, // BSWAP EAX
+        0x2D, 0x12, 0x34, 0x56, 0x78, // SUB EAX, 78563412h
+        0x89, 0xC3, // MOV EBX, EAX
+        0xB8, 0xFC, 0x00, 0x00, 0x00, // MOV EAX, 252 (exit_group)
+        0xCD, 0x80, // INT 80h
+    ];
+    let (_, exit) = run_elf(&code, 0);
+    assert!(
+        matches!(exit, Exit::Exited(0)),
+        "BSWAP executed — got {exit:?}"
+    );
+}
+
+#[test]
 fn guest_segfault_produces_a_fault_report() {
     let code = [0xA1, 0x00, 0x00, 0x00, 0x00]; // MOV EAX, [0]
     let (_, exit) = run_elf(&code, 0);

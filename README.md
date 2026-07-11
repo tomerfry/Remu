@@ -69,12 +69,13 @@ cargo run --release --bin remu-user -- [--strace] [--trace] [--env K=V] \
     <program.elf> [guest args...]
 ```
 
-The guest's exit status becomes the host exit code; a crash prints a register
-dump. The layer is written against the small `remu::usermode::UserArch`
-adapter trait, so adding another CPU architecture means one new adapter.
-Current limits (v1): `ET_EXEC` only (no dynamic linking/PIE), integer-only
-binaries built with `-march=i386` (no x87, and no 486+ instructions — stock
-musl static binaries need `lock cmpxchg`), no signals, no threads. See
+The guest's exit status becomes the host exit code; a crash prints a
+precise fault report (exception, rewound EIP, register dump). The layer is
+written against the small `remu::usermode::UserArch` adapter trait, so
+adding another CPU architecture means one new adapter. Post-386 integer
+opcodes (`CMPXCHG`, `BSWAP`, `CMOVcc`, `CPUID`, ...) are enabled for
+user-mode guests. Current limits (v1): `ET_EXEC` only (no dynamic
+linking/PIE), integer-only binaries (no x87), no signals, no threads. See
 `tests/data/README.md` for building compatible test programs.
 
 ## Tests

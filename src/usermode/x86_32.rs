@@ -120,6 +120,12 @@ impl UserArch for Cpu {
         self.regs.eip = entry;
         self.regs.eflags.insert(EFlags::IF);
         self.syscall_int = Some(SYSCALL_VECTOR);
+        // No guest kernel behind the IDT: hand exceptions to the host for a
+        // precise fault report instead of letting them cascade.
+        self.trap_faults = true;
+        // Real 32-bit binaries use a few post-386 opcodes (CMPXCHG, BSWAP,
+        // CMOVcc, CPUID, ...); enable them for user-mode guests.
+        self.extensions = true;
     }
 
     #[inline]
@@ -164,6 +170,33 @@ impl UserArch for Cpu {
             NR_SET_THREAD_AREA => Some(set_thread_area(mem, args[0])),
             _ => None,
         }
+    }
+
+    fn take_fault(&mut self) -> Option<String> {
+        let Some(HostTrap::Exception(e)) = self.host_trap else {
+            return None;
+        };
+        self.host_trap = None;
+        let name = match e.vector {
+            0 => " (#DE divide error)",
+            1 => " (#DB debug)",
+            4 => " (#OF overflow)",
+            5 => " (#BR bound range)",
+            6 => " (#UD invalid opcode)",
+            7 => " (#NM no coprocessor)",
+            12 => " (#SS stack fault)",
+            13 => " (#GP general protection)",
+            14 => " (#PF page fault)",
+            _ => "",
+        };
+        let mut msg = format!("unhandled CPU exception {}{name}", e.vector);
+        if let Some(code) = e.error {
+            msg.push_str(&format!(", error code {code:#06x}"));
+        }
+        if e.vector == 14 {
+            msg.push_str(&format!(", CR2={:#010x}", self.regs.cr2));
+        }
+        Some(msg)
     }
 
     fn pc(&self) -> u32 {

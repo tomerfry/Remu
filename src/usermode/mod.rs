@@ -60,6 +60,13 @@ pub trait UserArch {
         None
     }
 
+    /// Take a pending trapped CPU exception, if any (clears it); the string
+    /// describes it for a fault report. Register state has been rewound to
+    /// the faulting instruction, so `pc()`/`dump()` point at the culprit.
+    fn take_fault(&mut self) -> Option<String> {
+        None
+    }
+
     /// Current program counter (for diagnostics).
     fn pc(&self) -> u32;
 
@@ -121,6 +128,9 @@ impl<A: UserArch> Usermode<A> {
                 linux::Control::Ret(v) => self.cpu.set_syscall_ret(v),
                 linux::Control::Exit(code) => return Some(Exit::Exited(code)),
             }
+        }
+        if let Some(f) = self.cpu.take_fault() {
+            return Some(Exit::Fault(format!("{f}\n{}", self.cpu.dump())));
         }
         if let Some(s) = self.mem.take_segv() {
             return Some(Exit::Fault(format!(
