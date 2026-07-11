@@ -346,7 +346,7 @@ impl Cpu {
         let plan = self.jit_plan(bus, phys, start_rip);
         self.regs.rip = start_rip; // decode-ahead advanced it
         let Some(plan) = plan else {
-            self.jit.cold.insert(key);
+            self.jit_mark_cold(key, phys);
             return false;
         };
 

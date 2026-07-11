@@ -23,7 +23,6 @@
 #![cfg(all(feature = "jit", target_arch = "x86_64"))]
 
 use core::mem::offset_of;
-use std::collections::HashSet;
 
 use dynasmrt::x64::Assembler;
 use dynasmrt::{AssemblyOffset, DynasmApi};
@@ -32,6 +31,19 @@ use super::icache::{ICache, STAMP_SLOTS};
 use super::{Bus, Cpu, Registers, RunExit, RunResult};
 
 mod emit;
+
+/// Table `idx` sentinel marking a head known to be untranslatable.
+const COLD: u32 = u32::MAX;
+
+/// Result of a direct-mapped block-table probe.
+enum Lookup {
+    /// A valid translated block at this index.
+    Hit(usize),
+    /// A head recorded as untranslatable (interpret it).
+    Cold,
+    /// No valid entry — evaluate/translate.
+    Miss,
+}
 
 // --- Guest-state field offsets from the `*mut Cpu` base (rbp) ---------------
 // Computed from the real layout so emitted code never bakes an absolute
@@ -98,9 +110,6 @@ pub(crate) struct JitState {
     blocks: Vec<BlockMeta>,
     table: Box<[Slot; JIT_SLOTS]>,
     hot: Box<[u8; HOT_SLOTS]>,
-    /// Guest keys whose head instruction is untranslatable — always
-    /// interpreted, never re-attempted.
-    cold: HashSet<u64>,
 }
 
 impl JitState {
@@ -116,7 +125,6 @@ impl JitState {
                 }; JIT_SLOTS],
             ),
             hot: Box::new([0u8; HOT_SLOTS]),
-            cold: HashSet::new(),
         }
     }
 
@@ -183,7 +191,7 @@ impl Cpu {
             let key = phys | self.icache_ctx();
             let budget = n - executed;
             match self.jit_lookup(key, phys) {
-                Some(idx) if self.jit.blocks[idx].ninsns as u64 <= budget => {
+                Lookup::Hit(idx) if self.jit.blocks[idx].ninsns as u64 <= budget => {
                     let retired = self.jit_enter(idx, budget);
                     if retired == 0 {
                         // Stale prologue exit: drop the block and step once so
@@ -195,8 +203,13 @@ impl Cpu {
                         executed += retired;
                     }
                 }
-                _ => {
-                    // Miss, or a block too large for the remaining budget.
+                // A known-untranslatable head, or a block too large for the
+                // remaining budget: interpret one instruction.
+                Lookup::Cold | Lookup::Hit(_) => {
+                    self.step_fast(bus);
+                    executed += 1;
+                }
+                Lookup::Miss => {
                     if self.jit_should_translate(bus, key, phys) {
                         // Re-enter the loop; the freshly filled block hits next.
                         continue;
@@ -212,19 +225,23 @@ impl Cpu {
         }
     }
 
-    /// Look up a valid block for `key`, revalidating against the icache
-    /// write-stamp and invalidation clock (the block prologue re-checks these
-    /// too, covering chained entries).
-    fn jit_lookup(&self, key: u64, phys: u64) -> Option<usize> {
+    /// Probe the direct-mapped table for `key`, revalidating against the
+    /// icache write-stamp and invalidation clock. A [`COLD`] sentinel marks a
+    /// head known to be untranslatable, so cold code needs no hash lookup on
+    /// the fallback path.
+    fn jit_lookup(&self, key: u64, phys: u64) -> Lookup {
         let slot = &self.jit.table[phys as usize & (JIT_SLOTS - 1)];
         if slot.key != key {
-            return None;
+            return Lookup::Miss;
         }
         let stamp = self.icache_stamp(phys);
-        if slot.version >= stamp && slot.version >= self.icache.inval {
-            Some(slot.idx as usize)
+        if slot.version < stamp || slot.version < self.icache.inval {
+            return Lookup::Miss; // stale: re-evaluate (code may have changed)
+        }
+        if slot.idx == COLD {
+            Lookup::Cold
         } else {
-            None
+            Lookup::Hit(slot.idx as usize)
         }
     }
 
@@ -247,9 +264,6 @@ impl Cpu {
     /// Warm `key`'s hot counter and, once hot, translate it. Returns whether a
     /// block was installed (so the caller re-probes instead of stepping).
     fn jit_should_translate<B: Bus>(&mut self, bus: &mut B, key: u64, phys: u64) -> bool {
-        if self.jit.cold.contains(&key) {
-            return false;
-        }
         let h = &mut self.jit.hot[phys as usize & (HOT_SLOTS - 1)];
         *h = h.saturating_add(1);
         if *h < HOT_THRESHOLD {
@@ -259,6 +273,18 @@ impl Cpu {
             self.jit.flush();
         }
         self.jit_translate(bus, key, phys)
+    }
+
+    /// Mark `key` as untranslatable in the direct-mapped table so the fallback
+    /// path recognizes it without a hash lookup. Version-tagged, so a later
+    /// guest write to the page (bumping the stamp) re-opens translation.
+    pub(super) fn jit_mark_cold(&mut self, key: u64, phys: u64) {
+        let version = self.icache.clock;
+        self.jit.table[phys as usize & (JIT_SLOTS - 1)] = Slot {
+            key,
+            version,
+            idx: COLD,
+        };
     }
 
     /// Remove a block from the direct-mapped table (its code stays in the
