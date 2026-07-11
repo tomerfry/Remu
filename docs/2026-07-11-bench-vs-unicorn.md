@@ -229,8 +229,8 @@ Unicorn exactly.
 What landed:
 
 - **P1 (both cores)** — the per-step whole-`Registers` snapshot is now a
-  GPR-only snapshot (32 B / 128 B); all cold-field writers (13 sites on the
-  386, 19 on x86-64) call a flag-guarded `prepare_cold_write()` that
+  GPR-only snapshot (32 B / 128 B); all cold-field writers (15 call sites on
+  the 386, 19 on x86-64) call a flag-guarded `prepare_cold_write()` that
   captures the full file at most once per instruction. A permanent
   debug-build differential assert replays the old rewind and compares —
   every debug test run, including a 1.76M-case debug MOO run, validates the

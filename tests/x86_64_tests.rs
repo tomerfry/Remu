@@ -624,6 +624,43 @@ fn store_into_the_next_instruction_is_fetched_fresh() {
 }
 
 #[test]
+fn fetch_cache_does_not_survive_a_privilege_drop() {
+    // Fill the fetch-translation cache at CPL 0 on a supervisor-only code
+    // page, SYSRET to CPL 3 within the same page: the user fetch must #PF
+    // (present + user + instruction-fetch). A stale cache entry from the
+    // CPL 0 fill would wrongly allow it — this pins the prepare_cold_write
+    // invalidation hook on privilege transitions.
+    let (mut cpu, mut mem) = long_4k(&[0x90]);
+    cpu.trap_faults = true;
+    let pd = 0x3000u64;
+    mem.write64(pd + 4 * 8, (4u64 << 21) | 0x83); // 0x80_0000: supervisor-only
+    cpu.invalidate_tlb();
+
+    // STAR: SYSRET base 0x10 -> user CS 0x23 (64-bit), SS 0x1B.
+    cpu.regs.msr.star = 0x0010u64 << 48;
+    cpu.regs.gpr[reg::RCX as usize] = 0x80_0100; // return RIP, same page
+    cpu.regs.gpr[reg::R11 as usize] = 2; // RFLAGS image
+    mem.load(0x80_0000, &[0x48, 0x0F, 0x07]); // SYSRET
+    mem.load(0x80_0100, &[0x90]);
+    cpu.regs.rip = 0x80_0000;
+
+    step(&mut cpu, &mut mem); // SYSRET: fills the cache at CPL 0, drops to 3
+    assert_eq!(cpu.cpl(), 3);
+    assert_eq!(cpu.regs.rip, 0x80_0100);
+
+    cpu.step(&mut mem); // user fetch of the supervisor page must fault
+    match cpu.host_trap.take() {
+        Some(remu::x86_64::HostTrap::Exception(e)) => {
+            assert_eq!(e.vector, 14);
+            let code = e.error.unwrap();
+            assert_eq!(code & 0x15, 0x15, "present + user + instruction-fetch");
+        }
+        other => panic!("expected a trapped #PF, got {other:?}"),
+    }
+    assert_eq!(cpu.regs.cr2, 0x80_0100);
+}
+
+#[test]
 fn invlpg_after_pd_rewrite_fetches_through_the_new_mapping() {
     // Pins the fetch-cache invalidation hooks: guest code running in the
     // 2 MiB region at 0xA0_0000 rewrites its own PD entry to point at the

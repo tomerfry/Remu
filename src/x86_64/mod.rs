@@ -1219,6 +1219,7 @@ impl Cpu {
             return None;
         }
         let phys = self.fetch_page | (lin & 0xFFF);
+        debug_assert!(matches!(n, 2 | 4 | 8));
         let v = match n {
             2 => bus.read16(phys) as u64,
             4 => bus.read32(phys) as u64,
@@ -1480,6 +1481,7 @@ impl Cpu {
     /// Real-mode interrupt: push FLAGS/CS/IP (16-bit), clear IF/TF, and load
     /// `CS:IP` from the vector table described by IDTR.
     fn interrupt_real<B: Bus>(&mut self, bus: &mut B, vector: u8, class: Event) -> Exec<()> {
+        self.prepare_cold_write(); // CS cache
         let entry = vector as u32 * 4;
         if entry + 3 > self.regs.idtr.limit as u32 {
             let ext = (class == Event::External) as u16;
@@ -1495,7 +1497,6 @@ impl Cpu {
         self.push16(bus, old_cs)?;
         self.push16(bus, old_ip as u16)?;
         self.regs.rflags.remove(RFlags::IF | RFlags::TF);
-        self.prepare_cold_write(); // CS cache
         self.regs.seg[reg::CS as usize].sel = cs;
         self.regs.seg[reg::CS as usize].base = (cs as u64) << 4;
         self.regs.rip = ip as u64;
