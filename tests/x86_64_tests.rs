@@ -547,6 +547,119 @@ fn wp_enforces_supervisor_write_protection() {
     }
 }
 
+// --- Fetch-window / fetch-translation-cache boundary tests ---------------------
+
+#[test]
+fn fetch_across_page_boundary_faults_on_the_unmapped_second_page() {
+    // MOV EAX, imm32 at 0x7F_FFFC: opcode + 3 imm bytes in the mapped 2 MiB
+    // region 3, last imm byte in region 4, which is unmapped. The fetch must
+    // #PF with CR2 = 0x80_0000 and RIP rewound; once mapped, it executes.
+    let (mut cpu, mut mem) = long_4k(&[0x90]);
+    cpu.trap_faults = true;
+    let pd = 0x3000u64;
+    mem.write64(pd + 4 * 8, 0); // unmap 0x80_0000..0x9F_FFFF
+    cpu.invalidate_tlb();
+
+    mem.load(0x7F_FFFC, &[0xB8, 0x78, 0x56, 0x34, 0x12]); // MOV EAX, 12345678h
+    cpu.regs.rip = 0x7F_FFFC;
+
+    cpu.step(&mut mem);
+    match cpu.host_trap.take() {
+        Some(remu::x86_64::HostTrap::Exception(e)) => assert_eq!(e.vector, 14),
+        other => panic!("expected a trapped #PF, got {other:?}"),
+    }
+    assert_eq!(cpu.regs.cr2, 0x80_0000, "CR2 is the second page");
+    assert_eq!(cpu.regs.rip, 0x7F_FFFC, "RIP rewinds to the instruction start");
+
+    // Map region 4 and restart: the refetch sees the new mapping.
+    mem.write64(pd + 4 * 8, (4u64 << 21) | 0x87);
+    cpu.invalidate_tlb();
+    cpu.step(&mut mem);
+    assert!(cpu.host_trap.is_none());
+    assert_eq!(cpu.regs.gpr[reg::RAX as usize], 0x1234_5678);
+    assert_eq!(cpu.regs.rip, 0x80_0001);
+}
+
+#[test]
+fn nx_on_the_second_page_faults_mid_instruction() {
+    // Same straddle, but the second page is mapped no-execute: the fetch of
+    // the last byte must #PF with the instruction-fetch bit set.
+    let (mut cpu, mut mem) = long_4k(&[0x90]);
+    cpu.trap_faults = true;
+    let pd = 0x3000u64;
+    mem.write64(pd + 4 * 8, (4u64 << 21) | 0x87 | (1u64 << 63)); // NX
+    cpu.invalidate_tlb();
+
+    mem.load(0x7F_FFFC, &[0xB8, 0x78, 0x56, 0x34, 0x12]);
+    cpu.regs.rip = 0x7F_FFFC;
+
+    cpu.step(&mut mem);
+    match cpu.host_trap.take() {
+        Some(remu::x86_64::HostTrap::Exception(e)) => {
+            assert_eq!(e.vector, 14);
+            assert_eq!(e.error.unwrap() & 0x10, 0x10, "instruction-fetch bit");
+        }
+        other => panic!("expected a trapped #PF, got {other:?}"),
+    }
+    assert_eq!(cpu.regs.cr2, 0x80_0000);
+    assert_eq!(cpu.regs.rip, 0x7F_FFFC);
+}
+
+#[test]
+fn store_into_the_next_instruction_is_fetched_fresh() {
+    // Self-modifying code under the persistent fetch-translation cache:
+    // only the *translation* is cached, so a store into the next
+    // instruction's immediate must be observed by its fetch.
+    let (mut cpu, mut mem) = long(&[
+        0xC6, 0x05, 0x01, 0x00, 0x00, 0x00, 0x42, // MOV byte [RIP+1], 42h
+        0xB0, 0x37, // MOV AL, 37h (imm at CODE+8 = the store target)
+    ]);
+    step(&mut cpu, &mut mem);
+    step(&mut cpu, &mut mem);
+    assert_eq!(
+        cpu.regs.gpr[reg::RAX as usize] & 0xFF,
+        0x42,
+        "the freshly stored immediate must be fetched"
+    );
+}
+
+#[test]
+fn invlpg_after_pd_rewrite_fetches_through_the_new_mapping() {
+    // Pins the fetch-cache invalidation hooks: guest code running in the
+    // 2 MiB region at 0xA0_0000 rewrites its own PD entry to point at the
+    // frame at 0xC0_0000, executes INVLPG, and jumps within its own page —
+    // the tail must be fetched through the NEW mapping. A stale fetch
+    // translation would run the old frame's bytes.
+    let (mut cpu, mut mem) = long_4k(&[0x90]);
+
+    #[rustfmt::skip]
+    let stub = [
+        0x48, 0xB8, 0x87, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, // MOV RAX, 0xC00087
+        0x48, 0x89, 0x03, // MOV [RBX], RAX   (RBX = &PD[5])
+        0x0F, 0x01, 0x3E, // INVLPG [RSI]     (RSI = 0xA0_0000)
+        0xE9, 0xEB, 0x00, 0x00, 0x00, // JMP 0xA0_0100
+    ];
+    // The stub must exist in BOTH frames: every byte fetched after INVLPG
+    // (including the JMP tail) already goes through the new mapping.
+    mem.load(0xA0_0000, &stub);
+    mem.load(0xC0_0000, &stub);
+    mem.load(0xA0_0100, &[0xB8, 0x11, 0x01, 0x00, 0x00]); // old: MOV EAX, 111h
+    mem.load(0xC0_0100, &[0xB8, 0x22, 0x02, 0x00, 0x00]); // new: MOV EAX, 222h
+
+    cpu.regs.gpr[reg::RBX as usize] = 0x3000 + 5 * 8;
+    cpu.regs.gpr[reg::RSI as usize] = 0xA0_0000;
+    cpu.regs.rip = 0xA0_0000;
+
+    for _ in 0..5 {
+        step(&mut cpu, &mut mem);
+    }
+    assert_eq!(
+        cpu.regs.gpr[reg::RAX as usize],
+        0x222,
+        "the jump target must be fetched through the remapped page"
+    );
+}
+
 // --- MSRs, SWAPGS -------------------------------------------------------------
 
 #[test]

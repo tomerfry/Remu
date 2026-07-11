@@ -435,6 +435,15 @@ pub struct Cpu {
     /// The current instruction wrote (or is about to write) a cold register,
     /// so a fault must rewind from `fault_regs`, not just the GPR snapshot.
     cold_saved: bool,
+    /// One-entry fetch-translation cache: linear page number whose
+    /// translation is cached (`u64::MAX` = empty). Fetches on this page skip
+    /// the TLB lookup entirely; a hot loop in one page pays zero translates.
+    /// Invalidated by [`Cpu::fetch_invalidate`] — called from every TLB
+    /// flush, `INVLPG`, and `prepare_cold_write` (whose callers are a
+    /// superset of everything that can change CPL, mode, or CS).
+    fetch_tag: u64,
+    /// Physical page base for `fetch_tag`.
+    fetch_page: u64,
     /// Length in bytes of the immediate that follows the ModRM/displacement
     /// of the current instruction — set by the dispatcher *before* ModRM
     /// decode, because a RIP-relative displacement is relative to the end of
@@ -505,6 +514,8 @@ impl Cpu {
             ilen: 0,
             fault_regs: Registers::new(),
             cold_saved: false,
+            fetch_tag: u64::MAX,
+            fetch_page: 0,
             imm_len: 0,
             used_rip_rel: false,
             supervisor_override: false,
@@ -526,6 +537,7 @@ impl Cpu {
         self.intr = None;
         self.inhibit_interrupts = false;
         self.supervisor_override = false;
+        self.fetch_invalidate();
         self.tlb.flush();
         self.host_trap = None;
     }
@@ -533,6 +545,7 @@ impl Cpu {
     /// Convenience for tests and loaders: set `CS:RIP` with real-mode
     /// semantics (CS base = `sel * 16`).
     pub fn set_cs_ip(&mut self, sel: u16, rip: u64) {
+        self.fetch_invalidate();
         self.regs.seg[reg::CS as usize] = SegReg::real(sel);
         self.regs.rip = rip;
     }
@@ -545,6 +558,7 @@ impl Cpu {
     /// Long mode *requires* paging, so this writes the minimal table set
     /// through `bus` — real firmware does the same dance, just less tersely.
     pub fn setup_long_flat<B: Bus>(&mut self, bus: &mut B, rip: u64, rsp: u64) {
+        self.fetch_invalidate();
         // PML4[0] -> PDPT at 0x2000; PDPT[n] = n GiB, present/write/user/PS.
         // The user bit keeps ring-3 test code runnable through the flat map.
         bus.write64(0x1000, 0x2000 | 0x07);
@@ -732,12 +746,23 @@ impl Cpu {
     /// (anything besides `gpr`/`rip`/`rflags`/`cr2`) during the current
     /// instruction, so a later fault in the same instruction can rewind it.
     /// Every function that writes such a register must call this first.
+    ///
+    /// Doubles as the fetch-cache invalidation point: cold writers are a
+    /// superset of everything that can change CPL, the execution mode, or
+    /// the CS base under the cached fetch translation.
     #[inline]
     pub(crate) fn prepare_cold_write(&mut self) {
+        self.fetch_invalidate();
         if !self.cold_saved {
             self.cold_saved = true;
             self.fault_regs = self.regs;
         }
+    }
+
+    /// Drop the cached fetch translation (page-table or privilege change).
+    #[inline]
+    pub(crate) fn fetch_invalidate(&mut self) {
+        self.fetch_tag = u64::MAX;
     }
 
     /// Decode prefixes and execute the instruction at `CS:RIP`.
@@ -1136,9 +1161,35 @@ impl Cpu {
             .base
             .wrapping_add(self.regs.rip);
         let lin = if self.m64 { lin } else { lin & 0xFFFF_FFFF };
-        let b = self.lin_fetch8(bus, lin)?;
+        let b = if self.paging() {
+            // One-entry fetch-translation cache: a hit skips the NX-aware
+            // TLB lookup; the cheap checks above still run per byte, so
+            // every exception fires at exactly the same byte as a per-byte
+            // translation. The entry persists across instructions — a hot
+            // loop within one page pays zero translates — and is dropped on
+            // TLB flushes, INVLPG and every CPL/mode/CS change (see
+            // `fetch_invalidate`).
+            if lin >> 12 == self.fetch_tag {
+                bus.read(self.fetch_page | (lin & 0xFFF))
+            } else {
+                self.fetch_miss(bus, lin)?
+            }
+        } else {
+            bus.read(lin)
+        };
         self.regs.rip = self.regs.rip.wrapping_add(1);
         Ok(b)
+    }
+
+    /// Fetch-cache miss: translate the code byte's page (NX-aware, so a #PF
+    /// error code carries the instruction-fetch bit) and cache it.
+    /// Deliberately not inlined: it is rare, and keeping it out of
+    /// `fetch8`'s many inline sites keeps the hot path small.
+    fn fetch_miss<B: Bus>(&mut self, bus: &mut B, lin: u64) -> Exec<u8> {
+        let phys = self.fetch_translate(bus, lin)?;
+        self.fetch_tag = lin >> 12;
+        self.fetch_page = phys & !0xFFF;
+        Ok(bus.read(phys))
     }
 
     /// Fetch a little-endian word at `CS:RIP`.
