@@ -1192,9 +1192,49 @@ impl Cpu {
         Ok(bus.read(phys))
     }
 
+    /// Try to fetch `n` (2/4/8) instruction bytes as one wide bus read:
+    /// possible when they all sit in the cached fetch page (which the Bus
+    /// contract requires for a wide access anyway), fit the 15-byte limit,
+    /// and the whole range passes the canonical/limit check. `None` falls
+    /// back to byte-wise fetching — page crosses, cache misses, paging off
+    /// and every fault case take that path, so exceptions are untouched.
+    #[inline]
+    fn fetch_wide<B: Bus>(&mut self, bus: &mut B, n: u8) -> Option<u64> {
+        let rip = self.regs.rip;
+        let lin = self.regs.seg[reg::CS as usize].base.wrapping_add(rip);
+        let lin = if self.m64 { lin } else { lin & 0xFFFF_FFFF };
+        if lin >> 12 != self.fetch_tag
+            || lin & 0xFFF > 0x1000 - n as u64
+            || self.ilen > 15 - n
+        {
+            return None;
+        }
+        let range_ok = if self.m64 {
+            // One page: canonicality is uniform across it.
+            Self::canonical(lin)
+        } else {
+            rip.wrapping_add(n as u64 - 1) <= self.regs.seg[reg::CS as usize].limit as u64
+        };
+        if !range_ok {
+            return None;
+        }
+        let phys = self.fetch_page | (lin & 0xFFF);
+        let v = match n {
+            2 => bus.read16(phys) as u64,
+            4 => bus.read32(phys) as u64,
+            _ => bus.read64(phys),
+        };
+        self.ilen += n;
+        self.regs.rip = rip.wrapping_add(n as u64);
+        Some(v)
+    }
+
     /// Fetch a little-endian word at `CS:RIP`.
     #[inline]
     pub(crate) fn fetch16<B: Bus>(&mut self, bus: &mut B) -> Exec<u16> {
+        if let Some(v) = self.fetch_wide(bus, 2) {
+            return Ok(v as u16);
+        }
         let lo = self.fetch8(bus)? as u16;
         let hi = self.fetch8(bus)? as u16;
         Ok(lo | hi << 8)
@@ -1203,6 +1243,9 @@ impl Cpu {
     /// Fetch a little-endian double-word at `CS:RIP`.
     #[inline]
     pub(crate) fn fetch32<B: Bus>(&mut self, bus: &mut B) -> Exec<u32> {
+        if let Some(v) = self.fetch_wide(bus, 4) {
+            return Ok(v as u32);
+        }
         let lo = self.fetch16(bus)? as u32;
         let hi = self.fetch16(bus)? as u32;
         Ok(lo | hi << 16)
@@ -1211,6 +1254,9 @@ impl Cpu {
     /// Fetch a little-endian quad-word at `CS:RIP`.
     #[inline]
     pub(crate) fn fetch64<B: Bus>(&mut self, bus: &mut B) -> Exec<u64> {
+        if let Some(v) = self.fetch_wide(bus, 8) {
+            return Ok(v);
+        }
         let lo = self.fetch32(bus)? as u64;
         let hi = self.fetch32(bus)? as u64;
         Ok(lo | hi << 32)
