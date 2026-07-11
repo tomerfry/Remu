@@ -18,8 +18,10 @@
 //! ```
 
 mod alu;
+mod decode;
 mod execute;
 mod execute_0f;
+mod icache;
 mod modrm;
 mod paging;
 mod protected;
@@ -321,6 +323,12 @@ pub struct PerfStats {
     pub opcode_hist: [u64; 256],
     /// Two-byte (`0F xx`) dispatch histogram.
     pub opcode_0f_hist: [u64; 256],
+    /// Decoded-instruction-cache hits.
+    pub icache_hits: u64,
+    /// Decoded-instruction-cache fills.
+    pub icache_fills: u64,
+    /// Decoded instructions rejected by the cache (page-crossers).
+    pub icache_uncacheable: u64,
 }
 
 impl Default for PerfStats {
@@ -332,6 +340,9 @@ impl Default for PerfStats {
             imm_fetches: 0,
             opcode_hist: [0; 256],
             opcode_0f_hist: [0; 256],
+            icache_hits: 0,
+            icache_fills: 0,
+            icache_uncacheable: 0,
         }
     }
 }
@@ -345,11 +356,15 @@ impl PerfStats {
         let n = self.insns.max(1) as f64;
         let _ = writeln!(
             out,
-            "insns {}  prefix/i {:.3}  modrm/i {:.3}  imm/i {:.3}",
+            "insns {}  prefix/i {:.3}  modrm/i {:.3}  imm/i {:.3}  \
+             icache hit/i {:.3} fills {} uncacheable {}",
             self.insns,
             self.prefix_bytes as f64 / n,
             self.modrm_calls as f64 / n,
             self.imm_fetches as f64 / n,
+            self.icache_hits as f64 / n,
+            self.icache_fills,
+            self.icache_uncacheable,
         );
         let one = self.opcode_hist.iter().enumerate();
         let two = self.opcode_0f_hist.iter().enumerate();
@@ -431,6 +446,8 @@ pub struct Cpu {
     supervisor_override: bool,
     /// TLB for paged address translation (see `paging.rs`).
     tlb: paging::Tlb,
+    /// Decoded-instruction cache (see `icache.rs`).
+    icache: icache::ICache,
 
     // --- Host (OS-emulation) hooks — all inert at their defaults -------------
     /// If set, `INT n` for this vector does not vector through the IDT; instead
@@ -458,6 +475,11 @@ pub struct Cpu {
     /// Profile counters (present only with the `perf-stats` feature).
     #[cfg(feature = "perf-stats")]
     pub stats: PerfStats,
+
+    /// Test-only switch forcing the fused decode path, for differential
+    /// tests of the decoupled decoder.
+    #[cfg(test)]
+    pub(crate) fused_only: bool,
 }
 
 impl Cpu {
@@ -485,12 +507,15 @@ impl Cpu {
             cold_saved: false,
             supervisor_override: false,
             tlb: paging::Tlb::new(),
+            icache: icache::ICache::new(),
             syscall_int: None,
             trap_faults: false,
             extensions: false,
             host_trap: None,
             #[cfg(feature = "perf-stats")]
             stats: PerfStats::default(),
+            #[cfg(test)]
+            fused_only: false,
         }
     }
 
@@ -514,6 +539,7 @@ impl Cpu {
         self.inhibit_interrupts = false;
         self.supervisor_override = false;
         self.tlb.flush();
+        self.icache.invalidate_all();
         self.host_trap = None;
     }
 
@@ -677,23 +703,17 @@ impl Cpu {
         }
     }
 
-    /// Decode prefixes and execute the instruction at `CS:EIP`.
-    fn exec_one<B: Bus>(&mut self, bus: &mut B) -> Exec<u32> {
-        self.start_eip = self.regs.eip;
-        self.ilen = 0;
-        self.seg_override = None;
-        self.rep = None;
-        self.lock = false;
-        self.lock_ok = false;
-        self.commit_on_fault = false;
-        self.cold_saved = false;
-        self.supervisor_override = false;
+    /// Consume the prefix bytes at `CS:EIP`, recording their effects, and
+    /// return the opcode byte plus the number of prefixes consumed. Resets
+    /// the size flags from CS.D first; the caller resets the rest of the
+    /// per-instruction decode state.
+    #[inline(always)]
+    fn scan_prefixes<B: Bus>(&mut self, bus: &mut B) -> Exec<(u8, u32)> {
         let db = self.regs.seg[reg::CS as usize].db();
         self.osize32 = db;
         self.asize32 = db;
-        self.stat(|s| s.insns += 1);
 
-        let mut cycles = 0u32;
+        let mut npfx = 0u32;
         let opcode = loop {
             let b = self.fetch8(bus)?;
             match b {
@@ -711,8 +731,59 @@ impl Cpu {
                 _ => break b,
             }
             self.stat(|s| s.prefix_bytes += 1);
-            cycles += 1;
+            npfx += 1;
         };
+        Ok((opcode, npfx))
+    }
+
+    /// Decode prefixes and execute the instruction at `CS:EIP`.
+    fn exec_one<B: Bus>(&mut self, bus: &mut B) -> Exec<u32> {
+        self.start_eip = self.regs.eip;
+        self.stat(|s| s.insns += 1);
+
+        #[cfg(test)]
+        let try_hot = !self.fused_only;
+        #[cfg(not(test))]
+        let try_hot = true;
+
+        // Decoded-instruction-cache probe: on a hit, skip the fetch, prefix
+        // scan and dispatch entirely (see icache.rs for the validity rules).
+        let probe_phys = if try_hot { self.icache_phys() } else { None };
+        if let Some(phys) = probe_phys {
+            let slot = phys as usize & (icache::ICACHE_ENTRIES - 1);
+            let e = &self.icache.entries[slot];
+            if e.key == (phys as u64 | self.icache_ctx())
+                && e.version >= self.icache.stamps[(phys >> 12) as usize & (icache::STAMP_SLOTS - 1)]
+                && e.version >= self.icache.inval
+                // Per-hit CS-limit revalidation, replacing the per-byte
+                // `fetch_check` (a shrink misses here and runs fused → #GP).
+                && self.start_eip as u64 + (e.insn.len - 1) as u64
+                    <= self.regs.seg[reg::CS as usize].limit as u64
+            {
+                let d = e.insn;
+                #[cfg(any(test, debug_assertions))]
+                {
+                    self.icache.hits += 1;
+                }
+                self.stat(|s| s.icache_hits += 1);
+                #[cfg(debug_assertions)]
+                self.icache_differential(bus, &d);
+                self.begin_decoded(&d);
+                return self.exec_decoded(bus, &d).map(|c| c + d.npfx() as u32);
+            }
+        }
+
+        self.ilen = 0;
+        self.seg_override = None;
+        self.rep = None;
+        self.lock = false;
+        self.lock_ok = false;
+        self.commit_on_fault = false;
+        self.cold_saved = false;
+        self.supervisor_override = false;
+
+        let (opcode, npfx) = self.scan_prefixes(bus)?;
+        let mut cycles = npfx;
 
         // LOCK legality is a decode-time check: an opcode that can never
         // lock raises #UD before any side effect. Candidate opcodes verify
@@ -720,6 +791,26 @@ impl Cpu {
         // after ModRM decode via `lock_check`.
         if self.lock && opcode != 0x0F && !LOCK_CANDIDATE[opcode as usize] {
             return Err(Exception::ud());
+        }
+
+        // Decoupled decode-then-execute for the hot subset. LOCK/REP forms
+        // and everything outside the subset run the fused path unchanged;
+        // a decode failure rewinds and re-runs fused, so fault ordering is
+        // bit-identical (see decode.rs).
+        if try_hot && !self.lock && self.rep.is_none() {
+            let mut d = decode::DecodedInsn::default();
+            match self.try_decode(bus, opcode, npfx, &mut d)? {
+                decode::Decoded::Hot => {
+                    if let Some(phys) = probe_phys {
+                        self.icache_fill(phys, &d);
+                    }
+                    return Ok(cycles + self.exec_decoded(bus, &d)?);
+                }
+                decode::Decoded::Cold0F(op2) => {
+                    return Ok(cycles + self.dispatch_0f(bus, op2)?);
+                }
+                decode::Decoded::Cold => {}
+            }
         }
 
         cycles += self.dispatch(bus, opcode)?;

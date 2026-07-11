@@ -172,6 +172,10 @@ impl UserArch for Cpu {
         }
     }
 
+    fn invalidate_code(&mut self) {
+        self.invalidate_icache();
+    }
+
     fn take_fault(&mut self) -> Option<String> {
         let Some(HostTrap::Exception(e)) = self.host_trap else {
             return None;

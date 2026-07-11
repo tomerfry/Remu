@@ -38,7 +38,7 @@ impl ModRm {
 /// 8/16/32-bit by the handler) or a memory location as an unresolved
 /// `segment-register:offset` pair (resolution happens per access, so limit
 /// checks and paging apply naturally).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Operand {
     Reg(u8),
     Mem { seg: u8, off: u32 },

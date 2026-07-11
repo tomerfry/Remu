@@ -1429,7 +1429,7 @@ impl Cpu {
         Ok(if op.is_mem() { 7 } else { 3 })
     }
 
-    fn shift_dispatch8(&mut self, sub: u8, v: u8, n: u32) -> u8 {
+    pub(crate) fn shift_dispatch8(&mut self, sub: u8, v: u8, n: u32) -> u8 {
         match sub {
             0 => self.rol8(v, n),
             1 => self.ror8(v, n),
@@ -1455,7 +1455,7 @@ impl Cpu {
         Ok(if op.is_mem() { 7 } else { 3 })
     }
 
-    fn shift_dispatch(&mut self, sub: u8, v: u32, n: u32) -> u32 {
+    pub(crate) fn shift_dispatch(&mut self, sub: u8, v: u32, n: u32) -> u32 {
         if self.osize32 {
             match sub {
                 0 => self.rol32(v, n),
