@@ -57,6 +57,7 @@ impl Cpu {
     /// Fetch and decode a ModRM byte (plus SIB/displacement), resolving the
     /// `rm` operand for the current address size.
     pub(crate) fn modrm<B: Bus>(&mut self, bus: &mut B) -> Exec<(ModRm, Operand)> {
+        self.stat(|s| s.modrm_calls += 1);
         let m = ModRm(self.fetch8(bus)?);
         if m.md() == 3 {
             return Ok((m, Operand::Reg(m.rm())));

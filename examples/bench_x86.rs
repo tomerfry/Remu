@@ -234,6 +234,8 @@ fn bench_386(name: &str, program: &[u8], instructions: u64, check: fn(&x86_32::C
         assert!(!cpu.halted && !cpu.shutdown, "{name}: halted/shutdown");
     }
     report("32", name, instructions, &times, check(&cpu));
+    #[cfg(feature = "perf-stats")]
+    print!("{}", cpu.stats.report());
 }
 
 // --- 64-bit long mode (x86-64 core), programs at 0x10000 --------------------
@@ -305,6 +307,8 @@ fn bench_x64(name: &str, program: &[u8], instructions: u64, check: fn(&x86_64::C
         assert!(!cpu.halted && !cpu.shutdown, "{name}: halted/shutdown");
     }
     report("64", name, instructions, &times, check(&cpu));
+    #[cfg(feature = "perf-stats")]
+    print!("{}", cpu.stats.report());
 }
 
 fn main() {

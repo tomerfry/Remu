@@ -303,6 +303,70 @@ const LOCK_CANDIDATE: [bool; 256] = {
     t
 };
 
+/// Decode/dispatch profile counters, collected only with the `perf-stats`
+/// feature. They quantify per-instruction decode work (the target of the
+/// decoded-instruction-cache effort) and are reported by
+/// [`PerfStats::report`].
+#[derive(Debug, Clone)]
+pub struct PerfStats {
+    /// Instructions executed (`exec_one` entries).
+    pub insns: u64,
+    /// Prefix bytes consumed by the decode loop.
+    pub prefix_bytes: u64,
+    /// `modrm()` decodes (ModRM + SIB + displacement fetches).
+    pub modrm_calls: u64,
+    /// Operand-size immediates fetched via `fetch_imm`.
+    pub imm_fetches: u64,
+    /// One-byte-opcode dispatch histogram.
+    pub opcode_hist: [u64; 256],
+    /// Two-byte (`0F xx`) dispatch histogram.
+    pub opcode_0f_hist: [u64; 256],
+}
+
+impl Default for PerfStats {
+    fn default() -> Self {
+        PerfStats {
+            insns: 0,
+            prefix_bytes: 0,
+            modrm_calls: 0,
+            imm_fetches: 0,
+            opcode_hist: [0; 256],
+            opcode_0f_hist: [0; 256],
+        }
+    }
+}
+
+impl PerfStats {
+    /// Multi-line summary: per-instruction averages, then every executed
+    /// opcode sorted by frequency.
+    pub fn report(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        let n = self.insns.max(1) as f64;
+        let _ = writeln!(
+            out,
+            "insns {}  prefix/i {:.3}  modrm/i {:.3}  imm/i {:.3}",
+            self.insns,
+            self.prefix_bytes as f64 / n,
+            self.modrm_calls as f64 / n,
+            self.imm_fetches as f64 / n,
+        );
+        let one = self.opcode_hist.iter().enumerate();
+        let two = self.opcode_0f_hist.iter().enumerate();
+        let mut ops: Vec<(String, u64)> = one
+            .map(|(op, &c)| (format!("{op:02X}"), c))
+            .chain(two.map(|(op, &c)| (format!("0F {op:02X}"), c)))
+            .filter(|&(_, c)| c > 0)
+            .collect();
+        ops.sort_by(|a, b| b.1.cmp(&a.1));
+        for (name, count) in ops {
+            let pct = count as f64 / n * 100.0;
+            let _ = writeln!(out, "  {name:>5}  {count:>12}  {pct:5.1}%");
+        }
+        out
+    }
+}
+
 /// An 80386 processor.
 ///
 /// As with the other cores, the CPU does not own its bus — call [`Cpu::step`]
@@ -390,6 +454,10 @@ pub struct Cpu {
     ///
     /// [`syscall_int`]: Cpu::syscall_int
     pub host_trap: Option<HostTrap>,
+
+    /// Profile counters (present only with the `perf-stats` feature).
+    #[cfg(feature = "perf-stats")]
+    pub stats: PerfStats,
 }
 
 impl Cpu {
@@ -421,7 +489,18 @@ impl Cpu {
             trap_faults: false,
             extensions: false,
             host_trap: None,
+            #[cfg(feature = "perf-stats")]
+            stats: PerfStats::default(),
         }
+    }
+
+    /// Bump a profile counter; compiles to nothing without `perf-stats`.
+    #[inline(always)]
+    pub(crate) fn stat(&mut self, f: impl FnOnce(&mut PerfStats)) {
+        #[cfg(feature = "perf-stats")]
+        f(&mut self.stats);
+        #[cfg(not(feature = "perf-stats"))]
+        let _ = f;
     }
 
     /// Perform a RESET: registers to power-on state, pending interrupts and
@@ -612,6 +691,7 @@ impl Cpu {
         let db = self.regs.seg[reg::CS as usize].db();
         self.osize32 = db;
         self.asize32 = db;
+        self.stat(|s| s.insns += 1);
 
         let mut cycles = 0u32;
         let opcode = loop {
@@ -630,6 +710,7 @@ impl Cpu {
                 0xF3 => self.rep = Some(true),
                 _ => break b,
             }
+            self.stat(|s| s.prefix_bytes += 1);
             cycles += 1;
         };
 
@@ -919,6 +1000,7 @@ impl Cpu {
     /// 16-bit immediate to 32 bits.
     #[inline]
     pub(crate) fn fetch_imm<B: Bus>(&mut self, bus: &mut B) -> Exec<u32> {
+        self.stat(|s| s.imm_fetches += 1);
         if self.osize32 {
             self.fetch32(bus)
         } else {

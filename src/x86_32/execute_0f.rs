@@ -8,6 +8,7 @@ use super::{Bus, Cpu, Exception, Exec};
 
 impl Cpu {
     pub(crate) fn dispatch_0f<B: Bus>(&mut self, bus: &mut B, opcode: u8) -> Exec<u32> {
+        self.stat(|s| s.opcode_0f_hist[opcode as usize] += 1);
         // Decode-time LOCK legality: only BTS/BTR/BTC (and group 8) can lock —
         // plus CMPXCHG/XADD, the atomic primitives, when extensions are on.
         let lock_atomic = self.extensions && matches!(opcode, 0xB0 | 0xB1 | 0xC0 | 0xC1);
