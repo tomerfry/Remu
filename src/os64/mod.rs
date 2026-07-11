@@ -27,7 +27,7 @@ mod syscall;
 
 use std::path::{Path, PathBuf};
 
-use crate::x86_64::{Cpu, Exception, HostTrap};
+use crate::x86_64::{Cpu, Exception, HostTrap, RunExit};
 
 use fs::Vfs;
 use memory::{AddressSpace, PROT_READ, PROT_WRITE, PhysMem, STACK_TOP, VmaKind};
@@ -160,19 +160,35 @@ impl Emulator {
                 }
                 return 125;
             }
-            self.cpu.step(&mut self.mem);
-            steps += 1;
-            if let Some(trap) = self.cpu.host_trap.take() {
-                match trap {
-                    HostTrap::Syscall => self.dispatch_syscall(),
-                    HostTrap::Exception(e) => self.handle_fault(e),
+            // Batched execution: the CPU returns at the first host trap, so
+            // the per-instruction host_trap poll of the old step() loop is
+            // gone without changing when traps are serviced.
+            let r = self.cpu.run(&mut self.mem, max - steps);
+            steps += r.executed;
+            match r.exit {
+                RunExit::HostTrap => {
+                    match self.cpu.host_trap.take() {
+                        Some(HostTrap::Syscall) => self.dispatch_syscall(),
+                        Some(HostTrap::Exception(e)) => self.handle_fault(e),
+                        None => unreachable!("HostTrap exit with no trap recorded"),
+                    }
+                    // Trap service writes guest memory host-side (read
+                    // buffers, mmap, stack growth) — stale decoded code must
+                    // not survive.
+                    self.cpu.invalidate_icache();
                 }
-                // Trap service writes guest memory host-side (read buffers,
-                // mmap, stack growth) — stale decoded code must not survive.
-                self.cpu.invalidate_icache();
-            } else if self.cpu.shutdown {
-                self.exit_code = 139;
-                break;
+                RunExit::Shutdown => {
+                    self.exit_code = 139;
+                    break;
+                }
+                // The guest runs at ring 3, where HLT raises #GP and arrives
+                // as a HostTrap — Halted is unreachable; treat a halted CPU
+                // as a dead guest defensively.
+                RunExit::Halted => {
+                    self.exit_code = 139;
+                    break;
+                }
+                RunExit::Completed => {} // the cap re-checks at the loop top
             }
         }
         self.exit_code

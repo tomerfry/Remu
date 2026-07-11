@@ -123,6 +123,13 @@ impl<A: UserArch> Usermode<A> {
 
     /// Advance one instruction, servicing any syscall it raised. `Some` once
     /// the process has ended (tracing frontends drive this directly).
+    ///
+    /// Deliberately NOT migrated to the cores' batched `run(n)`: the segv
+    /// latch polled below lives on the bus (`mem.take_segv()`), invisible to
+    /// the CPU's run loop. A batched runner would keep executing a faulted
+    /// guest — whose garbage `INT 0x80`s would be serviced as real syscalls —
+    /// and would report the wrong PC. Migrate only once the segv latch is a
+    /// CPU-visible exception.
     #[inline]
     pub fn step_one(&mut self) -> Option<Exit> {
         self.cpu.step(&mut self.mem);
