@@ -25,9 +25,7 @@ use crate::x86_32::{Cpu, Exception, HostTrap};
 
 use abi::gdt;
 use fs::Vfs;
-use memory::{
-    AddressSpace, PhysMem, PROT_READ, PROT_WRITE, STACK_TOP, VmaKind,
-};
+use memory::{AddressSpace, PROT_READ, PROT_WRITE, PhysMem, STACK_TOP, VmaKind};
 
 /// Initial stack reservation (grows down on demand beyond this).
 const INIT_STACK: u32 = 0x0004_0000; // 256 KiB
@@ -112,7 +110,10 @@ impl Emulator {
 
         let mut vfs = Vfs::new(rootfs);
         vfs.exec_path = exec_path;
-        vfs.cmdline = argv.iter().flat_map(|a| a.iter().chain(&[0]).copied()).collect();
+        vfs.cmdline = argv
+            .iter()
+            .flat_map(|a| a.iter().chain(&[0]).copied())
+            .collect();
 
         let mut emu = Emulator {
             cpu,
@@ -149,7 +150,10 @@ impl Emulator {
         while self.running {
             if steps >= max {
                 if self.trace {
-                    eprintln!("[remu] instruction cap reached at eip={:#010x}", self.cpu.regs.eip);
+                    eprintln!(
+                        "[remu] instruction cap reached at eip={:#010x}",
+                        self.cpu.regs.eip
+                    );
                 }
                 return 125;
             }
@@ -204,9 +208,21 @@ impl Emulator {
             if v.kind == VmaKind::System {
                 continue;
             }
-            let r = if v.prot & memory::PROT_READ != 0 { 'r' } else { '-' };
-            let w = if v.prot & memory::PROT_WRITE != 0 { 'w' } else { '-' };
-            let x = if v.prot & memory::PROT_EXEC != 0 { 'x' } else { '-' };
+            let r = if v.prot & memory::PROT_READ != 0 {
+                'r'
+            } else {
+                '-'
+            };
+            let w = if v.prot & memory::PROT_WRITE != 0 {
+                'w'
+            } else {
+                '-'
+            };
+            let x = if v.prot & memory::PROT_EXEC != 0 {
+                'x'
+            } else {
+                '-'
+            };
             s.push_str(&format!(
                 "{:08x}-{:08x} {r}{w}{x}p 00000000 00:00 0\n",
                 v.start, v.end

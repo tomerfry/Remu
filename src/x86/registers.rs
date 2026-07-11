@@ -70,9 +70,18 @@ impl Flags {
 /// 16-bit order: AX CX DX BX SP BP SI DI. 8-bit order: AL CL DL BL AH CH DH BH.
 /// Segment order: ES CS SS DS.
 pub mod reg {
-    pub const AX: u8 = 0; pub const CX: u8 = 1; pub const DX: u8 = 2; pub const BX: u8 = 3;
-    pub const SP: u8 = 4; pub const BP: u8 = 5; pub const SI: u8 = 6; pub const DI: u8 = 7;
-    pub const ES: u8 = 0; pub const CS: u8 = 1; pub const SS: u8 = 2; pub const DS: u8 = 3;
+    pub const AX: u8 = 0;
+    pub const CX: u8 = 1;
+    pub const DX: u8 = 2;
+    pub const BX: u8 = 3;
+    pub const SP: u8 = 4;
+    pub const BP: u8 = 5;
+    pub const SI: u8 = 6;
+    pub const DI: u8 = 7;
+    pub const ES: u8 = 0;
+    pub const CS: u8 = 1;
+    pub const SS: u8 = 2;
+    pub const DS: u8 = 3;
 }
 
 /// The 8086 register file.
@@ -107,9 +116,18 @@ impl Registers {
     /// Power-on register state: execution starts at `FFFF:0000`, flags clear.
     pub fn new() -> Self {
         Registers {
-            ax: 0, bx: 0, cx: 0, dx: 0,
-            sp: 0, bp: 0, si: 0, di: 0,
-            es: 0, cs: 0xFFFF, ss: 0, ds: 0,
+            ax: 0,
+            bx: 0,
+            cx: 0,
+            dx: 0,
+            sp: 0,
+            bp: 0,
+            si: 0,
+            di: 0,
+            es: 0,
+            cs: 0xFFFF,
+            ss: 0,
+            ds: 0,
             ip: 0,
             flags: Flags::empty(),
         }
@@ -119,8 +137,14 @@ impl Registers {
     #[inline]
     pub fn reg16(&self, i: u8) -> u16 {
         match i & 7 {
-            0 => self.ax, 1 => self.cx, 2 => self.dx, 3 => self.bx,
-            4 => self.sp, 5 => self.bp, 6 => self.si, _ => self.di,
+            0 => self.ax,
+            1 => self.cx,
+            2 => self.dx,
+            3 => self.bx,
+            4 => self.sp,
+            5 => self.bp,
+            6 => self.si,
+            _ => self.di,
         }
     }
 
@@ -128,8 +152,14 @@ impl Registers {
     #[inline]
     pub fn set_reg16(&mut self, i: u8, v: u16) {
         match i & 7 {
-            0 => self.ax = v, 1 => self.cx = v, 2 => self.dx = v, 3 => self.bx = v,
-            4 => self.sp = v, 5 => self.bp = v, 6 => self.si = v, _ => self.di = v,
+            0 => self.ax = v,
+            1 => self.cx = v,
+            2 => self.dx = v,
+            3 => self.bx = v,
+            4 => self.sp = v,
+            5 => self.bp = v,
+            6 => self.si = v,
+            _ => self.di = v,
         }
     }
 
@@ -145,7 +175,11 @@ impl Registers {
     pub fn set_reg8(&mut self, i: u8, v: u8) {
         let r = i & 3;
         let w = self.reg16(r);
-        let w = if i & 4 != 0 { (w & 0x00FF) | ((v as u16) << 8) } else { (w & 0xFF00) | v as u16 };
+        let w = if i & 4 != 0 {
+            (w & 0x00FF) | ((v as u16) << 8)
+        } else {
+            (w & 0xFF00) | v as u16
+        };
         self.set_reg16(r, w);
     }
 
@@ -153,7 +187,10 @@ impl Registers {
     #[inline]
     pub fn seg(&self, i: u8) -> u16 {
         match i & 3 {
-            0 => self.es, 1 => self.cs, 2 => self.ss, _ => self.ds,
+            0 => self.es,
+            1 => self.cs,
+            2 => self.ss,
+            _ => self.ds,
         }
     }
 
@@ -161,7 +198,10 @@ impl Registers {
     #[inline]
     pub fn set_seg(&mut self, i: u8, v: u16) {
         match i & 3 {
-            0 => self.es = v, 1 => self.cs = v, 2 => self.ss = v, _ => self.ds = v,
+            0 => self.es = v,
+            1 => self.cs = v,
+            2 => self.ss = v,
+            _ => self.ds = v,
         }
     }
 }

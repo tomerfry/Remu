@@ -32,10 +32,20 @@ use serde::Deserialize;
 
 #[derive(Deserialize, Default, Clone, Copy)]
 struct Regs {
-    ax: Option<u16>, bx: Option<u16>, cx: Option<u16>, dx: Option<u16>,
-    cs: Option<u16>, ss: Option<u16>, ds: Option<u16>, es: Option<u16>,
-    sp: Option<u16>, bp: Option<u16>, si: Option<u16>, di: Option<u16>,
-    ip: Option<u16>, flags: Option<u16>,
+    ax: Option<u16>,
+    bx: Option<u16>,
+    cx: Option<u16>,
+    dx: Option<u16>,
+    cs: Option<u16>,
+    ss: Option<u16>,
+    ds: Option<u16>,
+    es: Option<u16>,
+    sp: Option<u16>,
+    bp: Option<u16>,
+    si: Option<u16>,
+    di: Option<u16>,
+    ip: Option<u16>,
+    flags: Option<u16>,
 }
 
 #[derive(Deserialize)]
@@ -95,8 +105,8 @@ fn set_initial(cpu: &mut Cpu, r: &Regs) {
 
 /// Run every case in one opcode file. Returns (failures, cases).
 fn run_file(path: &PathBuf, flags_mask: u16) -> (usize, usize) {
-    let raw = std::fs::read(path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    let raw =
+        std::fs::read(path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
     let mut data = String::new();
     flate2::read::GzDecoder::new(&raw[..])
         .read_to_string(&mut data)
@@ -150,13 +160,36 @@ fn run_file(path: &PathBuf, flags_mask: u16) -> (usize, usize) {
             if failures < 5 {
                 eprintln!(
                     "FAIL {} [{}]:\n  exp ip:{:04X} flags:{:04X} ax:{:04X} bx:{:04X} cx:{:04X} dx:{:04X} sp:{:04X} bp:{:04X} si:{:04X} di:{:04X} cs:{:04X} ss:{:04X} ds:{:04X} es:{:04X}\n  got ip:{:04X} flags:{:04X} ax:{:04X} bx:{:04X} cx:{:04X} dx:{:04X} sp:{:04X} bp:{:04X} si:{:04X} di:{:04X} cs:{:04X} ss:{:04X} ds:{:04X} es:{:04X} (mask {:04X})",
-                    path.file_name().unwrap().to_string_lossy(), case.name,
-                    exp(f.ip, i.ip), exp_flags, exp(f.ax, i.ax), exp(f.bx, i.bx),
-                    exp(f.cx, i.cx), exp(f.dx, i.dx), exp(f.sp, i.sp), exp(f.bp, i.bp),
-                    exp(f.si, i.si), exp(f.di, i.di), exp(f.cs, i.cs), exp(f.ss, i.ss),
-                    exp(f.ds, i.ds), exp(f.es, i.es),
-                    got.ip, got.flags.to_word(), got.ax, got.bx, got.cx, got.dx,
-                    got.sp, got.bp, got.si, got.di, got.cs, got.ss, got.ds, got.es,
+                    path.file_name().unwrap().to_string_lossy(),
+                    case.name,
+                    exp(f.ip, i.ip),
+                    exp_flags,
+                    exp(f.ax, i.ax),
+                    exp(f.bx, i.bx),
+                    exp(f.cx, i.cx),
+                    exp(f.dx, i.dx),
+                    exp(f.sp, i.sp),
+                    exp(f.bp, i.bp),
+                    exp(f.si, i.si),
+                    exp(f.di, i.di),
+                    exp(f.cs, i.cs),
+                    exp(f.ss, i.ss),
+                    exp(f.ds, i.ds),
+                    exp(f.es, i.es),
+                    got.ip,
+                    got.flags.to_word(),
+                    got.ax,
+                    got.bx,
+                    got.cx,
+                    got.dx,
+                    got.sp,
+                    got.bp,
+                    got.si,
+                    got.di,
+                    got.cs,
+                    got.ss,
+                    got.ds,
+                    got.es,
                     flags_mask,
                 );
             }
@@ -185,7 +218,11 @@ fn harte_8088_suite() {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", dir.display()))
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.file_name().map(|n| n.to_string_lossy().ends_with(".json.gz")).unwrap_or(false))
+        .filter(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().ends_with(".json.gz"))
+                .unwrap_or(false)
+        })
         .collect();
     entries.sort();
 
@@ -215,5 +252,8 @@ fn harte_8088_suite() {
             failed_opcodes.join(", ")
         );
     }
-    eprintln!("SingleStepTests 8088 suite passed: {} files, {total_cases} cases.", entries.len());
+    eprintln!(
+        "SingleStepTests 8088 suite passed: {} files, {total_cases} cases.",
+        entries.len()
+    );
 }

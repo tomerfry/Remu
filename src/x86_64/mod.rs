@@ -1485,10 +1485,7 @@ impl Cpu {
         let rip = self.regs.rip;
         let lin = self.regs.seg[reg::CS as usize].base.wrapping_add(rip);
         let lin = if self.m64 { lin } else { lin & 0xFFFF_FFFF };
-        if lin >> 12 != self.fetch_tag
-            || lin & 0xFFF > 0x1000 - n as u64
-            || self.ilen > 15 - n
-        {
+        if lin >> 12 != self.fetch_tag || lin & 0xFFF > 0x1000 - n as u64 || self.ilen > 15 - n {
             return None;
         }
         let range_ok = if self.m64 {

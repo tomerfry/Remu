@@ -526,8 +526,10 @@ impl Emulator {
 /// Build an i386 `struct stat64` (96 bytes) with the fields that matter.
 fn build_stat64(mode: u32, size: u64, ino: u64) -> [u8; 96] {
     let mut s = [0u8; 96];
-    let put32 = |s: &mut [u8; 96], off: usize, v: u32| s[off..off + 4].copy_from_slice(&v.to_le_bytes());
-    let put64 = |s: &mut [u8; 96], off: usize, v: u64| s[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    let put32 =
+        |s: &mut [u8; 96], off: usize, v: u32| s[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    let put64 =
+        |s: &mut [u8; 96], off: usize, v: u64| s[off..off + 8].copy_from_slice(&v.to_le_bytes());
     put32(&mut s, 12, ino as u32); // __st_ino
     put32(&mut s, 16, mode); // st_mode
     put32(&mut s, 20, 1); // st_nlink

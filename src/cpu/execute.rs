@@ -6,10 +6,10 @@
 //! the table's base count — currently only taken branches contribute.
 
 use crate::bus::Bus;
+use crate::cpu::Cpu;
 use crate::cpu::addressing::{AddressingMode, Operand};
 use crate::cpu::opcodes::{OpInfo, Operation};
 use crate::cpu::registers::Status;
-use crate::cpu::Cpu;
 use crate::interrupt::IRQ_VECTOR;
 
 impl Cpu {
@@ -22,64 +22,226 @@ impl Cpu {
         use Operation::*;
         match info.operation {
             // Loads
-            LDA => { let v = self.read(bus, m.addr); self.regs.a = v; self.regs.p.set_zn(v); 0 }
-            LDX => { let v = self.read(bus, m.addr); self.regs.x = v; self.regs.p.set_zn(v); 0 }
-            LDY => { let v = self.read(bus, m.addr); self.regs.y = v; self.regs.p.set_zn(v); 0 }
+            LDA => {
+                let v = self.read(bus, m.addr);
+                self.regs.a = v;
+                self.regs.p.set_zn(v);
+                0
+            }
+            LDX => {
+                let v = self.read(bus, m.addr);
+                self.regs.x = v;
+                self.regs.p.set_zn(v);
+                0
+            }
+            LDY => {
+                let v = self.read(bus, m.addr);
+                self.regs.y = v;
+                self.regs.p.set_zn(v);
+                0
+            }
 
             // Stores
-            STA => { self.write(bus, m.addr, self.regs.a); 0 }
-            STX => { self.write(bus, m.addr, self.regs.x); 0 }
-            STY => { self.write(bus, m.addr, self.regs.y); 0 }
+            STA => {
+                self.write(bus, m.addr, self.regs.a);
+                0
+            }
+            STX => {
+                self.write(bus, m.addr, self.regs.x);
+                0
+            }
+            STY => {
+                self.write(bus, m.addr, self.regs.y);
+                0
+            }
 
             // Register transfers
-            TAX => { self.regs.x = self.regs.a; self.regs.p.set_zn(self.regs.x); 0 }
-            TAY => { self.regs.y = self.regs.a; self.regs.p.set_zn(self.regs.y); 0 }
-            TXA => { self.regs.a = self.regs.x; self.regs.p.set_zn(self.regs.a); 0 }
-            TYA => { self.regs.a = self.regs.y; self.regs.p.set_zn(self.regs.a); 0 }
-            TSX => { self.regs.x = self.regs.sp; self.regs.p.set_zn(self.regs.x); 0 }
-            TXS => { self.regs.sp = self.regs.x; 0 } // TXS does not affect flags
+            TAX => {
+                self.regs.x = self.regs.a;
+                self.regs.p.set_zn(self.regs.x);
+                0
+            }
+            TAY => {
+                self.regs.y = self.regs.a;
+                self.regs.p.set_zn(self.regs.y);
+                0
+            }
+            TXA => {
+                self.regs.a = self.regs.x;
+                self.regs.p.set_zn(self.regs.a);
+                0
+            }
+            TYA => {
+                self.regs.a = self.regs.y;
+                self.regs.p.set_zn(self.regs.a);
+                0
+            }
+            TSX => {
+                self.regs.x = self.regs.sp;
+                self.regs.p.set_zn(self.regs.x);
+                0
+            }
+            TXS => {
+                self.regs.sp = self.regs.x;
+                0
+            } // TXS does not affect flags
 
             // Stack
-            PHA => { self.push(bus, self.regs.a); 0 }
-            PHP => { self.push_status(bus, true); 0 }
-            PLA => { let v = self.pull(bus); self.regs.a = v; self.regs.p.set_zn(v); 0 }
-            PLP => { self.pull_status(bus); 0 }
+            PHA => {
+                self.push(bus, self.regs.a);
+                0
+            }
+            PHP => {
+                self.push_status(bus, true);
+                0
+            }
+            PLA => {
+                let v = self.pull(bus);
+                self.regs.a = v;
+                self.regs.p.set_zn(v);
+                0
+            }
+            PLP => {
+                self.pull_status(bus);
+                0
+            }
 
             // Logical
-            AND => { let v = self.read(bus, m.addr); self.regs.a &= v; self.regs.p.set_zn(self.regs.a); 0 }
-            ORA => { let v = self.read(bus, m.addr); self.regs.a |= v; self.regs.p.set_zn(self.regs.a); 0 }
-            EOR => { let v = self.read(bus, m.addr); self.regs.a ^= v; self.regs.p.set_zn(self.regs.a); 0 }
-            BIT => { self.bit(bus, m); 0 }
+            AND => {
+                let v = self.read(bus, m.addr);
+                self.regs.a &= v;
+                self.regs.p.set_zn(self.regs.a);
+                0
+            }
+            ORA => {
+                let v = self.read(bus, m.addr);
+                self.regs.a |= v;
+                self.regs.p.set_zn(self.regs.a);
+                0
+            }
+            EOR => {
+                let v = self.read(bus, m.addr);
+                self.regs.a ^= v;
+                self.regs.p.set_zn(self.regs.a);
+                0
+            }
+            BIT => {
+                self.bit(bus, m);
+                0
+            }
 
             // Arithmetic
-            ADC => { let v = self.read(bus, m.addr); self.adc(v); 0 }
-            SBC => { let v = self.read(bus, m.addr); self.sbc(v); 0 }
-            CMP => { let v = self.read(bus, m.addr); self.compare(self.regs.a, v); 0 }
-            CPX => { let v = self.read(bus, m.addr); self.compare(self.regs.x, v); 0 }
-            CPY => { let v = self.read(bus, m.addr); self.compare(self.regs.y, v); 0 }
+            ADC => {
+                let v = self.read(bus, m.addr);
+                self.adc(v);
+                0
+            }
+            SBC => {
+                let v = self.read(bus, m.addr);
+                self.sbc(v);
+                0
+            }
+            CMP => {
+                let v = self.read(bus, m.addr);
+                self.compare(self.regs.a, v);
+                0
+            }
+            CPX => {
+                let v = self.read(bus, m.addr);
+                self.compare(self.regs.x, v);
+                0
+            }
+            CPY => {
+                let v = self.read(bus, m.addr);
+                self.compare(self.regs.y, v);
+                0
+            }
 
             // Increment / decrement
-            INC => { self.rmw(bus, m, |c, v| { let r = v.wrapping_add(1); c.regs.p.set_zn(r); r }); 0 }
-            DEC => { self.rmw(bus, m, |c, v| { let r = v.wrapping_sub(1); c.regs.p.set_zn(r); r }); 0 }
-            INX => { self.regs.x = self.regs.x.wrapping_add(1); self.regs.p.set_zn(self.regs.x); 0 }
-            INY => { self.regs.y = self.regs.y.wrapping_add(1); self.regs.p.set_zn(self.regs.y); 0 }
-            DEX => { self.regs.x = self.regs.x.wrapping_sub(1); self.regs.p.set_zn(self.regs.x); 0 }
-            DEY => { self.regs.y = self.regs.y.wrapping_sub(1); self.regs.p.set_zn(self.regs.y); 0 }
+            INC => {
+                self.rmw(bus, m, |c, v| {
+                    let r = v.wrapping_add(1);
+                    c.regs.p.set_zn(r);
+                    r
+                });
+                0
+            }
+            DEC => {
+                self.rmw(bus, m, |c, v| {
+                    let r = v.wrapping_sub(1);
+                    c.regs.p.set_zn(r);
+                    r
+                });
+                0
+            }
+            INX => {
+                self.regs.x = self.regs.x.wrapping_add(1);
+                self.regs.p.set_zn(self.regs.x);
+                0
+            }
+            INY => {
+                self.regs.y = self.regs.y.wrapping_add(1);
+                self.regs.p.set_zn(self.regs.y);
+                0
+            }
+            DEX => {
+                self.regs.x = self.regs.x.wrapping_sub(1);
+                self.regs.p.set_zn(self.regs.x);
+                0
+            }
+            DEY => {
+                self.regs.y = self.regs.y.wrapping_sub(1);
+                self.regs.p.set_zn(self.regs.y);
+                0
+            }
 
             // Shifts / rotates
-            ASL => { self.shift(bus, info.mode, m, Cpu::asl_val); 0 }
-            LSR => { self.shift(bus, info.mode, m, Cpu::lsr_val); 0 }
-            ROL => { self.shift(bus, info.mode, m, Cpu::rol_val); 0 }
-            ROR => { self.shift(bus, info.mode, m, Cpu::ror_val); 0 }
+            ASL => {
+                self.shift(bus, info.mode, m, Cpu::asl_val);
+                0
+            }
+            LSR => {
+                self.shift(bus, info.mode, m, Cpu::lsr_val);
+                0
+            }
+            ROL => {
+                self.shift(bus, info.mode, m, Cpu::rol_val);
+                0
+            }
+            ROR => {
+                self.shift(bus, info.mode, m, Cpu::ror_val);
+                0
+            }
 
             // Flag operations
-            CLC => { self.regs.p.remove(Status::C); 0 }
-            SEC => { self.regs.p.insert(Status::C); 0 }
-            CLD => { self.regs.p.remove(Status::D); 0 }
-            SED => { self.regs.p.insert(Status::D); 0 }
-            CLI => { self.regs.p.remove(Status::I); 0 }
-            SEI => { self.regs.p.insert(Status::I); 0 }
-            CLV => { self.regs.p.remove(Status::V); 0 }
+            CLC => {
+                self.regs.p.remove(Status::C);
+                0
+            }
+            SEC => {
+                self.regs.p.insert(Status::C);
+                0
+            }
+            CLD => {
+                self.regs.p.remove(Status::D);
+                0
+            }
+            SED => {
+                self.regs.p.insert(Status::D);
+                0
+            }
+            CLI => {
+                self.regs.p.remove(Status::I);
+                0
+            }
+            SEI => {
+                self.regs.p.insert(Status::I);
+                0
+            }
+            CLV => {
+                self.regs.p.remove(Status::V);
+                0
+            }
 
             // Branches
             BCC => self.branch(m, !self.regs.p.contains(Status::C)),
@@ -92,15 +254,33 @@ impl Cpu {
             BVS => self.branch(m, self.regs.p.contains(Status::V)),
 
             // Jumps / subroutines
-            JMP => { self.regs.pc = m.addr; 0 }
-            JSR => { self.jsr(bus); 0 }
-            RTS => { self.rts(bus); 0 }
+            JMP => {
+                self.regs.pc = m.addr;
+                0
+            }
+            JSR => {
+                self.jsr(bus);
+                0
+            }
+            RTS => {
+                self.rts(bus);
+                0
+            }
 
             // System
-            BRK => { self.brk(bus); 0 }
-            RTI => { self.rti(bus); 0 }
+            BRK => {
+                self.brk(bus);
+                0
+            }
+            RTI => {
+                self.rti(bus);
+                0
+            }
             NOP => 0,
-            KIL => { self.halted = true; 0 }
+            KIL => {
+                self.halted = true;
+                0
+            }
         }
     }
 
@@ -139,7 +319,8 @@ impl Cpu {
 
             // N and V are taken from this intermediate, before the high-nibble fix.
             self.regs.p.set(Status::N, sum & 0x80 != 0);
-            self.regs.p
+            self.regs
+                .p
                 .set(Status::V, (a as u16 ^ sum) & (v as u16 ^ sum) & 0x80 != 0);
 
             if sum >= 0xA0 {
@@ -151,7 +332,8 @@ impl Cpu {
             let sum = a as u16 + v as u16 + cin;
             let result = (sum & 0xFF) as u8;
             self.regs.p.set(Status::C, sum > 0xFF);
-            self.regs.p
+            self.regs
+                .p
                 .set(Status::V, (a as u16 ^ sum) & (v as u16 ^ sum) & 0x80 != 0);
             self.regs.a = result;
             self.regs.p.set_zn(result);
@@ -169,7 +351,9 @@ impl Cpu {
         let r = a as i16 - v as i16 - (1 - cin);
         let result = r as u8;
         self.regs.p.set(Status::C, r >= 0);
-        self.regs.p.set(Status::V, (a ^ v) & (a ^ result) & 0x80 != 0);
+        self.regs
+            .p
+            .set(Status::V, (a ^ v) & (a ^ result) & 0x80 != 0);
         self.regs.p.set_zn(result);
 
         if self.regs.p.contains(Status::D) {

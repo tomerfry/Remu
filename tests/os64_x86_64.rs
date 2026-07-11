@@ -41,7 +41,11 @@ fn hello_elf(msg: &[u8]) -> Vec<u8> {
     code.extend_from_slice(&[0x31, 0xFF]); // xor edi, edi
     code.extend_from_slice(&[0xB8, 0xE7, 0x00, 0x00, 0x00]); // mov eax, 231 (exit_group)
     code.extend_from_slice(&[0x0F, 0x05]); // syscall
-    assert_eq!(code.len(), 36, "code length must match the assumed msg offset");
+    assert_eq!(
+        code.len(),
+        36,
+        "code length must match the assumed msg offset"
+    );
 
     let filesz = (code_off + code.len() + msg.len()) as u64;
     let entry = VBASE + code_off as u64;
@@ -108,7 +112,10 @@ fn bad_write_buffer_returns_efault() {
     let mut emu = Emulator::load_image(&elf, &["hello".into()], &[], None).expect("load");
     emu.vfs.install(1, Fd::Sink(Vec::new()));
     let code = emu.run_capped(10_000);
-    assert_eq!(code, 0, "guest exits normally; the bad write just returns EFAULT");
+    assert_eq!(
+        code, 0,
+        "guest exits normally; the bad write just returns EFAULT"
+    );
     assert!(emu.vfs.sink_data(1).unwrap().is_empty(), "nothing written");
 }
 
@@ -120,5 +127,8 @@ fn malformed_elf_huge_memsz_rejected() {
     let memsz_off = EHDR + 40;
     elf[memsz_off..memsz_off + 8].copy_from_slice(&u64::MAX.to_le_bytes());
     let r = Emulator::load_image(&elf, &["x".into()], &[], None);
-    assert!(r.is_err(), "segment escaping the address space must be rejected");
+    assert!(
+        r.is_err(),
+        "segment escaping the address space must be rejected"
+    );
 }

@@ -118,7 +118,11 @@ impl Device for Uart16550 {
             MCR => self.mcr,
             LSR => {
                 // Transmission is instantaneous, so TX is always empty.
-                let rx_ready = if self.rx.is_empty() { 0 } else { LSR_DATA_READY };
+                let rx_ready = if self.rx.is_empty() {
+                    0
+                } else {
+                    LSR_DATA_READY
+                };
                 LSR_THR_EMPTY | LSR_TX_IDLE | rx_ready
             }
             MSR => 0,

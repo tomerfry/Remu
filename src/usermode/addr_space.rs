@@ -366,8 +366,16 @@ mod tests {
         // not panic: paging is off for guests, so the CPU can hand us this.
         m.write32(0x0001_FFFE, 0x1122_3344);
         assert_eq!(m.read32(0x0001_FFFE), 0x1122_3344);
-        assert_eq!(m.read8(0x0001_FFFF), 0x33, "second LE byte, last of chunk 1");
-        assert_eq!(m.read8(0x0002_0000), 0x22, "third LE byte, first of chunk 2");
+        assert_eq!(
+            m.read8(0x0001_FFFF),
+            0x33,
+            "second LE byte, last of chunk 1"
+        );
+        assert_eq!(
+            m.read8(0x0002_0000),
+            0x22,
+            "third LE byte, first of chunk 2"
+        );
         m.write16(0x0001_FFFF, 0xA55A);
         assert_eq!(m.read16(0x0001_FFFF), 0xA55A);
         assert!(m.take_segv().is_none(), "both chunks are mapped");
@@ -380,7 +388,13 @@ mod tests {
         // The high half falls in the unmapped next chunk: byte-split latches
         // the segv rather than slice-panicking.
         assert_eq!(m.read32(0x0001_FFFE), 0x0000, "unmapped bytes read as 0");
-        assert_eq!(m.take_segv(), Some(Segv { addr: 0x0002_0000, write: false }));
+        assert_eq!(
+            m.take_segv(),
+            Some(Segv {
+                addr: 0x0002_0000,
+                write: false
+            })
+        );
     }
 
     #[test]

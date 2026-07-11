@@ -48,8 +48,8 @@ impl AddressingMode {
         use AddressingMode::*;
         match self {
             Implied | Accumulator => 1,
-            Immediate | ZeroPage | ZeroPageX | ZeroPageY | IndexedIndirect
-            | IndirectIndexed | Relative => 2,
+            Immediate | ZeroPage | ZeroPageX | ZeroPageY | IndexedIndirect | IndirectIndexed
+            | Relative => 2,
             Absolute | AbsoluteX | AbsoluteY | Indirect | JsrAbsolute => 3,
         }
     }
@@ -69,7 +69,10 @@ pub struct Operand {
 
 impl Operand {
     const fn at(addr: u16) -> Self {
-        Operand { addr, page_crossed: false }
+        Operand {
+            addr,
+            page_crossed: false,
+        }
     }
 }
 
@@ -110,13 +113,19 @@ impl Cpu {
             AbsoluteX => {
                 let base = self.fetch_word(bus);
                 let addr = base.wrapping_add(self.regs.x as u16);
-                Operand { addr, page_crossed: page_crossed(base, addr) }
+                Operand {
+                    addr,
+                    page_crossed: page_crossed(base, addr),
+                }
             }
 
             AbsoluteY => {
                 let base = self.fetch_word(bus);
                 let addr = base.wrapping_add(self.regs.y as u16);
-                Operand { addr, page_crossed: page_crossed(base, addr) }
+                Operand {
+                    addr,
+                    page_crossed: page_crossed(base, addr),
+                }
             }
 
             Indirect => {
@@ -145,14 +154,20 @@ impl Cpu {
                 let hi = self.read(bus, base.wrapping_add(1) as u16) as u16;
                 let pointer = lo | (hi << 8);
                 let addr = pointer.wrapping_add(self.regs.y as u16);
-                Operand { addr, page_crossed: page_crossed(pointer, addr) }
+                Operand {
+                    addr,
+                    page_crossed: page_crossed(pointer, addr),
+                }
             }
 
             Relative => {
                 let offset = self.fetch_byte(bus) as i8 as u16;
                 let base = self.regs.pc;
                 let addr = base.wrapping_add(offset);
-                Operand { addr, page_crossed: page_crossed(base, addr) }
+                Operand {
+                    addr,
+                    page_crossed: page_crossed(base, addr),
+                }
             }
         }
     }

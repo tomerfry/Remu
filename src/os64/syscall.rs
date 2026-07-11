@@ -157,7 +157,8 @@ impl Emulator {
             }
             sys::MPROTECT => {
                 let (addr, len, prot_in) = (self.arg(0), self.arg(1), self.arg(2));
-                self.aspace.protect(&mut self.mem, addr, len, prot_bits(prot_in));
+                self.aspace
+                    .protect(&mut self.mem, addr, len, prot_bits(prot_in));
                 self.cpu.invalidate_tlb();
                 0
             }
@@ -194,7 +195,7 @@ impl Emulator {
             sys::RT_SIGACTION | sys::RT_SIGPROCMASK | sys::SIGALTSTACK => 0,
             sys::PRLIMIT64 => self.sys_prlimit64(),
             sys::FUTEX => match self.arg(1) & 0x7F {
-                1 => 0,             // FUTEX_WAKE
+                1 => 0,              // FUTEX_WAKE
                 0 => -errno::EAGAIN, // FUTEX_WAIT: single-threaded, never blocks
                 _ => -errno::ENOSYS,
             },
@@ -332,11 +333,19 @@ impl Emulator {
             }
             prctl::ARCH_GET_FS => {
                 let v = self.cpu.regs.seg[reg::FS as usize].base;
-                if self.g_write(addr, &v.to_le_bytes()) { 0 } else { -errno::EFAULT }
+                if self.g_write(addr, &v.to_le_bytes()) {
+                    0
+                } else {
+                    -errno::EFAULT
+                }
             }
             prctl::ARCH_GET_GS => {
                 let v = self.cpu.regs.seg[reg::GS as usize].base;
-                if self.g_write(addr, &v.to_le_bytes()) { 0 } else { -errno::EFAULT }
+                if self.g_write(addr, &v.to_le_bytes()) {
+                    0
+                } else {
+                    -errno::EFAULT
+                }
             }
             _ => -errno::EINVAL,
         }
@@ -350,7 +359,11 @@ impl Emulator {
             let b = f.as_bytes();
             out[i * 65..i * 65 + b.len()].copy_from_slice(b);
         }
-        if self.g_write(buf, &out) { 0 } else { -errno::EFAULT }
+        if self.g_write(buf, &out) {
+            0
+        } else {
+            -errno::EFAULT
+        }
     }
 
     fn sys_getrandom(&mut self) -> i64 {
@@ -434,8 +447,10 @@ fn prot_bits(p: u64) -> u32 {
 /// Build an x86-64 `struct stat` (144 bytes) with the fields that matter.
 fn build_stat(mode: u32, size: u64, ino: u64) -> [u8; 144] {
     let mut s = [0u8; 144];
-    let put32 = |s: &mut [u8; 144], off: usize, v: u32| s[off..off + 4].copy_from_slice(&v.to_le_bytes());
-    let put64 = |s: &mut [u8; 144], off: usize, v: u64| s[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    let put32 =
+        |s: &mut [u8; 144], off: usize, v: u32| s[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    let put64 =
+        |s: &mut [u8; 144], off: usize, v: u64| s[off..off + 8].copy_from_slice(&v.to_le_bytes());
     put64(&mut s, 8, ino); // st_ino
     put64(&mut s, 16, 1); // st_nlink
     put32(&mut s, 24, mode); // st_mode

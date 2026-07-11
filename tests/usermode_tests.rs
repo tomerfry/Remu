@@ -267,7 +267,10 @@ fn guest_wide_access_across_a_chunk_boundary_does_not_panic() {
         0xCD, 0x80, // INT 80h
     ];
     let (_, exit) = run_elf(&code, 0x9000);
-    assert!(matches!(exit, Exit::Exited(0)), "wide crossing round-trips — got {exit:?}");
+    assert!(
+        matches!(exit, Exit::Exited(0)),
+        "wide crossing round-trips — got {exit:?}"
+    );
 }
 
 #[test]

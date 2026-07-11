@@ -81,7 +81,8 @@ impl Emulator {
         // Load the dynamic linker if requested by PT_INTERP.
         let (entry, interp_base) = if let Some(interp) = &image.interp {
             let interp_data = Self::read_interp(rootfs.as_ref(), interp)?;
-            let interp_img = loader::load(&mut aspace, &mut mem, &interp_data, loader::INTERP_BASE)?;
+            let interp_img =
+                loader::load(&mut aspace, &mut mem, &interp_data, loader::INTERP_BASE)?;
             (interp_img.entry, Some(interp_img.base))
         } else {
             (image.entry, None)
@@ -106,7 +107,15 @@ impl Emulator {
         };
         let envp: Vec<Vec<u8>> = envp.iter().map(|s| s.as_bytes().to_vec()).collect();
 
-        let rsp = process::build_stack(&aspace, &mut mem, &image, interp_base, &argv, &envp, &argv[0]);
+        let rsp = process::build_stack(
+            &aspace,
+            &mut mem,
+            &image,
+            interp_base,
+            &argv,
+            &envp,
+            &argv[0],
+        );
 
         let mut cpu = Cpu::new();
         arch::enter_user(&mut cpu, &aspace, entry, rsp);
@@ -125,8 +134,9 @@ impl Emulator {
 
     /// Read the interpreter (`ld-linux-x86-64.so.2`) from the rootfs.
     fn read_interp(rootfs: Option<&PathBuf>, interp: &str) -> Result<Vec<u8>, String> {
-        let root = rootfs
-            .ok_or_else(|| format!("binary needs interpreter {interp} but no rootfs was provided"))?;
+        let root = rootfs.ok_or_else(|| {
+            format!("binary needs interpreter {interp} but no rootfs was provided")
+        })?;
         let host = root.join(interp.trim_start_matches('/'));
         std::fs::read(&host).map_err(|e| format!("read interpreter {host:?}: {e}"))
     }
@@ -143,7 +153,10 @@ impl Emulator {
         while self.running {
             if steps >= max {
                 if self.trace {
-                    eprintln!("[remu] instruction cap reached at rip={:#018x}", self.cpu.regs.rip);
+                    eprintln!(
+                        "[remu] instruction cap reached at rip={:#018x}",
+                        self.cpu.regs.rip
+                    );
                 }
                 return 125;
             }

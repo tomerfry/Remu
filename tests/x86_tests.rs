@@ -19,8 +19,8 @@ fn setup(program: &[u8]) -> (Cpu, LinearMemory) {
 fn mov_imm_and_reg_halves() {
     let (mut cpu, mut mem) = setup(&[
         0xB8, 0x34, 0x12, // MOV AX, 1234h
-        0xB4, 0xAB,       // MOV AH, ABh
-        0x88, 0xC3,       // MOV BL, AL
+        0xB4, 0xAB, // MOV AH, ABh
+        0x88, 0xC3, // MOV BL, AL
     ]);
     cpu.step(&mut mem);
     assert_eq!(cpu.regs.ax, 0x1234);
@@ -95,9 +95,9 @@ fn modrm_effective_addresses_and_segment_default() {
 fn push_pop_and_push_sp_quirk() {
     let (mut cpu, mut mem) = setup(&[
         0xB8, 0x55, 0xAA, // MOV AX, AA55h
-        0x50,             // PUSH AX
-        0x5B,             // POP BX
-        0x54,             // PUSH SP
+        0x50, // PUSH AX
+        0x5B, // POP BX
+        0x54, // PUSH SP
     ]);
     cpu.step(&mut mem);
     cpu.step(&mut mem);
@@ -116,11 +116,11 @@ fn push_pop_and_push_sp_quirk() {
 fn jumps_calls_and_rets() {
     let (mut cpu, mut mem) = setup(&[
         0xE8, 0x02, 0x00, // 0100: CALL 0105
-        0xEB, 0x03,       // 0103: JMP 0108
-        0xC3,             // 0105: RET
-        0x90,             // 0106
-        0x90,             // 0107
-        0xF4,             // 0108: HLT
+        0xEB, 0x03, // 0103: JMP 0108
+        0xC3, // 0105: RET
+        0x90, // 0106
+        0x90, // 0107
+        0xF4, // 0108: HLT
     ]);
     cpu.step(&mut mem);
     assert_eq!(cpu.regs.ip, 0x0105);

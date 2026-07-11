@@ -62,7 +62,9 @@ pub struct LinearMemory {
 impl LinearMemory {
     /// Create a zero-initialized 1 MiB memory.
     pub fn new() -> Self {
-        LinearMemory { ram: vec![0u8; 0x10_0000].into_boxed_slice().try_into().unwrap() }
+        LinearMemory {
+            ram: vec![0u8; 0x10_0000].into_boxed_slice().try_into().unwrap(),
+        }
     }
 
     /// Load `data` into memory starting at physical address `addr`.

@@ -569,7 +569,10 @@ fn fetch_across_page_boundary_faults_on_the_unmapped_second_page() {
         other => panic!("expected a trapped #PF, got {other:?}"),
     }
     assert_eq!(cpu.regs.cr2, 0x80_0000, "CR2 is the second page");
-    assert_eq!(cpu.regs.rip, 0x7F_FFFC, "RIP rewinds to the instruction start");
+    assert_eq!(
+        cpu.regs.rip, 0x7F_FFFC,
+        "RIP rewinds to the instruction start"
+    );
 
     // Map region 4 and restart: the refetch sees the new mapping.
     mem.write64(pd + 4 * 8, (4u64 << 21) | 0x87);

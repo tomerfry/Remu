@@ -1131,7 +1131,11 @@ fn call_gate_inner_stack_fault_restores_outer_ss() {
         ss_before,
         "the committed inner SS cache must be rewound after the push fault"
     );
-    assert_eq!(cpu.regs.gpr[reg::ESP as usize], 0x6000, "outer ESP restored");
+    assert_eq!(
+        cpu.regs.gpr[reg::ESP as usize],
+        0x6000,
+        "outer ESP restored"
+    );
     assert_eq!(cpu.regs.seg[reg::CS as usize], cs_before);
     assert_eq!(cpu.cpl(), 3);
     assert_eq!(cpu.regs.eip, 0x4000, "EIP rewinds to the CALL");

@@ -19,8 +19,16 @@ pub fn disassemble<B: Bus>(bus: &mut B, addr: u16) -> (String, u16) {
     // Read only the operand bytes the instruction actually has: bus reads can
     // have device side effects, so a phantom read would perturb the traced run.
     let len = info.length();
-    let b1 = if len >= 2 { bus.read(addr.wrapping_add(1)) } else { 0 };
-    let b2 = if len >= 3 { bus.read(addr.wrapping_add(2)) } else { 0 };
+    let b1 = if len >= 2 {
+        bus.read(addr.wrapping_add(1))
+    } else {
+        0
+    };
+    let b2 = if len >= 3 {
+        bus.read(addr.wrapping_add(2))
+    } else {
+        0
+    };
     let word = (b1 as u16) | ((b2 as u16) << 8);
 
     let operand = match info.mode {
@@ -37,9 +45,7 @@ pub fn disassemble<B: Bus>(bus: &mut B, addr: u16) -> (String, u16) {
         IndexedIndirect => format!("(${:02X},X)", b1),
         IndirectIndexed => format!("(${:02X}),Y", b1),
         Relative => {
-            let target = addr
-                .wrapping_add(2)
-                .wrapping_add(b1 as i8 as u16);
+            let target = addr.wrapping_add(2).wrapping_add(b1 as i8 as u16);
             format!("${:04X}", target)
         }
     };

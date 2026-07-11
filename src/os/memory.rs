@@ -95,7 +95,9 @@ impl PhysMem {
             Some(f) if off + 4 <= FRAME => {
                 u32::from_le_bytes([f[off], f[off + 1], f[off + 2], f[off + 3]])
             }
-            _ => (0..4).fold(0u32, |acc, i| acc | (self.load8(addr + i) as u32) << (8 * i)),
+            _ => (0..4).fold(0u32, |acc, i| {
+                acc | (self.load8(addr + i) as u32) << (8 * i)
+            }),
         }
     }
 

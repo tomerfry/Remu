@@ -3,7 +3,7 @@
 //! dynamic linker. Only the subset needed to run Linux i386 binaries is parsed.
 
 use crate::os::abi::elf;
-use crate::os::memory::{AddressSpace, PhysMem, PROT_EXEC, PROT_READ, PROT_WRITE};
+use crate::os::memory::{AddressSpace, PROT_EXEC, PROT_READ, PROT_WRITE, PhysMem};
 
 /// Base address for a PIE / `ET_DYN` main executable.
 pub const EXE_PIE_BASE: u32 = 0x5655_5000;
@@ -103,7 +103,13 @@ pub fn load(
         match p_type {
             elf::PT_LOAD => {
                 let vaddr = p_vaddr.wrapping_add(bias);
-                aspace.map(mem, vaddr, p_memsz, prot_of(p_flags), crate::os::memory::VmaKind::Image);
+                aspace.map(
+                    mem,
+                    vaddr,
+                    p_memsz,
+                    prot_of(p_flags),
+                    crate::os::memory::VmaKind::Image,
+                );
                 let file = data
                     .get(p_offset as usize..(p_offset + p_filesz) as usize)
                     .ok_or("PT_LOAD file range out of bounds")?;

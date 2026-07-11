@@ -66,7 +66,13 @@ impl Cpu {
         if m.md() == 0 && m.rm() == 6 {
             let off = self.fetch_word(bus);
             self.ea_cycles = 6;
-            return (m, Operand::Mem { seg: self.seg_or(reg::DS), off });
+            return (
+                m,
+                Operand::Mem {
+                    seg: self.seg_or(reg::DS),
+                    off,
+                },
+            );
         }
 
         let disp = match m.md() {
@@ -88,7 +94,13 @@ impl Cpu {
             _ => (r.bx, reg::DS, 5),
         };
         self.ea_cycles = if m.md() == 0 { ea } else { ea + 4 };
-        (m, Operand::Mem { seg: self.seg_or(seg), off: base.wrapping_add(disp) })
+        (
+            m,
+            Operand::Mem {
+                seg: self.seg_or(seg),
+                off: base.wrapping_add(disp),
+            },
+        )
     }
 
     /// Read an operand as a byte.
