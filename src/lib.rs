@@ -11,7 +11,9 @@
 //!
 //! The [`usermode`] layer runs statically linked Linux i386 ELF executables
 //! on the 80386 core, emulating their syscalls on the host (qemu-user
-//! style) — see the `remu-user` binary.
+//! style) — see the `remu-user` binary. The [`os`] and [`os64`] layers are the
+//! qiling-style OS-emulation engines (hardware paging, ring 3) for Linux i386
+//! and x86-64 respectively — see `remu-user64` for the 64-bit runner.
 //!
 //! ```
 //! use remu::{Cpu, memory::FlatMemory, bus::Bus};
@@ -32,6 +34,7 @@ pub mod device;
 pub mod interrupt;
 pub mod memory;
 pub mod os;
+pub mod os64;
 #[cfg(feature = "python")]
 mod python;
 pub mod usermode;

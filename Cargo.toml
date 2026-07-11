@@ -21,6 +21,11 @@ path = "src/main.rs"
 name = "remu-user"
 path = "src/bin/remu-user.rs"
 
+[[bin]]
+# Linux x86-64 OS-emulation runner (qiling-style, hardware paging).
+name = "remu-user64"
+path = "src/bin/remu-user64.rs"
+
 [dependencies]
 bitflags = "2"
 pyo3 = { version = "0.29.0", features = ["abi3-py39"], optional = true }
