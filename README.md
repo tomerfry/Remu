@@ -1,8 +1,8 @@
 # Remu
 
 A CPU emulation framework in Rust with cycle-conscious interpreters for the
-MOS 6502, the Intel 8086/8088 and the Intel 80386. Goals: realistic
-emulation, and emulation speed to the MAXIMUM.
+MOS 6502, the Intel 8086/8088, the Intel 80386 and x86-64/AMD64. Goals:
+realistic emulation, and emulation speed to the MAXIMUM.
 
 ## Rust
 
@@ -52,6 +52,25 @@ mem.load(0x0_1100, &[0x66, 0xB8, 0x78, 0x56, 0x34, 0x12]); // MOV EAX, 0x1234567
 
 let mut cpu = Cpu::new();
 cpu.set_cs_ip(0x0000, 0x1100);
+cpu.step(&mut mem);
+assert_eq!(cpu.regs.gpr[0], 0x1234_5678);
+```
+
+The x86-64 core lives in `remu::x86_64` — sixteen 64-bit registers, REX
+prefixes and RIP-relative addressing, real/protected/compatibility/long
+modes, 4-level paging with NX and large pages, the SYSCALL/SYSRET and MSR
+system interface, and the full x86-64 integer instruction set (no x87/SSE
+state; SSE encodings raise `#UD` and CPUID says so). `Cpu::setup_long_flat`
+drops straight into 64-bit long mode with identity paging:
+
+```rust
+use remu::x86_64::{Cpu, LinearMemory};
+
+let mut mem = LinearMemory::new();          // flat 16 MiB space
+mem.load(0x1100, &[0x48, 0xC7, 0xC0, 0x78, 0x56, 0x34, 0x12]); // MOV RAX, 0x12345678
+
+let mut cpu = Cpu::new();
+cpu.setup_long_flat(&mut mem, 0x1100, 0x8_0000);
 cpu.step(&mut mem);
 assert_eq!(cpu.regs.gpr[0], 0x1234_5678);
 ```
