@@ -447,6 +447,14 @@ impl PerfStats {
     }
 }
 
+/// [`Cpu::events`] bit: a latched non-maskable interrupt (vector 2).
+pub(crate) const EVT_NMI: u8 = 1 << 0;
+/// [`Cpu::events`] bit: the INTR line is asserted (vector in `Cpu::intr`).
+pub(crate) const EVT_INTR: u8 = 1 << 1;
+/// [`Cpu::events`] bit: interrupts (and traps) are inhibited for one
+/// instruction after `MOV SS` / `POP SS` / `STI`.
+pub(crate) const EVT_INHIBIT: u8 = 1 << 2;
+
 /// An x86-64 processor.
 ///
 /// As with the other cores, the CPU does not own its bus — call [`Cpu::step`]
@@ -465,14 +473,15 @@ pub struct Cpu {
     /// Set on triple fault; only RESET leaves this state.
     pub shutdown: bool,
 
-    /// Latched pending non-maskable interrupt (edge-triggered, vector 2).
-    nmi_pending: bool,
+    /// Host-latched boundary events (`EVT_*` bits: NMI, INTR line,
+    /// one-instruction interrupt shadow), folded into one byte so the
+    /// [`Cpu::step`] hot path tests them with a single predictable branch.
+    /// The bits are the *only* storage for these latches; `EVT_INTR` mirrors
+    /// `intr.is_some()`.
+    events: u8,
     /// Pending maskable interrupt request with its vector (as supplied by a
-    /// PIC/APIC during the acknowledge cycle).
+    /// PIC/APIC during the acknowledge cycle). `Some` iff `EVT_INTR` is set.
     intr: Option<u8>,
-    /// Interrupts (and traps) are inhibited for one instruction after
-    /// `MOV SS`/`POP SS`/`STI`.
-    inhibit_interrupts: bool,
 
     // --- Per-instruction decode state ---------------------------------------
     /// Segment-override prefix (segment register index). In 64-bit mode only
@@ -587,9 +596,8 @@ impl Cpu {
             cycles: 0,
             halted: false,
             shutdown: false,
-            nmi_pending: false,
+            events: 0,
             intr: None,
-            inhibit_interrupts: false,
             seg_override: None,
             rep: None,
             lock: false,
@@ -637,9 +645,8 @@ impl Cpu {
         self.regs = Registers::new();
         self.halted = false;
         self.shutdown = false;
-        self.nmi_pending = false;
+        self.events = 0;
         self.intr = None;
-        self.inhibit_interrupts = false;
         self.supervisor_override = false;
         self.fetch_invalidate();
         self.tlb.flush();
@@ -731,6 +738,37 @@ impl Cpu {
     /// Execute one instruction (or service a pending interrupt). Returns the
     /// number of cycles consumed, and adds them to [`Cpu::cycles`].
     pub fn step<B: Bus>(&mut self, bus: &mut B) -> u32 {
+        if self.boundary_pending() {
+            return self.step_slow(bus);
+        }
+        self.step_fast(bus)
+    }
+
+    /// Whether the next instruction boundary needs [`Cpu::step_slow`]: a
+    /// latched event, HLT/shutdown state, or a pending single-step trap.
+    ///
+    /// Short-circuit `||`, not bitwise `|`: measured faster on both cores
+    /// (the fused OR-chain stalls the branch on all four loads; the
+    /// short-circuit chain is a run of individually predicted-not-taken
+    /// branches). `halted`/`shutdown` are `pub` fields and TF is
+    /// guest-visible in RFLAGS (all writable by embedders and tests
+    /// directly), so they are re-read here rather than mirrored into
+    /// `events` — a mirror of a `pub` field can go stale.
+    #[inline(always)]
+    fn boundary_pending(&self) -> bool {
+        (self.events != 0)
+            || self.halted
+            || self.shutdown
+            || (self.regs.rflags.bits() & RFlags::TF.bits() != 0)
+    }
+
+    /// The boundary slow path: shutdown/halt states, interrupt delivery, the
+    /// one-instruction shadow, and single-step traps. Out of line so the hot
+    /// path pays only [`Cpu::boundary_pending`]'s single predicted-not-taken
+    /// branch.
+    #[cold]
+    #[inline(never)]
+    fn step_slow<B: Bus>(&mut self, bus: &mut B) -> u32 {
         if self.shutdown {
             self.cycles += 1;
             return 1;
@@ -738,11 +776,11 @@ impl Cpu {
 
         // Interrupts are recognized at instruction boundaries, except for the
         // one-instruction shadow after MOV SS / POP SS / STI.
-        let inhibited = self.inhibit_interrupts;
-        self.inhibit_interrupts = false;
+        let inhibited = self.events & EVT_INHIBIT != 0;
+        self.events &= !EVT_INHIBIT;
         if !inhibited {
-            if self.nmi_pending {
-                self.nmi_pending = false;
+            if self.events & EVT_NMI != 0 {
+                self.events &= !EVT_NMI;
                 self.halted = false;
                 self.deliver(
                     bus,
@@ -759,6 +797,7 @@ impl Cpu {
                 && self.regs.rflags.contains(RFlags::IF)
             {
                 self.intr = None;
+                self.events &= !EVT_INTR;
                 self.halted = false;
                 self.deliver(
                     bus,
@@ -782,58 +821,24 @@ impl Cpu {
         // TF was set when it started.
         let trap = self.regs.rflags.contains(RFlags::TF);
 
-        // Faults restore register state so the instruction can restart. Only
-        // the GPRs are snapshotted here: RIP rewinds via `start_rip`, RFLAGS
-        // keeps whatever the faulting computation left behind, CR2 keeps the
-        // page-fault address, and every other field is cold — its writers
-        // call `prepare_cold_write` first, which captures the full register
-        // file.
         let saved_gpr = self.regs.gpr;
         #[cfg(debug_assertions)]
         let saved_all = self.regs;
         let mut cycles = match self.exec_one(bus) {
             Ok(c) => c,
-            Err(e) => {
-                if self.commit_on_fault {
-                    // String-op progress stays; only RIP rewinds.
-                    self.regs.rip = self.start_rip;
-                } else {
-                    if self.cold_saved {
-                        let (rflags, cr2) = (self.regs.rflags, self.regs.cr2);
-                        self.regs = self.fault_regs;
-                        self.regs.rflags = rflags;
-                        self.regs.cr2 = cr2;
-                    }
-                    self.regs.gpr = saved_gpr;
-                    self.regs.rip = self.start_rip;
-                    #[cfg(debug_assertions)]
-                    {
-                        // Differential check against the old whole-file
-                        // rewind: a mismatch means a cold-register writer is
-                        // missing its `prepare_cold_write` call.
-                        let mut want = saved_all;
-                        want.rflags = self.regs.rflags;
-                        want.cr2 = self.regs.cr2;
-                        assert_eq!(
-                            self.regs, want,
-                            "fault rewind mismatch at {:#x}",
-                            self.start_rip
-                        );
-                    }
-                }
-                // OS-emulation hook: hand the (rewound, restartable) fault to
-                // the host instead of vectoring through the IDT.
-                if self.trap_faults {
-                    self.host_trap = Some(HostTrap::Exception(e));
-                    self.cycles += INTERRUPT_CYCLES as u64;
-                    return INTERRUPT_CYCLES;
-                }
-                self.deliver(bus, e, Event::Fault);
-                INTERRUPT_CYCLES
-            }
+            Err(e) => match self.fault_epilogue(
+                bus,
+                e,
+                &saved_gpr,
+                #[cfg(debug_assertions)]
+                &saved_all,
+            ) {
+                Some(c) => c,
+                None => return INTERRUPT_CYCLES,
+            },
         };
 
-        if trap && self.regs.rflags.contains(RFlags::TF) && !self.inhibit_interrupts {
+        if trap && self.regs.rflags.contains(RFlags::TF) && self.events & EVT_INHIBIT == 0 {
             self.deliver(
                 bus,
                 Exception {
@@ -847,6 +852,92 @@ impl Cpu {
 
         self.cycles += cycles as u64;
         cycles
+    }
+
+    /// The boundary fast path: no event latched, not halted/shut down, TF
+    /// clear — just execute one instruction. The single-step epilogue is
+    /// skipped because TF was clear when the instruction started; an
+    /// instruction that sets TF (or arms the shadow) routes the *next* step
+    /// through [`Cpu::step_slow`] via [`Cpu::boundary_pending`].
+    #[inline(always)]
+    fn step_fast<B: Bus>(&mut self, bus: &mut B) -> u32 {
+        // Faults restore register state so the instruction can restart. Only
+        // the GPRs are snapshotted here: RIP rewinds via `start_rip`, RFLAGS
+        // keeps whatever the faulting computation left behind, CR2 keeps the
+        // page-fault address, and every other field is cold — its writers
+        // call `prepare_cold_write` first, which captures the full register
+        // file.
+        let saved_gpr = self.regs.gpr;
+        #[cfg(debug_assertions)]
+        let saved_all = self.regs;
+        let cycles = match self.exec_one(bus) {
+            Ok(c) => c,
+            Err(e) => match self.fault_epilogue(
+                bus,
+                e,
+                &saved_gpr,
+                #[cfg(debug_assertions)]
+                &saved_all,
+            ) {
+                Some(c) => c,
+                None => return INTERRUPT_CYCLES,
+            },
+        };
+
+        self.cycles += cycles as u64;
+        cycles
+    }
+
+    /// Rewind and dispose of a fault from `exec_one`: restore pre-instruction
+    /// register state, then either hand the exception to the host
+    /// (`trap_faults`, returns `None` — cycles already accounted) or deliver
+    /// it through the IDT (returns `Some(INTERRUPT_CYCLES)` for the caller's
+    /// accounting).
+    #[cold]
+    #[inline(never)]
+    fn fault_epilogue<B: Bus>(
+        &mut self,
+        bus: &mut B,
+        e: Exception,
+        saved_gpr: &[u64; 16],
+        #[cfg(debug_assertions)] saved_all: &Registers,
+    ) -> Option<u32> {
+        if self.commit_on_fault {
+            // String-op progress stays; only RIP rewinds.
+            self.regs.rip = self.start_rip;
+        } else {
+            if self.cold_saved {
+                let (rflags, cr2) = (self.regs.rflags, self.regs.cr2);
+                self.regs = self.fault_regs;
+                self.regs.rflags = rflags;
+                self.regs.cr2 = cr2;
+            }
+            self.regs.gpr = *saved_gpr;
+            self.regs.rip = self.start_rip;
+            #[cfg(debug_assertions)]
+            {
+                // Differential check against the old whole-file
+                // rewind: a mismatch means a cold-register writer is
+                // missing its `prepare_cold_write` call.
+                let mut want = *saved_all;
+                want.rflags = self.regs.rflags;
+                want.cr2 = self.regs.cr2;
+                assert_eq!(
+                    self.regs, want,
+                    "fault rewind mismatch at {:#x}",
+                    self.start_rip
+                );
+            }
+        }
+        // OS-emulation hook: hand the (rewound, restartable) fault to
+        // the host instead of vectoring through the IDT.
+        if self.trap_faults {
+            self.host_trap = Some(HostTrap::Exception(e));
+            self.cycles += INTERRUPT_CYCLES as u64;
+            return None;
+        }
+        self.deliver(bus, e, Event::Fault);
+        Some(INTERRUPT_CYCLES)
     }
 
     /// Capture the register file before the first write to a cold register
@@ -1122,7 +1213,7 @@ impl Cpu {
 
     /// Latch a pending NMI (vector 2, not maskable by `IF`).
     pub fn trigger_nmi(&mut self) {
-        self.nmi_pending = true;
+        self.events |= EVT_NMI;
     }
 
     /// Assert the INTR line with `vector` (as a PIC would supply during the
@@ -1130,11 +1221,13 @@ impl Cpu {
     /// boundary with `IF` set.
     pub fn assert_intr(&mut self, vector: u8) {
         self.intr = Some(vector);
+        self.events |= EVT_INTR;
     }
 
     /// Deassert the INTR line.
     pub fn clear_intr(&mut self) {
         self.intr = None;
+        self.events &= !EVT_INTR;
     }
 
     /// Whether an interrupt would be taken at the next instruction boundary.
@@ -1142,7 +1235,8 @@ impl Cpu {
     /// interruptible, as on hardware.
     #[inline]
     pub(crate) fn interrupt_pending(&self) -> bool {
-        self.nmi_pending || (self.intr.is_some() && self.regs.rflags.contains(RFlags::IF))
+        self.events & EVT_NMI != 0
+            || (self.events & EVT_INTR != 0 && self.regs.rflags.contains(RFlags::IF))
     }
 
     // --- Canonical addresses -----------------------------------------------------
@@ -1615,6 +1709,7 @@ impl Cpu {
     /// A fault raised while delivering `e` is handled serially unless the
     /// pair forms a double fault; a fault while delivering `#DF` is a triple
     /// fault and shuts the processor down.
+    #[cold]
     pub(crate) fn deliver<B: Bus>(&mut self, bus: &mut B, e: Exception, class: Event) {
         let (mut current, mut class) = (e, class);
         let mut in_double_fault = false;
@@ -1650,6 +1745,7 @@ impl Cpu {
     /// effect is rolled back (CR2 excepted, so a nested `#PF` keeps its
     /// address) and the nested fault is delivered from the architectural
     /// state the CPU had before delivery began.
+    #[cold]
     pub(crate) fn raise<B: Bus>(&mut self, bus: &mut B, e: Exception, class: Event) -> Exec<()> {
         let snapshot = self.regs;
         let sup = self.supervisor_override;

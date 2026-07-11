@@ -125,7 +125,7 @@ impl Cpu {
                 let idx = opcode >> 3;
                 self.load_seg(bus, idx, v)?;
                 if idx == reg::SS {
-                    self.inhibit_interrupts = true;
+                    self.events |= super::EVT_INHIBIT;
                 }
                 Ok(7)
             }
@@ -559,7 +559,7 @@ impl Cpu {
                 let v = self.read_op16(bus, op)?;
                 self.load_seg(bus, m.sub(), v)?;
                 if m.sub() == reg::SS {
-                    self.inhibit_interrupts = true;
+                    self.events |= super::EVT_INHIBIT;
                 }
                 Ok(if op.is_mem() { 5 } else { 2 })
             }
@@ -1114,7 +1114,7 @@ impl Cpu {
                     return Err(Exception::gp(0));
                 }
                 self.regs.rflags.insert(RFlags::IF);
-                self.inhibit_interrupts = true;
+                self.events |= super::EVT_INHIBIT;
                 Ok(3)
             }
             0xFC => {
@@ -1665,7 +1665,7 @@ impl Cpu {
         self.load_seg(bus, sreg, sel)?;
         self.write_reg_osize(r, dst);
         if sreg == reg::SS {
-            self.inhibit_interrupts = true;
+            self.events |= super::EVT_INHIBIT;
         }
         Ok(())
     }
