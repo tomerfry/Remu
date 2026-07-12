@@ -353,7 +353,13 @@ impl Cpu {
         let version = self.icache.clock;
         let stamp_slot = (phys >> 12) as usize & (STAMP_SLOTS - 1);
         let entry = emit_block(&mut self.jit.asm, &plan, version, stamp_slot);
-        self.jit.asm.commit().expect("commit JIT block");
+        // A commit failure (e.g. an unencodable relocation) must not crash the
+        // emulator: discard the whole cache and interpret this head instead.
+        if self.jit.asm.commit().is_err() {
+            self.jit.flush();
+            self.jit_mark_cold(key, phys);
+            return false;
+        }
 
         let idx = self.jit.blocks.len() as u32;
         self.jit.blocks.push(BlockMeta {
@@ -697,6 +703,9 @@ fn emit_body(ops: &mut Assembler, b: &Body) {
 
 /// Materialize the live host status flags into `regs.rflags`: `from_host` bits
 /// come from EFLAGS, `const0`/`const1` are forced, everything else is kept.
+///
+/// Uses `LAHF`/`SETO` to read the flags — universal on modern x86-64 (the
+/// host this JIT targets), though absent on the earliest AMD64 steppings.
 fn emit_materialize(ops: &mut Assembler, from_host: u32, const0: u32, const1: u32) {
     let clear = (from_host | const0 | const1) as i32;
     if clear == 0 {
@@ -749,6 +758,24 @@ fn emit_exit(ops: &mut Assembler, plan: &Plan, rip: u64, retired_r8: bool, ninsn
     dynasm!(ops ; .arch x64 ; pop rbp ; ret);
 }
 
+/// Emit a self-loop back-edge that decrements the `loop` counter (rcx) and,
+/// while it is nonzero, jumps to `body_top` — via a two-hop bounce so the
+/// distance is unbounded. `loop` has only an 8-bit displacement, but the loop
+/// body can span far more than 127 bytes; the `loop` here only reaches the
+/// adjacent `cont` trampoline, whose near `jmp` reaches any block size. When
+/// rcx reaches 0 (budget exhausted) it falls through past `budget_done`.
+fn emit_backedge(ops: &mut Assembler, body_top: dynasmrt::DynamicLabel) {
+    let cont = ops.new_dynamic_label();
+    let budget_done = ops.new_dynamic_label();
+    dynasm!(ops ; .arch x64
+        ; loop =>cont            // rcx-- ; if rcx != 0 -> cont (adjacent: rel8-safe)
+        ; jmp =>budget_done      // rcx == 0 -> fall out to the budget exit
+        ; =>cont
+        ; jmp =>body_top         // near back-edge, reaches any block size
+        ; =>budget_done
+    );
+}
+
 /// Emit a whole block and return its entry offset. Calling convention
 /// (win64): `fn(cpu: *mut Cpu, budget: u64) -> retired: u64`.
 fn emit_block(ops: &mut Assembler, plan: &Plan, version: u64, stamp_slot: usize) -> AssemblyOffset {
@@ -796,8 +823,9 @@ fn emit_block(ops: &mut Assembler, plan: &Plan, version: u64, stamp_slot: usize)
                 dynasm!(ops ; .arch x64
                     ; lea r8, [r8 + ninsns as i32]
                     ; lea r11, [r11 + cyc_iter]
-                    ; loop =>body_top
                 );
+                emit_backedge(ops, body_top);
+                // rcx == 0: budget exhausted after a taken branch.
                 emit_exit(ops, plan, plan.start_rip, true, ninsns, Cyc::R11);
                 dynasm!(ops ; .arch x64
                     ; =>exit_ft
@@ -811,8 +839,8 @@ fn emit_block(ops: &mut Assembler, plan: &Plan, version: u64, stamp_slot: usize)
                 dynasm!(ops ; .arch x64
                     ; lea r8, [r8 + ninsns as i32]
                     ; lea r11, [r11 + cyc_iter]
-                    ; loop =>body_top
                 );
+                emit_backedge(ops, body_top);
                 emit_exit(ops, plan, plan.start_rip, true, ninsns, Cyc::R11);
             }
             Term::Fall { .. } => unreachable!("self_loop implies a branch terminator"),

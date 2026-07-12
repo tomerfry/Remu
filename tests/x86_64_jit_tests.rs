@@ -186,6 +186,31 @@ fn alu_ops_and_shifts() {
 }
 
 #[test]
+fn large_self_loop_backedge() {
+    // A self-loop whose body is far larger than a `loop` rel8 back-edge can
+    // reach (24 ALU ops before DEC/JNZ). Exercises the bounce trampoline; a
+    // direct `loop =>body_top` would fail to encode and panic at commit.
+    #[rustfmt::skip]
+    let mut p = vec![
+        0x48, 0xC7, 0xC1, 0x40, 0x00, 0x00, 0x00, // MOV RCX, 64
+        0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, // MOV RAX, 1
+        0x48, 0xC7, 0xC3, 0x03, 0x00, 0x00, 0x00, // MOV RBX, 3
+    ];
+    let loop_start = p.len();
+    // 24 ADD RAX, RBX (each 3 bytes of guest, several host bytes each).
+    for _ in 0..24 {
+        p.extend_from_slice(&[0x48, 0x01, 0xD8]); // ADD RAX, RBX
+    }
+    p.extend_from_slice(&[0x48, 0xFF, 0xC9]); // DEC RCX
+    let back = -((p.len() + 2 - loop_start) as i64) as i8;
+    p.extend_from_slice(&[0x75, back as u8]); // JNZ loop_start
+    let total = 3 + (24 + 1) * 64;
+    for chunk in [1u64, 41, 733] {
+        lockstep(&p, total, chunk);
+    }
+}
+
+#[test]
 fn smc_invalidates_jit_block() {
     // Run a tight loop enough to translate it, then overwrite the loop body
     // with a HLT via a guest store and confirm the CPU sees the new code

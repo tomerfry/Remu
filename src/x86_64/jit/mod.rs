@@ -196,7 +196,7 @@ impl Cpu {
                     if retired == 0 {
                         // Stale prologue exit: drop the block and step once so
                         // the loop makes progress (a fresh block re-translates).
-                        self.jit_evict(key);
+                        self.jit_evict(phys);
                         self.step_fast(bus);
                         executed += 1;
                     } else {
@@ -287,14 +287,11 @@ impl Cpu {
         };
     }
 
-    /// Remove a block from the direct-mapped table (its code stays in the
-    /// buffer until the next flush).
-    fn jit_evict(&mut self, key: u64) {
-        for slot in self.jit.table.iter_mut() {
-            if slot.key == key {
-                slot.key = 0;
-            }
-        }
+    /// Drop the block at `phys`'s direct-mapped slot (its code stays in the
+    /// buffer until the next flush). O(1): a physical address maps to exactly
+    /// one slot.
+    fn jit_evict(&mut self, phys: u64) {
+        self.jit.table[phys as usize & (JIT_SLOTS - 1)].key = 0;
     }
 
     /// Read the per-page write-stamp the way the icache does.
