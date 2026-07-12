@@ -90,7 +90,10 @@ fn main() -> ExitCode {
         if cpu.halted {
             // PC has already advanced past the KIL opcode byte.
             let jam_addr = cpu.regs.pc.wrapping_sub(1);
-            println!("halted (KIL) at ${jam_addr:04X} after {} cycles", cpu.cycles);
+            println!(
+                "halted (KIL) at ${jam_addr:04X} after {} cycles",
+                cpu.cycles
+            );
             break;
         }
         if trace {

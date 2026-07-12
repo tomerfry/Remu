@@ -72,7 +72,7 @@ const TIGHT16: &[u8] = &[
     0x75, 0xFD,             // 1007: JNZ 1006
     0x4A,                   // 1009: DEC DX
     0x75, 0xF7,             // 100A: JNZ 1003
-];                          // 100C: end
+]; // 100C: end
 
 #[rustfmt::skip]
 const ALU16: &[u8] = &[
@@ -87,7 +87,7 @@ const ALU16: &[u8] = &[
     0x75, 0xF3,             // 1014: JNZ 1009
     0x4A,                   // 1016: DEC DX
     0x75, 0xED,             // 1017: JNZ 1006
-];                          // 1019: end
+]; // 1019: end
 
 #[rustfmt::skip]
 const MEM16: &[u8] = &[
@@ -103,7 +103,7 @@ const MEM16: &[u8] = &[
     0x75, 0xF3,             // 1017: JNZ 100C
     0x4A,                   // 1019: DEC DX
     0x75, 0xED,             // 101A: JNZ 1009
-];                          // 101C: end
+]; // 101C: end
 
 #[rustfmt::skip]
 const CALL16: &[u8] = &[
@@ -118,7 +118,7 @@ const CALL16: &[u8] = &[
     0xEB, 0x02,             // 1012: JMP 1016
     0x40,                   // 1014: INC AX
     0xC3,                   // 1015: RET
-];                          // 1016: end
+]; // 1016: end
 
 fn bench_8086(name: &str, program: &[u8], instructions: u64, check: fn(&x86::Cpu) -> u64) {
     let mut mem = x86::LinearMemory::new();
@@ -154,7 +154,7 @@ const TIGHT32: &[u8] = &[
     0xB9, 0x00, 0x2D, 0x31, 0x01, // 1000: MOV ECX, 20000000
     0x49,                         // 1005: DEC ECX
     0x75, 0xFD,                   // 1006: JNZ 1005
-];                                // 1008: end
+]; // 1008: end
 
 #[rustfmt::skip]
 const ALU32: &[u8] = &[
@@ -167,7 +167,7 @@ const ALU32: &[u8] = &[
     0x29, 0xC8,                   // 101A: SUB EAX, ECX
     0x49,                         // 101C: DEC ECX
     0x75, 0xEB,                   // 101D: JNZ 100A
-];                                // 101F: end
+]; // 101F: end
 
 #[rustfmt::skip]
 const MEM32: &[u8] = &[
@@ -180,7 +180,7 @@ const MEM32: &[u8] = &[
     0x89, 0x04, 0x97,                   // 101A: MOV [EDI+EDX*4], EAX
     0x49,                               // 101D: DEC ECX
     0x75, 0xEF,                         // 101E: JNZ 100F
-];                                      // 1020: end
+]; // 1020: end
 
 #[rustfmt::skip]
 const CALL32: &[u8] = &[
@@ -192,7 +192,7 @@ const CALL32: &[u8] = &[
     0xEB, 0x02,                   // 1012: JMP 1016
     0x40,                         // 1014: INC EAX
     0xC3,                         // 1015: RET
-];                                // 1016: end
+]; // 1016: end
 
 /// 50,000 × `REP MOVSD` of 4 KiB (≈205 MB copied). A REP counts as one
 /// instruction in both harnesses, so the "MIPS" column is a relative
@@ -209,7 +209,7 @@ const REP32: &[u8] = &[
     0x4A,                         // 1016: DEC EDX
     0x75, 0xEC,                   // 1017: JNZ 1005
     0xA1, 0xFC, 0x4F, 0x10, 0x00, // 1019: MOV EAX, [0x104FFC] (last dword)
-];                                // 101E: end
+]; // 101E: end
 
 fn bench_386(name: &str, program: &[u8], instructions: u64, check: fn(&x86_32::Cpu) -> u64) {
     bench_386_inner(name, program, instructions, false, false, check);
@@ -280,10 +280,13 @@ fn bench_386_inner(
     for _ in 0..RUNS {
         cpu.regs.eip = 0x1000;
         let t = Instant::now();
-        for _ in 0..instructions {
-            cpu.step(&mut mem);
-        }
+        let r = cpu.run(&mut mem, instructions);
         times.push(t.elapsed().as_secs_f64());
+        assert_eq!(
+            r.executed, instructions,
+            "{name}: run() stopped early ({:?})",
+            r.exit
+        );
         assert_eq!(cpu.regs.eip, end, "{name}: did not land on the end address");
         assert!(!cpu.halted && !cpu.shutdown, "{name}: halted/shutdown");
     }
@@ -299,7 +302,7 @@ const TIGHT64: &[u8] = &[
     0x48, 0xC7, 0xC1, 0x00, 0x2D, 0x31, 0x01, // 10000: MOV RCX, 20000000
     0x48, 0xFF, 0xC9,                         // 10007: DEC RCX
     0x75, 0xFB,                               // 1000A: JNZ 10007
-];                                            // 1000C: end
+]; // 1000C: end
 
 #[rustfmt::skip]
 const ALU64: &[u8] = &[
@@ -312,7 +315,7 @@ const ALU64: &[u8] = &[
     0x48, 0x29, 0xC8,                                           // 10025: SUB RAX, RCX
     0x48, 0xFF, 0xC9,                                           // 10028: DEC RCX
     0x75, 0xE4,                                                 // 1002B: JNZ 10011
-];                                                              // 1002D: end
+]; // 1002D: end
 
 #[rustfmt::skip]
 const MEM64: &[u8] = &[
@@ -325,7 +328,7 @@ const MEM64: &[u8] = &[
     0x48, 0x89, 0x04, 0x97,                   // 10023: MOV [RDI+RDX*4], RAX
     0x48, 0xFF, 0xC9,                         // 10027: DEC RCX
     0x75, 0xE9,                               // 1002A: JNZ 10015
-];                                            // 1002C: end
+]; // 1002C: end
 
 #[rustfmt::skip]
 const CALL64: &[u8] = &[
@@ -337,7 +340,7 @@ const CALL64: &[u8] = &[
     0xEB, 0x04,                               // 10018: JMP 1001E
     0x48, 0xFF, 0xC0,                         // 1001A: INC RAX
     0xC3,                                     // 1001D: RET
-];                                            // 1001E: end
+]; // 1001E: end
 
 fn bench_x64(name: &str, program: &[u8], instructions: u64, check: fn(&x86_64::Cpu) -> u64) {
     let mut mem = x86_64::LinearMemory::new();
@@ -353,10 +356,13 @@ fn bench_x64(name: &str, program: &[u8], instructions: u64, check: fn(&x86_64::C
     for _ in 0..RUNS {
         cpu.regs.rip = 0x1_0000;
         let t = Instant::now();
-        for _ in 0..instructions {
-            cpu.step(&mut mem);
-        }
+        let r = cpu.run(&mut mem, instructions);
         times.push(t.elapsed().as_secs_f64());
+        assert_eq!(
+            r.executed, instructions,
+            "{name}: run() stopped early ({:?})",
+            r.exit
+        );
         assert_eq!(cpu.regs.rip, end, "{name}: did not land on the end address");
         assert!(!cpu.halted && !cpu.shutdown, "{name}: halted/shutdown");
     }
@@ -369,29 +375,57 @@ fn main() {
     println!("engine\tmode\tname\tinstructions\tbest_s\tmips\trun_s\tcheck");
 
     let per16 = |body: u64, outer: u64| outer * (1 + body * INNER16 + 2);
-    bench_8086("tight_loop", TIGHT16, 1 + per16(2, TIGHT16_OUTER), |c| c.regs.cx as u64);
-    bench_8086("alu_mix", ALU16, 2 + per16(6, ALU16_OUTER), |c| c.regs.ax as u64);
-    bench_8086("mem_rw", MEM16, 3 + per16(6, MEM16_OUTER), |c| c.regs.ax as u64);
-    bench_8086("call_ret", CALL16, 2 + per16(5, CALL16_OUTER) + 1, |c| c.regs.ax as u64);
+    bench_8086("tight_loop", TIGHT16, 1 + per16(2, TIGHT16_OUTER), |c| {
+        c.regs.cx as u64
+    });
+    bench_8086("alu_mix", ALU16, 2 + per16(6, ALU16_OUTER), |c| {
+        c.regs.ax as u64
+    });
+    bench_8086("mem_rw", MEM16, 3 + per16(6, MEM16_OUTER), |c| {
+        c.regs.ax as u64
+    });
+    bench_8086("call_ret", CALL16, 2 + per16(5, CALL16_OUTER) + 1, |c| {
+        c.regs.ax as u64
+    });
 
     use x86_32::reg::{EAX, ECX};
-    bench_386("tight_loop", TIGHT32, 1 + 2 * TIGHT_N, |c| c.regs.gpr[ECX as usize] as u64);
-    bench_386("alu_mix", ALU32, 2 + 7 * ALU_N, |c| c.regs.gpr[EAX as usize] as u64);
-    bench_386("mem_rw", MEM32, 3 + 6 * MEM_N, |c| c.regs.gpr[EAX as usize] as u64);
-    bench_386("call_ret", CALL32, 3 + 5 * CALL_N, |c| c.regs.gpr[EAX as usize] as u64);
+    bench_386("tight_loop", TIGHT32, 1 + 2 * TIGHT_N, |c| {
+        c.regs.gpr[ECX as usize] as u64
+    });
+    bench_386("alu_mix", ALU32, 2 + 7 * ALU_N, |c| {
+        c.regs.gpr[EAX as usize] as u64
+    });
+    bench_386("mem_rw", MEM32, 3 + 6 * MEM_N, |c| {
+        c.regs.gpr[EAX as usize] as u64
+    });
+    bench_386("call_ret", CALL32, 3 + 5 * CALL_N, |c| {
+        c.regs.gpr[EAX as usize] as u64
+    });
     bench_386_paged("tight_loop_pg", TIGHT32, 1 + 2 * TIGHT_N, |c| {
         c.regs.gpr[ECX as usize] as u64
     });
-    bench_386_paged("mem_rw_pg", MEM32, 3 + 6 * MEM_N, |c| c.regs.gpr[EAX as usize] as u64);
+    bench_386_paged("mem_rw_pg", MEM32, 3 + 6 * MEM_N, |c| {
+        c.regs.gpr[EAX as usize] as u64
+    });
     bench_386_ring3("tight_loop_r3", TIGHT32, 1 + 2 * TIGHT_N, |c| {
         c.regs.gpr[ECX as usize] as u64
     });
-    bench_386_ring3("mem_rw_r3", MEM32, 3 + 6 * MEM_N, |c| c.regs.gpr[EAX as usize] as u64);
-    bench_386("rep_movs", REP32, 2 + 6 * REP_OUTER, |c| c.regs.gpr[EAX as usize] as u64);
+    bench_386_ring3("mem_rw_r3", MEM32, 3 + 6 * MEM_N, |c| {
+        c.regs.gpr[EAX as usize] as u64
+    });
+    bench_386("rep_movs", REP32, 2 + 6 * REP_OUTER, |c| {
+        c.regs.gpr[EAX as usize] as u64
+    });
 
     use x86_64::reg::{RAX, RCX};
-    bench_x64("tight_loop", TIGHT64, 1 + 2 * TIGHT_N, |c| c.regs.gpr[RCX as usize]);
-    bench_x64("alu_mix", ALU64, 2 + 7 * ALU_N, |c| c.regs.gpr[RAX as usize]);
+    bench_x64("tight_loop", TIGHT64, 1 + 2 * TIGHT_N, |c| {
+        c.regs.gpr[RCX as usize]
+    });
+    bench_x64("alu_mix", ALU64, 2 + 7 * ALU_N, |c| {
+        c.regs.gpr[RAX as usize]
+    });
     bench_x64("mem_rw", MEM64, 3 + 6 * MEM_N, |c| c.regs.gpr[RAX as usize]);
-    bench_x64("call_ret", CALL64, 3 + 5 * CALL_N, |c| c.regs.gpr[RAX as usize]);
+    bench_x64("call_ret", CALL64, 3 + 5 * CALL_N, |c| {
+        c.regs.gpr[RAX as usize]
+    });
 }

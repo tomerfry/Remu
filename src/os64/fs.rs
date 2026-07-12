@@ -34,7 +34,10 @@ impl Vfs {
     }
 
     fn get(&mut self, fd: i64) -> Option<&mut Fd> {
-        usize::try_from(fd).ok().and_then(|i| self.fds.get_mut(i))?.as_mut()
+        usize::try_from(fd)
+            .ok()
+            .and_then(|i| self.fds.get_mut(i))?
+            .as_mut()
     }
 
     /// Place `f` in the lowest free slot; returns its number.

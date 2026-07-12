@@ -7,9 +7,7 @@ use std::rc::Rc;
 
 use remu::Cpu;
 use remu::bus::Bus;
-use remu::device::uart::{
-    self, LSR_DATA_READY, LSR_THR_EMPTY, LSR_TX_IDLE, Uart16550,
-};
+use remu::device::uart::{self, LSR_DATA_READY, LSR_THR_EMPTY, LSR_TX_IDLE, Uart16550};
 use remu::device::{Device, SystemBus};
 
 /// Where the UART's 8-byte register window lives in the guest address space.
@@ -81,7 +79,11 @@ fn dlab_redirects_divisor_latch_without_transmitting() {
     uart.write(uart::IER, 0x03);
     assert_eq!(uart.read(uart::RBR_THR), 0x0C);
     assert_eq!(uart.read(uart::IER), 0x03);
-    assert_eq!(out.contents(), b"", "divisor writes must not reach the output");
+    assert_eq!(
+        out.contents(),
+        b"",
+        "divisor writes must not reach the output"
+    );
 
     // DLAB cleared: offset 0 transmits again and IER is back.
     uart.write(uart::LCR, 0x00);

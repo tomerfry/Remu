@@ -124,6 +124,14 @@ fn bench_386(c: &mut Criterion, name: &str, program: &[u8]) {
             black_box(cpu.cycles)
         })
     });
+    // The same program through the batched entry point, so the step()-loop
+    // vs run() delta stays measurable.
+    group.bench_function(format!("{name}_run"), |b| {
+        b.iter(|| {
+            black_box(cpu.run(&mut mem, STEPS));
+            black_box(cpu.cycles)
+        })
+    });
     group.finish();
 
     assert!(!cpu.halted, "benchmark program {name} halted");
@@ -188,6 +196,14 @@ fn bench_x64(c: &mut Criterion, name: &str, program: &[u8]) {
             for _ in 0..STEPS {
                 cpu.step(&mut mem);
             }
+            black_box(cpu.cycles)
+        })
+    });
+    // The same program through the batched entry point, so the step()-loop
+    // vs run() delta stays measurable.
+    group.bench_function(format!("{name}_run"), |b| {
+        b.iter(|| {
+            black_box(cpu.run(&mut mem, STEPS));
             black_box(cpu.cycles)
         })
     });

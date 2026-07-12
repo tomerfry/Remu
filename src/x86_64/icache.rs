@@ -128,7 +128,7 @@ impl Cpu {
     /// The caller (`exec_one`) refreshes `self.m64` before probing.
     #[inline(always)]
     pub(crate) fn icache_ctx(&self) -> u64 {
-        ((self.regs.cr0 & cr0::PE as u64) << 60)
+        ((self.regs.cr0 & cr0::PE) << 60)
             | ((self.regs.rflags.bits() as u64 & RFlags::VM.bits() as u64) << 44)
             | ((self.m64 as u64) << 62)
             | ((self.regs.seg[reg::CS as usize].attrs as u64 & 0x400) << 53)
@@ -189,7 +189,6 @@ impl Cpu {
 
 #[cfg(test)]
 mod tests {
-    use super::super::registers::reg;
     use super::super::{Cpu, LinearMemory};
 
     fn run_until_halt(cpu: &mut Cpu, mem: &mut LinearMemory, cap: u32) {
@@ -207,10 +206,16 @@ mod tests {
     /// preset).
     fn map_one(mem: &mut LinearMemory, root: u64, va: u64, pa: u64) {
         let (pdpt, pd, pt) = (root + 0x1000, root + 0x2000, root + 0x3000);
-        mem.load(root + ((va >> 39) & 0x1FF) * 8, &(pdpt | 0x67).to_le_bytes());
+        mem.load(
+            root + ((va >> 39) & 0x1FF) * 8,
+            &(pdpt | 0x67).to_le_bytes(),
+        );
         mem.load(pdpt + ((va >> 30) & 0x1FF) * 8, &(pd | 0x67).to_le_bytes());
         mem.load(pd + ((va >> 21) & 0x1FF) * 8, &(pt | 0x67).to_le_bytes());
-        mem.load(pt + ((va >> 12) & 0x1FF) * 8, &((pa & !0xFFF) | 0x67).to_le_bytes());
+        mem.load(
+            pt + ((va >> 12) & 0x1FF) * 8,
+            &((pa & !0xFFF) | 0x67).to_le_bytes(),
+        );
     }
 
     /// (c) CR3 remap, same linear page to different physical frames: the
@@ -236,7 +241,7 @@ mod tests {
         // After a CR3 switch the fetch-translation cache is cold, so the
         // first run never probes; each phase runs the snippet twice (warm
         // the fetch tag, then fill or hit).
-        let mut go = |cpu: &mut Cpu, mem: &mut LinearMemory| {
+        let go = |cpu: &mut Cpu, mem: &mut LinearMemory| {
             cpu.regs.rip = VA;
             cpu.halted = false;
             run_until_halt(cpu, mem, 10);
@@ -362,7 +367,7 @@ mod tests {
         let mut cpu = Cpu::new();
         cpu.setup_long_flat(&mut mem, 0x1_0000, 0x20_0000);
 
-        let mut run = |cpu: &mut Cpu, mem: &mut LinearMemory| {
+        let run = |cpu: &mut Cpu, mem: &mut LinearMemory| {
             cpu.regs.rip = 0x1_0000;
             cpu.halted = false;
             let mut cycles = Vec::new();

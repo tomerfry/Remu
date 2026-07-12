@@ -378,3 +378,100 @@ Closing the remaining pure-ALU gap needs per-*trace* amortization of the
 probe + snapshot + event checks (the P4 `events_pending` fold and
 `run(&mut bus, n)` entry point remain open alongside it), and beyond that
 the P5 JIT.
+
+---
+
+## 8. P4 + JIT cycle (2026-07-12)
+
+Cycle developed on branch `enhancing-performance`. Two efforts: **P4**, the
+interpreter-tier cleanups §4 named (events fold, `run(n)`, `#[cold]` paths),
+applied to *both* the 386 and x86-64 cores; and a **feature-gated template
+JIT** (`--features jit`, `src/x86_64/jit/`) for the x86-64 core — the §4 P5
+item, off by default with the interpreter kept as its reference and fallback.
+
+Correction to §7's framing: 32-bit **non-paged** `mem_rw` is also a Unicorn
+win (135 vs 199), not just the paged variant. "Beats Unicorn on every memory
+workload" holds for 16-bit and 64-bit modes and REP MOVS; in 32-bit, Remu
+wins `call_ret` and `rep_movs` but not `mem_rw`.
+
+### 8.1 P4 — events fold + run(n)
+
+The per-step preamble (5 event branches + an unconditional inhibit clear + a
+TF read) collapses to one `boundary_pending()` predicate over an `events: u8`
+bitmask; `step()` splits into an inline fast path and a `#[cold]` slow path,
+with the fault rewind in a shared `#[cold]` epilogue. `run(&mut bus, n)`
+retires a batch and returns `RunExit::{Completed,HostTrap,Halted,Shutdown}`;
+os/os64 drive it (usermode stays on `step_one` — its segv latch is bus-side).
+A per-iteration `host_trap` probe cost 2–5%, so a recorded trap now rings an
+`EVT_HOST_TRAP` doorbell bit and the run loop tests one predicate.
+
+Criterion (Melem/s = MIPS), interpreter, vs the post-P3 baseline:
+
+| Core | Workload | Before | After | Δ |
+|---|---|---:|---:|---:|
+| 386 | tight_loop | 184 | 193 | +5.0% |
+| 386 | alu (arith) | 129 | 133 | +2.9% |
+| 386 | call_ret | 154 | 160 | +3.6% |
+| x64 | tight_loop | 102 | 105 | +2.6% |
+| x64 | alu (arith) | 95 | 96.6 | +1.6% |
+| x64 | call_ret | 95.5 | 99.5 | +4.3% |
+
+Short-circuit `||` in `boundary_pending()` is load-bearing — a fused bitwise
+`|` regressed 386 tight_loop 8% (the branch stalls on all four loads). The
+cycles-batching experiment (§4 commit 4) was measured and **rejected**: no
+gain on tight/call, −4–5% on alu_run (extra local-accumulator bookkeeping),
+and it would quantize guest RDTSC to block boundaries.
+
+### 8.2 JIT — stages A + B (x86-64, `--features jit`)
+
+dynasm-rs template JIT reached through `run()`. Guest regs stay memory-
+resident (`[rbp+off]`); guest flags ride the host EFLAGS and materialize into
+`regs.rflags` only at block exits. Blocks are single-page, keyed
+`phys|icache_ctx()`, and revalidate in their own prologue against the icache
+write-stamp + O(1) inval clock — so guest code writes self-invalidate them.
+A self-looping block bounds iterations with `loop` (flag-preserving) and
+carries the `run(n)` budget in a host register, retiring exactly `n`. Cycle
+weights mirror `exec_decoded`, keeping `Cpu::cycles` in lockstep.
+
+- **Stage A**: MOV reg,imm; INC/DEC reg; Jcc; JMP rel; self-loop detection.
+- **Stage B**: register ALU (ADD/OR/ADC/SBB/AND/SUB/XOR/CMP r/r + r/imm),
+  immediate shifts/rotates, two-operand IMUL — gated by a per-flag exactness
+  state machine. Host and guest disagree on *undefined* flags (AND/OR/XOR's
+  AF, multi-bit shift/rotate OF, IMUL's SF/ZF/PF); the translator tracks each
+  flag as exact/const/garbage and takes the longest block prefix ending with
+  no garbage flag where every consumer reads only exact flags.
+
+x86-64 MIPS (best of 5), interpreter (P4) vs JIT-on, vs Unicorn:
+
+| Workload | Interp | JIT | Unicorn | JIT standing |
+|---|---:|---:|---:|---|
+| tight_loop | 105 | **10406** | 903 | **11.5× Unicorn** |
+| alu_mix | 91 | **5205** | 1415 | **3.7× Unicorn** |
+| mem_rw | 94 | 97.5 | 53 | **1.8× Unicorn** (not yet JIT'd) |
+| call_ret | 95 | 97.7 | 148 | Unicorn 1.5× (not yet JIT'd) |
+
+The two workloads Unicorn dominated (its TCG JIT vs an interpreter) are now
+decisive Remu wins. `mem_rw`/`call_ret` are not yet translated (their blocks
+contain memory and call/ret); they no longer *regress* under the feature
+because untranslatable heads are marked with a version-tagged COLD sentinel
+in the block table (no per-instruction hash lookup on the fallback path).
+
+Differential net (`tests/x86_64_jit_tests.rs`): chunked lockstep of `run()`
+(JIT) vs `step()` (interpreter) over prime chunk sizes asserts identical
+registers, **cycles** and RAM; covers the exact alu_mix body, an ALU/shift
+sweep, 32/64-bit zero-extension, and SMC invalidation. Feature off = byte-
+identical to before; all suites green both ways incl. MOO 80386 (1.76M).
+
+### 8.3 Open (next cycle)
+
+- **JIT stage C — block chaining**: patch direct-branch exits to jump
+  straight to the successor block instead of returning to the dispatcher
+  (translation-time chaining for constant targets first; backpatching via
+  `Assembler::alter` after an API spike).
+- **JIT stage D — memory + stack ops**: `MOV`/ALU with memory operands,
+  PUSH/POP, CALL/RET via `extern "win64"` helpers wrapping the interpreter's
+  `read*/write*/push*/pop*` (per-`Bus` monomorphization, `TypeId` flush);
+  faults side-exit and re-execute in the interpreter. Unlocks JIT for
+  `mem_rw` and `call_ret` (the last Unicorn loss).
+- **386 JIT port** (same infra) and **usermode segv → CPU-visible exception**
+  (so usermode can adopt `run(n)`).

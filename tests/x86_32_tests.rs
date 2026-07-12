@@ -3,7 +3,7 @@
 //! protected-mode plumbing. These give readable failures before reaching for
 //! the exhaustive SingleStepTests suite.
 
-use remu::x86_32::{Cpu, DescTable, EFlags, HostTrap, LinearMemory, SegReg, reg};
+use remu::x86_32::{Cpu, DescTable, EFlags, HostTrap, LinearMemory, RunExit, SegReg, reg};
 
 /// Build a CPU + flat memory with `program` at `0000:1100`, a sane stack and
 /// real-mode defaults (mirrors the SingleStepTests rig conventions).
@@ -1131,7 +1131,11 @@ fn call_gate_inner_stack_fault_restores_outer_ss() {
         ss_before,
         "the committed inner SS cache must be rewound after the push fault"
     );
-    assert_eq!(cpu.regs.gpr[reg::ESP as usize], 0x6000, "outer ESP restored");
+    assert_eq!(
+        cpu.regs.gpr[reg::ESP as usize],
+        0x6000,
+        "outer ESP restored"
+    );
     assert_eq!(cpu.regs.seg[reg::CS as usize], cs_before);
     assert_eq!(cpu.cpl(), 3);
     assert_eq!(cpu.regs.eip, 0x4000, "EIP rewinds to the CALL");
@@ -1375,4 +1379,143 @@ fn rep_string_is_interruptible() {
 
     cpu.step(&mut mem); // the pending interrupt is taken
     assert_eq!(cpu.regs.eip, 0x8000);
+}
+
+// --- run(): batched execution with boundary-exit reasons ---------------------
+
+#[test]
+fn run_matches_step_loop() {
+    // A DEC/JNZ loop batched through run() must retire the same state and
+    // cycle count as the equivalent step() loop.
+    #[rustfmt::skip]
+    let prog = [
+        0x66, 0xB9, 0x40, 0x00, 0x00, 0x00, // MOV ECX, 64
+        0x66, 0x49,                         // DEC ECX
+        0x75, 0xFC,                         // JNZ -4
+    ];
+    let (mut a, mut ma) = setup(&prog);
+    let (mut b, mut mb) = setup(&prog);
+    let n = 1 + 2 * 64;
+    let r = a.run(&mut ma, n);
+    assert_eq!(r.executed, n);
+    assert_eq!(r.exit, RunExit::Completed);
+    for _ in 0..n {
+        b.step(&mut mb);
+    }
+    assert_eq!(a.regs, b.regs);
+    assert_eq!(a.cycles, b.cycles);
+    assert_eq!(a.regs.eip, 0x110A);
+}
+
+#[test]
+fn run_sti_shadow_defers_delivery_one_instruction() {
+    // STI's shadow lets exactly one more instruction run before a pending
+    // interrupt is taken — including when each instruction is its own
+    // run() call, since the shadow is CPU state.
+    for split in [false, true] {
+        let (mut cpu, mut mem) = setup(&[0xFB, 0x90, 0x40]); // STI; NOP; INC AX
+        mem.load(0x20 * 4, &[0x00, 0x80, 0x00, 0x00]); // IVT 20h -> 0000:8000
+        cpu.assert_intr(0x20);
+        if split {
+            assert_eq!(cpu.run(&mut mem, 1).executed, 1); // STI
+            assert_eq!(cpu.regs.eip, 0x1101);
+            assert_eq!(cpu.run(&mut mem, 1).executed, 1); // NOP, shadowed
+            assert_eq!(
+                cpu.regs.eip, 0x1102,
+                "the shadow must survive a run() boundary"
+            );
+            assert_eq!(cpu.run(&mut mem, 1).executed, 1); // delivery
+        } else {
+            assert_eq!(cpu.run(&mut mem, 3).executed, 3);
+        }
+        assert_eq!(cpu.regs.eip, 0x8000, "handler reached");
+        // Return address on the real-mode frame: the INC AX after the NOP.
+        let ip = u16::from_le_bytes(mem.ram[0x9FFEA..0x9FFEC].try_into().unwrap());
+        assert_eq!(ip, 0x1102, "delivery deferred past exactly one instruction");
+        assert_eq!(cpu.regs.gpr[0], 0, "INC AX must not have run");
+    }
+}
+
+#[test]
+fn run_mov_ss_shadow_suppresses_single_step() {
+    // With TF set, MOV SS suppresses its own #DB; the trap fires after the
+    // next instruction instead.
+    let (mut cpu, mut mem) = setup(&[0x8E, 0xD0, 0x90]); // MOV SS, AX; NOP
+    mem.load(4, &[0x00, 0x81, 0x00, 0x00]); // IVT 1 -> 0000:8100
+    cpu.regs.gpr[0] = 0x9000; // reload SS with its current value
+    cpu.regs.eflags.insert(EFlags::TF);
+    let r = cpu.run(&mut mem, 2);
+    assert_eq!(r.executed, 2);
+    assert_eq!(cpu.regs.eip, 0x8100, "#DB handler reached");
+    let ip = u16::from_le_bytes(mem.ram[0x9FFEA..0x9FFEC].try_into().unwrap());
+    assert_eq!(ip, 0x1103, "the trap fires after the NOP, not after MOV SS");
+}
+
+#[test]
+fn run_tf_single_steps_each_instruction() {
+    // TF raises one #DB per instruction; IRET restores TF from the pushed
+    // flags, so the next instruction traps again.
+    let (mut cpu, mut mem) = setup(&[0x90, 0x90]); // NOP; NOP
+    mem.load(4, &[0x00, 0x81, 0x00, 0x00]); // IVT 1 -> 0000:8100
+    mem.load(0x8100, &[0xCF]); // IRET
+    cpu.regs.eflags.insert(EFlags::TF);
+    // Units: NOP+#DB, IRET, NOP+#DB, IRET.
+    let r = cpu.run(&mut mem, 4);
+    assert_eq!(r.executed, 4);
+    assert_eq!(r.exit, RunExit::Completed);
+    assert_eq!(cpu.regs.eip, 0x1102, "two NOPs retired, one trap each");
+    assert!(cpu.regs.eflags.contains(EFlags::TF), "IRET restored TF");
+}
+
+#[test]
+fn run_returns_halted_instead_of_idling_and_nmi_wakes() {
+    let (mut cpu, mut mem) = setup(&[0x40, 0xF4, 0x40]); // INC AX; HLT; INC AX
+    mem.load(2 * 4, &[0x00, 0x82, 0x00, 0x00]); // IVT 2 -> 0000:8200
+    mem.load(0x8200, &[0xCF]); // IRET
+    let r = cpu.run(&mut mem, 100);
+    assert_eq!(
+        r.executed, 2,
+        "HLT retires, then run() returns, no idle burn"
+    );
+    assert_eq!(r.exit, RunExit::Halted);
+    assert_eq!(cpu.regs.gpr[0], 1);
+
+    cpu.trigger_nmi();
+    let r = cpu.run(&mut mem, 3); // NMI delivery, IRET, INC AX
+    assert_eq!(r.executed, 3);
+    assert_eq!(r.exit, RunExit::Completed);
+    assert_eq!(cpu.regs.gpr[0], 2, "execution resumed after the HLT");
+    assert_eq!(cpu.regs.eip, 0x1103);
+}
+
+#[test]
+fn run_stops_at_host_trap_and_resumes() {
+    let (mut cpu, mut mem) = setup(&[0x40, 0xCD, 0x80, 0x40]); // INC AX; INT 80h; INC AX
+    cpu.syscall_int = Some(0x80);
+    let r = cpu.run(&mut mem, 100);
+    assert_eq!(r.exit, RunExit::HostTrap);
+    assert_eq!(r.executed, 2);
+    assert_eq!(cpu.regs.gpr[0], 1, "nothing ran past the trap");
+    assert_eq!(cpu.regs.eip, 0x1103, "EIP points past INT 80h");
+    assert_eq!(cpu.host_trap.take(), Some(HostTrap::Syscall));
+    let r = cpu.run(&mut mem, 1);
+    assert_eq!(r.exit, RunExit::Completed);
+    assert_eq!(cpu.regs.gpr[0], 2, "run resumes after the trap is serviced");
+}
+
+#[test]
+fn run_entry_states() {
+    let (mut cpu, mut mem) = setup(&[0x90]);
+    // n = 0 executes nothing.
+    let r = cpu.run(&mut mem, 0);
+    assert_eq!((r.executed, r.exit), (0, RunExit::Completed));
+    // A pre-set host trap exits before executing anything.
+    cpu.host_trap = Some(HostTrap::Syscall);
+    let r = cpu.run(&mut mem, 5);
+    assert_eq!((r.executed, r.exit), (0, RunExit::HostTrap));
+    cpu.host_trap = None;
+    // Shutdown exits immediately.
+    cpu.shutdown = true;
+    let r = cpu.run(&mut mem, 5);
+    assert_eq!((r.executed, r.exit), (0, RunExit::Shutdown));
 }

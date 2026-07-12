@@ -122,7 +122,9 @@ impl PhysMem {
         let off = (addr & PAGE_MASK) as usize;
         match self.frame(addr >> 12) {
             Some(f) if off + 8 <= FRAME => u64::from_le_bytes(f[off..off + 8].try_into().unwrap()),
-            _ => (0..8).fold(0u64, |acc, i| acc | (self.load8(addr + i) as u64) << (8 * i)),
+            _ => (0..8).fold(0u64, |acc, i| {
+                acc | (self.load8(addr + i) as u64) << (8 * i)
+            }),
         }
     }
 
@@ -186,7 +188,9 @@ impl Bus for PhysMem {
         let off = (addr & PAGE_MASK) as usize;
         match self.frame(addr >> 12) {
             Some(f) if off + 4 <= FRAME => u32::from_le_bytes(f[off..off + 4].try_into().unwrap()),
-            _ => (0..4).fold(0u32, |acc, i| acc | (self.load8(addr + i) as u32) << (8 * i)),
+            _ => (0..4).fold(0u32, |acc, i| {
+                acc | (self.load8(addr + i) as u32) << (8 * i)
+            }),
         }
     }
 
@@ -559,7 +563,13 @@ mod tests {
         let mut a = AddressSpace::new(&mut mem);
         // A high canonical address exercises all four table levels.
         let lin = 0x0000_5555_5555_6000;
-        a.map(&mut mem, lin, 0x2000, PROT_READ | PROT_WRITE, VmaKind::Image);
+        a.map(
+            &mut mem,
+            lin,
+            0x2000,
+            PROT_READ | PROT_WRITE,
+            VmaKind::Image,
+        );
         assert!(a.resolve(&mem, lin).is_some());
         assert!(a.write_bytes(&mut mem, lin + 0x123, b"hello"));
         let mut buf = [0u8; 5];
@@ -594,11 +604,25 @@ mod tests {
         // debug-build panic). These run in debug, so a regression would panic.
         let mut mem = PhysMem::new();
         let mut a = AddressSpace::new(&mut mem);
-        assert_eq!(a.mmap(&mut mem, u64::MAX, PROT_READ), 0, "absurd mmap is rejected");
+        assert_eq!(
+            a.mmap(&mut mem, u64::MAX, PROT_READ),
+            0,
+            "absurd mmap is rejected"
+        );
         a.init_brk(0x40_0000);
-        assert_eq!(a.set_brk(&mut mem, u64::MAX), 0x40_0000, "absurd brk is a no-op");
+        assert_eq!(
+            a.set_brk(&mut mem, u64::MAX),
+            0x40_0000,
+            "absurd brk is a no-op"
+        );
         // A map whose start+len wraps must not panic; it maps a saturated range.
-        a.map(&mut mem, u64::MAX - 0x100, 0x1000, PROT_READ, VmaKind::Mapping);
+        a.map(
+            &mut mem,
+            u64::MAX - 0x100,
+            0x1000,
+            PROT_READ,
+            VmaKind::Mapping,
+        );
     }
 
     #[test]

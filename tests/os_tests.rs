@@ -18,7 +18,11 @@ fn build_elf(mut code_with_dataref: impl FnMut(u32) -> (Vec<u8>, Vec<u8>)) -> Ve
     let (code0, _) = code_with_dataref(0);
     let data_addr = base + code_off + code0.len() as u32;
     let (code, data) = code_with_dataref(data_addr);
-    assert_eq!(code.len(), code0.len(), "code length must not depend on the data address");
+    assert_eq!(
+        code.len(),
+        code0.len(),
+        "code length must not depend on the data address"
+    );
 
     let entry = base + code_off;
     let total = code_off + code.len() as u32 + data.len() as u32;
@@ -289,7 +293,11 @@ fn sandbox_contains_parent_traversal() {
     let root = std::env::temp_dir().join("remu_rootfs_test");
     std::fs::create_dir_all(&root).unwrap();
     // A tempting file OUTSIDE the rootfs (a sibling); the guest must not open it.
-    std::fs::write(root.parent().unwrap().join("remu_escape_target.txt"), b"secret").unwrap();
+    std::fs::write(
+        root.parent().unwrap().join("remu_escape_target.txt"),
+        b"secret",
+    )
+    .unwrap();
 
     let path_str = b"/../remu_escape_target.txt\0";
     let elf = build_elf(|data_addr| {

@@ -1374,7 +1374,7 @@ impl Cpu {
                 self.write_reg_osize(d.reg, if taken { v } else { cur });
                 Ok(if op.is_mem() { 5 } else { 4 })
             }
-        _ => unreachable!("hot-subset op reached the extended arm"),
+            _ => unreachable!("hot-subset op reached the extended arm"),
         }
     }
 }
@@ -1443,7 +1443,14 @@ mod tests {
     #[test]
     fn ea_formula_matches_modrm_exhaustive_64() {
         let (mut cpu, mut mem) = setup64(&[]);
-        for rex in [None, Some(0x40u8), Some(0x41), Some(0x42), Some(0x44), Some(0x4F)] {
+        for rex in [
+            None,
+            Some(0x40u8),
+            Some(0x41),
+            Some(0x42),
+            Some(0x44),
+            Some(0x4F),
+        ] {
             for modrm in 0..=255u8 {
                 let bytes = [modrm, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC];
                 mem.load(0x1_0000, &bytes);

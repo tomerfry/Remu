@@ -4,7 +4,7 @@
 
 use crate::os::abi::auxv;
 use crate::os::loader::ElfImage;
-use crate::os::memory::{AddressSpace, PhysMem, PAGE_SIZE, STACK_TOP};
+use crate::os::memory::{AddressSpace, PAGE_SIZE, PhysMem, STACK_TOP};
 
 /// 16 fixed bytes for `AT_RANDOM` (determinism aids testing; true entropy is
 /// not required for correctness).

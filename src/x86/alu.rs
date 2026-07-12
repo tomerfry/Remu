@@ -10,226 +10,245 @@
 //! multiplies, `OF` after multi-bit shifts, …) we still set it to a fixed,
 //! deterministic value; the SingleStepTests harness masks those bits.
 
-use super::registers::Flags;
 use super::Cpu;
+use super::registers::Flags;
 
 macro_rules! alu_width {
     ($t:ty, $wide:ty, $swide:ty, $sign:literal, $bits:literal, $szp:ident,
      $add:ident, $adc:ident, $sub:ident, $sbb:ident, $and:ident, $or:ident, $xor:ident,
      $inc:ident, $dec:ident, $neg:ident,
      $rol:ident, $ror:ident, $rcl:ident, $rcr:ident, $shl:ident, $shr:ident, $sar:ident) => {
-impl Cpu {
-    #[inline]
-    pub(crate) fn $add(&mut self, a: $t, b: $t) -> $t {
-        let r = a.wrapping_add(b);
-        let f = &mut self.regs.flags;
-        f.set(Flags::CF, (a as $wide) + (b as $wide) > <$t>::MAX as $wide);
-        f.set(Flags::AF, (a ^ b ^ r) & 0x10 != 0);
-        f.set(Flags::OF, (a ^ r) & (b ^ r) & $sign != 0);
-        f.$szp(r);
-        r
-    }
+        impl Cpu {
+            #[inline]
+            pub(crate) fn $add(&mut self, a: $t, b: $t) -> $t {
+                let r = a.wrapping_add(b);
+                let f = &mut self.regs.flags;
+                f.set(Flags::CF, (a as $wide) + (b as $wide) > <$t>::MAX as $wide);
+                f.set(Flags::AF, (a ^ b ^ r) & 0x10 != 0);
+                f.set(Flags::OF, (a ^ r) & (b ^ r) & $sign != 0);
+                f.$szp(r);
+                r
+            }
 
-    #[inline]
-    pub(crate) fn $adc(&mut self, a: $t, b: $t) -> $t {
-        let c = self.regs.flags.contains(Flags::CF) as $t;
-        let r = a.wrapping_add(b).wrapping_add(c);
-        let f = &mut self.regs.flags;
-        f.set(Flags::CF, (a as $wide) + (b as $wide) + (c as $wide) > <$t>::MAX as $wide);
-        f.set(Flags::AF, (a ^ b ^ r) & 0x10 != 0);
-        f.set(Flags::OF, (a ^ r) & (b ^ r) & $sign != 0);
-        f.$szp(r);
-        r
-    }
+            #[inline]
+            pub(crate) fn $adc(&mut self, a: $t, b: $t) -> $t {
+                let c = self.regs.flags.contains(Flags::CF) as $t;
+                let r = a.wrapping_add(b).wrapping_add(c);
+                let f = &mut self.regs.flags;
+                f.set(
+                    Flags::CF,
+                    (a as $wide) + (b as $wide) + (c as $wide) > <$t>::MAX as $wide,
+                );
+                f.set(Flags::AF, (a ^ b ^ r) & 0x10 != 0);
+                f.set(Flags::OF, (a ^ r) & (b ^ r) & $sign != 0);
+                f.$szp(r);
+                r
+            }
 
-    #[inline]
-    pub(crate) fn $sub(&mut self, a: $t, b: $t) -> $t {
-        let r = a.wrapping_sub(b);
-        let f = &mut self.regs.flags;
-        f.set(Flags::CF, (b as $wide) > (a as $wide));
-        f.set(Flags::AF, (a ^ b ^ r) & 0x10 != 0);
-        f.set(Flags::OF, (a ^ b) & (a ^ r) & $sign != 0);
-        f.$szp(r);
-        r
-    }
+            #[inline]
+            pub(crate) fn $sub(&mut self, a: $t, b: $t) -> $t {
+                let r = a.wrapping_sub(b);
+                let f = &mut self.regs.flags;
+                f.set(Flags::CF, (b as $wide) > (a as $wide));
+                f.set(Flags::AF, (a ^ b ^ r) & 0x10 != 0);
+                f.set(Flags::OF, (a ^ b) & (a ^ r) & $sign != 0);
+                f.$szp(r);
+                r
+            }
 
-    #[inline]
-    pub(crate) fn $sbb(&mut self, a: $t, b: $t) -> $t {
-        let c = self.regs.flags.contains(Flags::CF) as $t;
-        let r = a.wrapping_sub(b).wrapping_sub(c);
-        let f = &mut self.regs.flags;
-        f.set(Flags::CF, (b as $wide) + (c as $wide) > a as $wide);
-        f.set(Flags::AF, (a ^ b ^ r) & 0x10 != 0);
-        f.set(Flags::OF, (a ^ b) & (a ^ r) & $sign != 0);
-        f.$szp(r);
-        r
-    }
+            #[inline]
+            pub(crate) fn $sbb(&mut self, a: $t, b: $t) -> $t {
+                let c = self.regs.flags.contains(Flags::CF) as $t;
+                let r = a.wrapping_sub(b).wrapping_sub(c);
+                let f = &mut self.regs.flags;
+                f.set(Flags::CF, (b as $wide) + (c as $wide) > a as $wide);
+                f.set(Flags::AF, (a ^ b ^ r) & 0x10 != 0);
+                f.set(Flags::OF, (a ^ b) & (a ^ r) & $sign != 0);
+                f.$szp(r);
+                r
+            }
 
-    #[inline]
-    pub(crate) fn $and(&mut self, a: $t, b: $t) -> $t {
-        let r = a & b;
-        let f = &mut self.regs.flags;
-        f.remove(Flags::CF | Flags::OF | Flags::AF);
-        f.$szp(r);
-        r
-    }
+            #[inline]
+            pub(crate) fn $and(&mut self, a: $t, b: $t) -> $t {
+                let r = a & b;
+                let f = &mut self.regs.flags;
+                f.remove(Flags::CF | Flags::OF | Flags::AF);
+                f.$szp(r);
+                r
+            }
 
-    #[inline]
-    pub(crate) fn $or(&mut self, a: $t, b: $t) -> $t {
-        let r = a | b;
-        let f = &mut self.regs.flags;
-        f.remove(Flags::CF | Flags::OF | Flags::AF);
-        f.$szp(r);
-        r
-    }
+            #[inline]
+            pub(crate) fn $or(&mut self, a: $t, b: $t) -> $t {
+                let r = a | b;
+                let f = &mut self.regs.flags;
+                f.remove(Flags::CF | Flags::OF | Flags::AF);
+                f.$szp(r);
+                r
+            }
 
-    #[inline]
-    pub(crate) fn $xor(&mut self, a: $t, b: $t) -> $t {
-        let r = a ^ b;
-        let f = &mut self.regs.flags;
-        f.remove(Flags::CF | Flags::OF | Flags::AF);
-        f.$szp(r);
-        r
-    }
+            #[inline]
+            pub(crate) fn $xor(&mut self, a: $t, b: $t) -> $t {
+                let r = a ^ b;
+                let f = &mut self.regs.flags;
+                f.remove(Flags::CF | Flags::OF | Flags::AF);
+                f.$szp(r);
+                r
+            }
 
-    /// `INC`: like add-1 but `CF` is preserved.
-    #[inline]
-    pub(crate) fn $inc(&mut self, a: $t) -> $t {
-        let r = a.wrapping_add(1);
-        let f = &mut self.regs.flags;
-        f.set(Flags::AF, a & 0xF == 0xF);
-        f.set(Flags::OF, r & $sign != 0 && a & $sign == 0);
-        f.$szp(r);
-        r
-    }
+            /// `INC`: like add-1 but `CF` is preserved.
+            #[inline]
+            pub(crate) fn $inc(&mut self, a: $t) -> $t {
+                let r = a.wrapping_add(1);
+                let f = &mut self.regs.flags;
+                f.set(Flags::AF, a & 0xF == 0xF);
+                f.set(Flags::OF, r & $sign != 0 && a & $sign == 0);
+                f.$szp(r);
+                r
+            }
 
-    /// `DEC`: like sub-1 but `CF` is preserved.
-    #[inline]
-    pub(crate) fn $dec(&mut self, a: $t) -> $t {
-        let r = a.wrapping_sub(1);
-        let f = &mut self.regs.flags;
-        f.set(Flags::AF, a & 0xF == 0);
-        f.set(Flags::OF, a & $sign != 0 && r & $sign == 0);
-        f.$szp(r);
-        r
-    }
+            /// `DEC`: like sub-1 but `CF` is preserved.
+            #[inline]
+            pub(crate) fn $dec(&mut self, a: $t) -> $t {
+                let r = a.wrapping_sub(1);
+                let f = &mut self.regs.flags;
+                f.set(Flags::AF, a & 0xF == 0);
+                f.set(Flags::OF, a & $sign != 0 && r & $sign == 0);
+                f.$szp(r);
+                r
+            }
 
-    #[inline]
-    pub(crate) fn $neg(&mut self, a: $t) -> $t {
-        let r = (0 as $t).wrapping_sub(a);
-        let f = &mut self.regs.flags;
-        f.set(Flags::CF, a != 0);
-        f.set(Flags::AF, a & 0xF != 0);
-        f.set(Flags::OF, a == $sign);
-        f.$szp(r);
-        r
-    }
+            #[inline]
+            pub(crate) fn $neg(&mut self, a: $t) -> $t {
+                let r = (0 as $t).wrapping_sub(a);
+                let f = &mut self.regs.flags;
+                f.set(Flags::CF, a != 0);
+                f.set(Flags::AF, a & 0xF != 0);
+                f.set(Flags::OF, a == $sign);
+                f.$szp(r);
+                r
+            }
 
-    // Shifts and rotates. The 8086 uses the full CL value as the count — no
-    // masking to 5 bits (that arrived with the 186) — so these iterate; counts
-    // above 31 are rare in practice. A count of zero leaves all flags alone.
-    // Rotates affect only CF and OF; OF is architecturally defined only for
-    // count == 1 but is always computed the same way here.
+            // Shifts and rotates. The 8086 uses the full CL value as the count — no
+            // masking to 5 bits (that arrived with the 186) — so these iterate; counts
+            // above 31 are rare in practice. A count of zero leaves all flags alone.
+            // Rotates affect only CF and OF; OF is architecturally defined only for
+            // count == 1 but is always computed the same way here.
 
-    #[inline]
-    pub(crate) fn $shl(&mut self, mut v: $t, count: u32) -> $t {
-        if count == 0 { return v; }
-        for _ in 0..count {
-            self.regs.flags.set(Flags::CF, v & $sign != 0);
-            v <<= 1;
+            #[inline]
+            pub(crate) fn $shl(&mut self, mut v: $t, count: u32) -> $t {
+                if count == 0 {
+                    return v;
+                }
+                for _ in 0..count {
+                    self.regs.flags.set(Flags::CF, v & $sign != 0);
+                    v <<= 1;
+                }
+                let cf = self.regs.flags.contains(Flags::CF);
+                self.regs.flags.set(Flags::OF, (v & $sign != 0) != cf);
+                self.regs.flags.remove(Flags::AF);
+                self.regs.flags.$szp(v);
+                v
+            }
+
+            #[inline]
+            pub(crate) fn $shr(&mut self, mut v: $t, count: u32) -> $t {
+                if count == 0 {
+                    return v;
+                }
+                for _ in 0..count {
+                    // Per 1-bit step (as the microcode iterates): OF = MSB before the shift.
+                    self.regs.flags.set(Flags::OF, v & $sign != 0);
+                    self.regs.flags.set(Flags::CF, v & 1 != 0);
+                    v >>= 1;
+                }
+                self.regs.flags.remove(Flags::AF);
+                self.regs.flags.$szp(v);
+                v
+            }
+
+            #[inline]
+            pub(crate) fn $sar(&mut self, mut v: $t, count: u32) -> $t {
+                if count == 0 {
+                    return v;
+                }
+                for _ in 0..count {
+                    self.regs.flags.set(Flags::CF, v & 1 != 0);
+                    v = ((v as $swide) >> 1) as $t;
+                }
+                self.regs.flags.remove(Flags::OF | Flags::AF);
+                self.regs.flags.$szp(v);
+                v
+            }
+
+            #[inline]
+            pub(crate) fn $rol(&mut self, mut v: $t, count: u32) -> $t {
+                if count == 0 {
+                    return v;
+                }
+                for _ in 0..count {
+                    v = v.rotate_left(1);
+                    self.regs.flags.set(Flags::CF, v & 1 != 0);
+                }
+                let cf = self.regs.flags.contains(Flags::CF);
+                self.regs.flags.set(Flags::OF, (v & $sign != 0) != cf);
+                v
+            }
+
+            #[inline]
+            pub(crate) fn $ror(&mut self, mut v: $t, count: u32) -> $t {
+                if count == 0 {
+                    return v;
+                }
+                for _ in 0..count {
+                    self.regs.flags.set(Flags::CF, v & 1 != 0);
+                    v = v.rotate_right(1);
+                }
+                self.regs.flags.set(Flags::OF, (v ^ (v << 1)) & $sign != 0);
+                v
+            }
+
+            #[inline]
+            pub(crate) fn $rcl(&mut self, mut v: $t, count: u32) -> $t {
+                if count == 0 {
+                    return v;
+                }
+                for _ in 0..count {
+                    let c = v & $sign != 0;
+                    v = (v << 1) | self.regs.flags.contains(Flags::CF) as $t;
+                    self.regs.flags.set(Flags::CF, c);
+                }
+                let cf = self.regs.flags.contains(Flags::CF);
+                self.regs.flags.set(Flags::OF, (v & $sign != 0) != cf);
+                v
+            }
+
+            #[inline]
+            pub(crate) fn $rcr(&mut self, mut v: $t, count: u32) -> $t {
+                if count == 0 {
+                    return v;
+                }
+                for _ in 0..count {
+                    // Per 1-bit step: OF = MSB XOR CF, computed *before* the rotate.
+                    let cf = self.regs.flags.contains(Flags::CF);
+                    self.regs.flags.set(Flags::OF, (v & $sign != 0) != cf);
+                    let c = v & 1 != 0;
+                    v = (v >> 1) | ((cf as $t) << ($bits - 1));
+                    self.regs.flags.set(Flags::CF, c);
+                }
+                v
+            }
         }
-        let cf = self.regs.flags.contains(Flags::CF);
-        self.regs.flags.set(Flags::OF, (v & $sign != 0) != cf);
-        self.regs.flags.remove(Flags::AF);
-        self.regs.flags.$szp(v);
-        v
-    }
-
-    #[inline]
-    pub(crate) fn $shr(&mut self, mut v: $t, count: u32) -> $t {
-        if count == 0 { return v; }
-        for _ in 0..count {
-            // Per 1-bit step (as the microcode iterates): OF = MSB before the shift.
-            self.regs.flags.set(Flags::OF, v & $sign != 0);
-            self.regs.flags.set(Flags::CF, v & 1 != 0);
-            v >>= 1;
-        }
-        self.regs.flags.remove(Flags::AF);
-        self.regs.flags.$szp(v);
-        v
-    }
-
-    #[inline]
-    pub(crate) fn $sar(&mut self, mut v: $t, count: u32) -> $t {
-        if count == 0 { return v; }
-        for _ in 0..count {
-            self.regs.flags.set(Flags::CF, v & 1 != 0);
-            v = ((v as $swide) >> 1) as $t;
-        }
-        self.regs.flags.remove(Flags::OF | Flags::AF);
-        self.regs.flags.$szp(v);
-        v
-    }
-
-    #[inline]
-    pub(crate) fn $rol(&mut self, mut v: $t, count: u32) -> $t {
-        if count == 0 { return v; }
-        for _ in 0..count {
-            v = v.rotate_left(1);
-            self.regs.flags.set(Flags::CF, v & 1 != 0);
-        }
-        let cf = self.regs.flags.contains(Flags::CF);
-        self.regs.flags.set(Flags::OF, (v & $sign != 0) != cf);
-        v
-    }
-
-    #[inline]
-    pub(crate) fn $ror(&mut self, mut v: $t, count: u32) -> $t {
-        if count == 0 { return v; }
-        for _ in 0..count {
-            self.regs.flags.set(Flags::CF, v & 1 != 0);
-            v = v.rotate_right(1);
-        }
-        self.regs.flags.set(Flags::OF, (v ^ (v << 1)) & $sign != 0);
-        v
-    }
-
-    #[inline]
-    pub(crate) fn $rcl(&mut self, mut v: $t, count: u32) -> $t {
-        if count == 0 { return v; }
-        for _ in 0..count {
-            let c = v & $sign != 0;
-            v = (v << 1) | self.regs.flags.contains(Flags::CF) as $t;
-            self.regs.flags.set(Flags::CF, c);
-        }
-        let cf = self.regs.flags.contains(Flags::CF);
-        self.regs.flags.set(Flags::OF, (v & $sign != 0) != cf);
-        v
-    }
-
-    #[inline]
-    pub(crate) fn $rcr(&mut self, mut v: $t, count: u32) -> $t {
-        if count == 0 { return v; }
-        for _ in 0..count {
-            // Per 1-bit step: OF = MSB XOR CF, computed *before* the rotate.
-            let cf = self.regs.flags.contains(Flags::CF);
-            self.regs.flags.set(Flags::OF, (v & $sign != 0) != cf);
-            let c = v & 1 != 0;
-            v = (v >> 1) | ((cf as $t) << ($bits - 1));
-            self.regs.flags.set(Flags::CF, c);
-        }
-        v
-    }
-}
     };
 }
 
-alu_width!(u8, u16, i8, 0x80, 8, set_szp8,
-    add8, adc8, sub8, sbb8, and8, or8, xor8, inc8, dec8, neg8,
-    rol8, ror8, rcl8, rcr8, shl8, shr8, sar8);
-alu_width!(u16, u32, i16, 0x8000, 16, set_szp16,
-    add16, adc16, sub16, sbb16, and16, or16, xor16, inc16, dec16, neg16,
-    rol16, ror16, rcl16, rcr16, shl16, shr16, sar16);
+alu_width!(
+    u8, u16, i8, 0x80, 8, set_szp8, add8, adc8, sub8, sbb8, and8, or8, xor8, inc8, dec8, neg8,
+    rol8, ror8, rcl8, rcr8, shl8, shr8, sar8
+);
+alu_width!(
+    u16, u32, i16, 0x8000, 16, set_szp16, add16, adc16, sub16, sbb16, and16, or16, xor16, inc16,
+    dec16, neg16, rol16, ror16, rcl16, rcr16, shl16, shr16, sar16
+);
 
 impl Cpu {
     // --- Multiply / divide --------------------------------------------------
@@ -285,7 +304,11 @@ impl Cpu {
         let old_cf = self.regs.flags.contains(Flags::CF);
         let old_af = self.regs.flags.contains(Flags::AF);
         let al_check: u8 = if old_af { 0x9F } else { 0x99 };
-        let of = if old_cf { (0x1A..=0x7F).contains(&old_al) } else { (0x7A..=0x7F).contains(&old_al) };
+        let of = if old_cf {
+            (0x1A..=0x7F).contains(&old_al)
+        } else {
+            (0x7A..=0x7F).contains(&old_al)
+        };
         self.regs.flags.set(Flags::OF, of);
 
         let mut al = old_al;
@@ -351,8 +374,12 @@ impl Cpu {
             self.regs.flags.remove(Flags::AF | Flags::CF);
         }
         self.regs.flags.set_szp8(new_al);
-        self.regs.flags.set(Flags::SF, (0x7A..=0xF9).contains(&old_al));
-        self.regs.flags.set(Flags::OF, (0x7A..=0x7F).contains(&old_al));
+        self.regs
+            .flags
+            .set(Flags::SF, (0x7A..=0xF9).contains(&old_al));
+        self.regs
+            .flags
+            .set(Flags::OF, (0x7A..=0x7F).contains(&old_al));
     }
 
     pub(crate) fn aas(&mut self) {
@@ -361,7 +388,8 @@ impl Cpu {
         let new_al;
         if old_al & 0xF > 9 || old_af {
             new_al = old_al.wrapping_sub(6);
-            self.regs.ax = (self.regs.ax & 0xFF00).wrapping_sub(0x100) & 0xFF00 | (new_al & 0x0F) as u16;
+            self.regs.ax =
+                (self.regs.ax & 0xFF00).wrapping_sub(0x100) & 0xFF00 | (new_al & 0x0F) as u16;
             self.regs.flags.insert(Flags::AF | Flags::CF);
         } else {
             new_al = old_al;
@@ -371,7 +399,9 @@ impl Cpu {
         self.regs.flags.set_szp8(new_al);
         let sf = (!old_af && old_al >= 0x80) || (old_af && (old_al <= 0x05 || old_al >= 0x86));
         self.regs.flags.set(Flags::SF, sf);
-        self.regs.flags.set(Flags::OF, old_af && (0x80..=0x85).contains(&old_al));
+        self.regs
+            .flags
+            .set(Flags::OF, old_af && (0x80..=0x85).contains(&old_al));
     }
 
     /// `AAD base` (D5 ib).

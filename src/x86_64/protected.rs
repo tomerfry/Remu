@@ -1348,7 +1348,7 @@ impl Cpu {
         // caught here — before any IDT/gate/TSS logic — so it works at CPL 3
         // with no IDT installed. RIP already points past the INT instruction.
         if self.syscall_int == Some(vector) {
-            self.host_trap = Some(super::HostTrap::Syscall);
+            self.set_host_trap(super::HostTrap::Syscall);
             return Ok(());
         }
         self.raise(
@@ -1377,7 +1377,7 @@ impl Cpu {
 
         // OS-emulation hook: hand the call to the host instead of LSTAR.
         if self.trap_syscall {
-            self.host_trap = Some(super::HostTrap::Syscall);
+            self.set_host_trap(super::HostTrap::Syscall);
             return Ok(2);
         }
 

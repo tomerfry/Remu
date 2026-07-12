@@ -264,7 +264,10 @@ impl Vfs {
     /// Read up to `buf.len()` bytes; returns count or `-errno`.
     pub fn read(&mut self, fd: i32, buf: &mut [u8]) -> i32 {
         match self.fds.get_mut(fd as usize).and_then(|s| s.as_mut()) {
-            Some(Fd::Std(0)) => std::io::stdin().read(buf).map(|n| n as i32).unwrap_or(-errno::EIO),
+            Some(Fd::Std(0)) => std::io::stdin()
+                .read(buf)
+                .map(|n| n as i32)
+                .unwrap_or(-errno::EIO),
             Some(Fd::Std(_)) => -errno::EBADF,
             Some(Fd::File { file, .. }) => file.read(buf).map(|n| n as i32).unwrap_or(-errno::EIO),
             Some(Fd::Dir { .. }) => -errno::EISDIR,
@@ -344,7 +347,9 @@ impl Vfs {
                     2 => SeekFrom::End(off),
                     _ => return -(errno::EINVAL as i64),
                 };
-                file.seek(sk).map(|p| p as i64).unwrap_or(-(errno::EIO as i64))
+                file.seek(sk)
+                    .map(|p| p as i64)
+                    .unwrap_or(-(errno::EIO as i64))
             }
             Some(Fd::Virtual { pos, data, .. }) => {
                 let base = match whence {
@@ -383,8 +388,13 @@ impl Vfs {
 
     /// Read the next batch of directory entries for `getdents64`, invoking
     /// `emit(name, is_dir)` and advancing the cursor; returns entries consumed.
-    pub fn next_dents(&mut self, fd: i32, mut emit: impl FnMut(&str, bool) -> bool) -> Option<usize> {
-        let Some(Fd::Dir { entries, pos, .. }) = self.fds.get_mut(fd as usize).and_then(|s| s.as_mut())
+    pub fn next_dents(
+        &mut self,
+        fd: i32,
+        mut emit: impl FnMut(&str, bool) -> bool,
+    ) -> Option<usize> {
+        let Some(Fd::Dir { entries, pos, .. }) =
+            self.fds.get_mut(fd as usize).and_then(|s| s.as_mut())
         else {
             return None;
         };

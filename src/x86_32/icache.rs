@@ -25,9 +25,9 @@
 use std::alloc::{Layout, alloc_zeroed, handle_alloc_error};
 use std::fmt;
 
+use super::Cpu;
 use super::decode::DecodedInsn;
 use super::registers::{EFlags, cr0, reg};
-use super::Cpu;
 
 /// Number of direct-mapped entries, byte-indexed by physical address
 /// (16384 × 32 B = 512 KiB, a 16 KiB contiguous code window).

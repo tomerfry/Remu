@@ -7,7 +7,9 @@
 //! right after `p_type` (offset 4), and the 64-bit fields follow.
 
 use crate::os64::abi::elf;
-use crate::os64::memory::{AddressSpace, PROT_EXEC, PROT_READ, PROT_WRITE, PhysMem, USER_END, VmaKind};
+use crate::os64::memory::{
+    AddressSpace, PROT_EXEC, PROT_READ, PROT_WRITE, PhysMem, USER_END, VmaKind,
+};
 
 /// Load base for a PIE / `ET_DYN` main executable (Linux's usual PIE base).
 pub const EXE_PIE_BASE: u64 = 0x5555_5555_5000;
@@ -34,17 +36,20 @@ pub struct ElfImage {
 
 #[inline]
 fn rd_u16(d: &[u8], off: usize) -> Option<u16> {
-    d.get(off..off + 2).map(|s| u16::from_le_bytes(s.try_into().unwrap()))
+    d.get(off..off + 2)
+        .map(|s| u16::from_le_bytes(s.try_into().unwrap()))
 }
 
 #[inline]
 fn rd_u32(d: &[u8], off: usize) -> Option<u32> {
-    d.get(off..off + 4).map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+    d.get(off..off + 4)
+        .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
 }
 
 #[inline]
 fn rd_u64(d: &[u8], off: usize) -> Option<u64> {
-    d.get(off..off + 8).map(|s| u64::from_le_bytes(s.try_into().unwrap()))
+    d.get(off..off + 8)
+        .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
 }
 
 fn prot_of(p_flags: u32) -> u32 {
@@ -81,7 +86,9 @@ pub fn load(
     let e_type = rd_u16(data, 16).ok_or("truncated header")?;
     let e_machine = rd_u16(data, 18).ok_or("truncated header")?;
     if e_machine != elf::EM_X86_64 {
-        return Err(format!("unsupported e_machine {e_machine} (need EM_X86_64)"));
+        return Err(format!(
+            "unsupported e_machine {e_machine} (need EM_X86_64)"
+        ));
     }
     if e_type != elf::ET_EXEC && e_type != elf::ET_DYN {
         return Err(format!("unsupported e_type {e_type}"));
@@ -136,7 +143,9 @@ pub fn load(
             }
             elf::PT_INTERP => {
                 let end = (p_offset + p_filesz) as usize;
-                let s = data.get(p_offset as usize..end).ok_or("PT_INTERP out of bounds")?;
+                let s = data
+                    .get(p_offset as usize..end)
+                    .ok_or("PT_INTERP out of bounds")?;
                 let s = s.split(|&b| b == 0).next().unwrap_or(s);
                 interp = Some(String::from_utf8_lossy(s).into_owned());
             }

@@ -22,7 +22,7 @@
 
 use std::path::PathBuf;
 
-use remu::cpu::opcodes::{Operation, OPCODES};
+use remu::cpu::opcodes::{OPCODES, Operation};
 use remu::memory::FlatMemory;
 use remu::{Cpu, Status};
 use serde::Deserialize;
@@ -98,10 +98,20 @@ fn run_file(path: &PathBuf) -> usize {
                     "FAIL {} [{}]:\n  exp pc:{:04X} a:{:02X} x:{:02X} y:{:02X} s:{:02X} p:{:02X} cyc:{}\n  got pc:{:04X} a:{:02X} x:{:02X} y:{:02X} s:{:02X} p:{:02X} cyc:{}",
                     path.file_name().unwrap().to_string_lossy(),
                     case.name,
-                    case.final_state.pc, case.final_state.a, case.final_state.x,
-                    case.final_state.y, case.final_state.s, case.final_state.p, case.cycles.len(),
-                    cpu.regs.pc, cpu.regs.a, cpu.regs.x, cpu.regs.y, cpu.regs.sp,
-                    cpu.regs.p.bits(), cycles,
+                    case.final_state.pc,
+                    case.final_state.a,
+                    case.final_state.x,
+                    case.final_state.y,
+                    case.final_state.s,
+                    case.final_state.p,
+                    case.cycles.len(),
+                    cpu.regs.pc,
+                    cpu.regs.a,
+                    cpu.regs.x,
+                    cpu.regs.y,
+                    cpu.regs.sp,
+                    cpu.regs.p.bits(),
+                    cycles,
                 );
             }
             failures += 1;
@@ -145,7 +155,10 @@ fn harte_suite() {
         let f = run_file(path);
         if f > 0 {
             total_failures += f;
-            failed_opcodes.push(format!("{} ({f})", path.file_name().unwrap().to_string_lossy()));
+            failed_opcodes.push(format!(
+                "{} ({f})",
+                path.file_name().unwrap().to_string_lossy()
+            ));
         }
     }
 
@@ -157,5 +170,8 @@ fn harte_suite() {
             failed_opcodes.join(", ")
         );
     }
-    eprintln!("Tom Harte suite passed: {} official-opcode files.", entries.len());
+    eprintln!(
+        "Tom Harte suite passed: {} official-opcode files.",
+        entries.len()
+    );
 }

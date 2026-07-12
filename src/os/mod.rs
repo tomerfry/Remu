@@ -21,13 +21,11 @@ pub mod syscall;
 
 use std::path::{Path, PathBuf};
 
-use crate::x86_32::{Cpu, Exception, HostTrap};
+use crate::x86_32::{Cpu, Exception, HostTrap, RunExit};
 
 use abi::gdt;
 use fs::Vfs;
-use memory::{
-    AddressSpace, PhysMem, PROT_READ, PROT_WRITE, STACK_TOP, VmaKind,
-};
+use memory::{AddressSpace, PROT_READ, PROT_WRITE, PhysMem, STACK_TOP, VmaKind};
 
 /// Initial stack reservation (grows down on demand beyond this).
 const INIT_STACK: u32 = 0x0004_0000; // 256 KiB
@@ -112,7 +110,10 @@ impl Emulator {
 
         let mut vfs = Vfs::new(rootfs);
         vfs.exec_path = exec_path;
-        vfs.cmdline = argv.iter().flat_map(|a| a.iter().chain(&[0]).copied()).collect();
+        vfs.cmdline = argv
+            .iter()
+            .flat_map(|a| a.iter().chain(&[0]).copied())
+            .collect();
 
         let mut emu = Emulator {
             cpu,
@@ -149,23 +150,42 @@ impl Emulator {
         while self.running {
             if steps >= max {
                 if self.trace {
-                    eprintln!("[remu] instruction cap reached at eip={:#010x}", self.cpu.regs.eip);
+                    eprintln!(
+                        "[remu] instruction cap reached at eip={:#010x}",
+                        self.cpu.regs.eip
+                    );
                 }
                 return 125;
             }
-            self.cpu.step(&mut self.mem);
-            steps += 1;
-            if let Some(trap) = self.cpu.host_trap.take() {
-                match trap {
-                    HostTrap::Syscall => self.dispatch_syscall(),
-                    HostTrap::Exception(e) => self.handle_fault(e),
+            // Batched execution: the CPU returns at the first host trap, so
+            // the per-instruction host_trap poll of the old step() loop is
+            // gone without changing when traps are serviced.
+            let r = self.cpu.run(&mut self.mem, max - steps);
+            steps += r.executed;
+            match r.exit {
+                RunExit::HostTrap => {
+                    match self.cpu.host_trap.take() {
+                        Some(HostTrap::Syscall) => self.dispatch_syscall(),
+                        Some(HostTrap::Exception(e)) => self.handle_fault(e),
+                        None => unreachable!("HostTrap exit with no trap recorded"),
+                    }
+                    // Trap service writes guest memory host-side (read
+                    // buffers, mmap, stack growth) — stale decoded code must
+                    // not survive.
+                    self.cpu.invalidate_icache();
                 }
-                // Trap service writes guest memory host-side (read buffers,
-                // mmap, stack growth) — stale decoded code must not survive.
-                self.cpu.invalidate_icache();
-            } else if self.cpu.shutdown {
-                self.exit_code = 139;
-                break;
+                RunExit::Shutdown => {
+                    self.exit_code = 139;
+                    break;
+                }
+                // The guest runs at ring 3, where HLT raises #GP and arrives
+                // as a HostTrap — Halted is unreachable; treat a halted CPU
+                // as a dead guest defensively.
+                RunExit::Halted => {
+                    self.exit_code = 139;
+                    break;
+                }
+                RunExit::Completed => {} // the cap re-checks at the loop top
             }
         }
         self.exit_code
@@ -204,9 +224,21 @@ impl Emulator {
             if v.kind == VmaKind::System {
                 continue;
             }
-            let r = if v.prot & memory::PROT_READ != 0 { 'r' } else { '-' };
-            let w = if v.prot & memory::PROT_WRITE != 0 { 'w' } else { '-' };
-            let x = if v.prot & memory::PROT_EXEC != 0 { 'x' } else { '-' };
+            let r = if v.prot & memory::PROT_READ != 0 {
+                'r'
+            } else {
+                '-'
+            };
+            let w = if v.prot & memory::PROT_WRITE != 0 {
+                'w'
+            } else {
+                '-'
+            };
+            let x = if v.prot & memory::PROT_EXEC != 0 {
+                'x'
+            } else {
+                '-'
+            };
             s.push_str(&format!(
                 "{:08x}-{:08x} {r}{w}{x}p 00000000 00:00 0\n",
                 v.start, v.end
