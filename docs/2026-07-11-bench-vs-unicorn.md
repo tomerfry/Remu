@@ -473,5 +473,94 @@ identical to before; all suites green both ways incl. MOO 80386 (1.76M).
   `read*/write*/push*/pop*` (per-`Bus` monomorphization, `TypeId` flush);
   faults side-exit and re-execute in the interpreter. Unlocks JIT for
   `mem_rw` and `call_ret` (the last Unicorn loss).
-- **386 JIT port** (same infra) and **usermode segv → CPU-visible exception**
-  (so usermode can adopt `run(n)`).
+- ~~**386 JIT port** (same infra)~~ — **done, see §9.** **usermode segv →
+  CPU-visible exception** (so usermode can adopt `run(n)`) remains open.
+
+---
+
+## 9. 386 JIT port — stages A + B (2026-07-12, same machine)
+
+The x86-64 template JIT was ported to the 80386 core on branch
+`enhance-remaining-cpus`, reusing the whole infrastructure: the direct-mapped
+block table keyed `phys | icache_ctx()`, the hot-counter/`HOT_THRESHOLD`
+warm-up, the SMC write-stamp + O(1) invalidation-clock prologue revalidation,
+the `loop`-bounded self-loop with the rel8 bounce trampoline, and the flag
+materialization via `LAHF`/`SETO`. The host is still x86-64 (the gate is
+`all(feature = "jit", target_arch = "x86_64")`), so a 32-bit guest instruction
+maps to the equivalent 32-bit host instruction. Lives in `src/x86_32/jit/`;
+reached through `Cpu::run`, interpreter kept as the reference and fallback.
+
+Deltas from the x86-64 backend, all mechanical:
+
+- **32-bit only.** Guest GPRs are `[u32; 8]` (stride 4, no high-dword zeroing);
+  every operand is `DWORD`. The `o64` paths are dropped.
+- **Gated on CS.D = 1.** Only 32-bit code segments are translated, so EIP is a
+  full 32-bit offset and near-branch targets wrap mod 2^32 to match the emitted
+  host arithmetic; 16-bit segments and V86 fall back to the interpreter (the
+  block key already folds CS.D/CR0.PE/EFLAGS.VM/`extensions`).
+- **Cycle-exact by construction.** The 386's register-form `exec_decoded`
+  weights (MOV/INC/DEC/ALU = 2, shift = 3, IMUL = 20, Jcc 7/3, JMP = 7) equal
+  the x86-64 core's, so the `CYC_*` table transfers verbatim. Any legacy prefix
+  costs the interpreter one cycle/byte, which the block does not model, so
+  prefixed forms are refused (`npfx() == 0`) — trivially satisfied by the
+  prefix-free 32-bit hot set.
+- **Flag exactness unchanged.** The 386 interpreter clears AF on logic ops and
+  shifts, clears OF on SAR, and (unlike the host) *computes* SF/ZF/PF for
+  two-operand IMUL — but the host leaves those undefined, so marking them
+  `garbage` is both correct and identical to the x86-64 table. `TEST` (AND
+  without write-back) and `CMP` emit host `test`/`cmp` (no destination write).
+
+Translated set (stage A + B, register operands only): `MOV r,imm`,
+`MOV r/m,imm` (reg form), `INC`/`DEC` (both the `40`–`4F` short forms and the
+`FF /0,/1` group form), register ALU (`ADD/OR/ADC/SBB/AND/SUB/XOR/CMP` r,r and
+r,imm; `TEST`), immediate shifts/rotates (SHL/SHR/SAR/ROL/ROR; RCL/RCR
+excluded), two-operand `IMUL`, `Jcc`, `JMP rel`, and self-loop detection.
+
+**Correctness.** `tests/x86_32_jit_tests.rs` — 10 differential tests chunk
+`run()` (JIT) against `step()` (interpreter) at prime chunk sizes and assert
+identical registers, **cycles**, and RAM: tight loops (both DEC forms), the
+`alu_mix` body, an ALU/shift sweep, shift-by-1/SAR (OF-exact + OF-cleared
+paths), TEST/CMP no-write-back, a >127-byte self-loop (bounce trampoline), and
+SMC invalidation. Feature off = byte-identical to before. Full suite green both
+ways (`cargo test` and `cargo test --features jit`, incl. the existing 58 386
+core tests and 9 x86-64 JIT tests); the interpreter path is untouched, so the
+80386 MOO conformance suite (which drives `step()`) is unaffected.
+
+### MIPS, best of 5 — 386 interpreter vs JIT (same machine, ring 0, paging off)
+
+| Workload | Interp | JIT | Δ | Unicorn | JIT standing |
+|---|---:|---:|---:|---:|---|
+| tight_loop | 188 | **10176** | **54×** | 889 | **11.4× Unicorn** |
+| alu_mix | 126 | **5233** | **42×** | 1407 | **3.7× Unicorn** |
+| mem_rw | 140 | 108 | −22% | 199 | Unicorn 1.8× (not yet JIT'd) |
+| call_ret | 157 | 104 | −34% | 133 | Unicorn 1.3× (not yet JIT'd) |
+
+The two compute-bound workloads reach x86-64-JIT parity (x86-64 measured
+10406 / 5205 on the same rig) and decisively beat Unicorn's TCG. The 386 core
+now stands exactly where the x86-64 core does after stage B: pure-register
+loops are the JIT's, memory/call loops are still the interpreter's.
+
+**The `mem_rw`/`call_ret` regression is real and understood.** Those loops are
+dominated by memory and CALL/RET operands, which stage A+B cannot translate, so
+they run on the interpreter *through* the `run_jit` fallback — which pays a
+per-instruction dispatch probe (CS.D test, `icache_phys`, key, direct-mapped
+table lookup) that plain `run_interp` does not. On the x86-64 core this probe
+is hidden under a slower interpreter (its `mem_rw`/`call_ret` even improved
+slightly under the feature); the 386 interpreter retires those workloads ~1.5×
+faster per instruction, so the same fixed probe cost surfaces as a 22–34% loss.
+Marking untranslatable heads COLD (a version-tagged sentinel — already ported)
+removes the *retranslation* cost but not the probe itself. This is inherent to
+stage A+B and is exactly what **stage D (memory + stack ops)** removes: once the
+memory MOVs and CALL/RET are translated, those loops stop hitting the fallback
+at all. The JIT is off by default, so nothing regresses unless `--features jit`
+is set on memory-heavy 32-bit code.
+
+### Open (386-specific, next cycle)
+
+- **Stage D on the 386** (memory + stack ops via `extern "win64"` helpers
+  wrapping `read*/write*/push*/pop*`) — turns `mem_rw`/`call_ret` from a
+  fallback regression into a translated win, as on the x86-64 roadmap.
+- **Register-register `MOV`** (`MovRmRW`/`MovRRmW`) is a cheap stage-C-adjacent
+  add that would shrink the `mem_rw` fallback fragment.
+- **Stage C block chaining** and the shared **usermode `run(n)`** adoption apply
+  to both cores.

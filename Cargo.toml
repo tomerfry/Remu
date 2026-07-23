@@ -58,7 +58,7 @@ python = ["dep:pyo3"]
 # performance work: `cargo run --release --features perf-stats --example
 # bench_x86`. Off by default; compiles to nothing.
 perf-stats = []
-# Template JIT (dynamic binary translation) for the x86-64 core, reached via
-# `Cpu::run`. Host must be x86-64. The interpreter stays the reference; off by
-# default. See src/x86_64/jit/.
+# Template JIT (dynamic binary translation) for the x86-64 and 80386 cores,
+# reached via `Cpu::run`. Host must be x86-64. The interpreter stays the
+# reference; off by default. See src/x86_64/jit/ and src/x86_32/jit/.
 jit = ["dep:dynasm", "dep:dynasmrt"]
