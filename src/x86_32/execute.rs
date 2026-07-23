@@ -34,53 +34,64 @@ impl Cpu {
         match opcode {
             // --- ALU: ADD OR ADC SBB AND SUB XOR CMP, six forms each --------
             0x00 | 0x08 | 0x10 | 0x18 | 0x20 | 0x28 | 0x30 | 0x38 => {
-                let f = ALU8[(opcode >> 3) as usize];
-                self.op_rm_r8(bus, f, opcode != 0x38)
+                self.op_rm_r8(bus, (opcode >> 3) as usize, opcode != 0x38)
             }
             0x01 | 0x09 | 0x11 | 0x19 | 0x21 | 0x29 | 0x31 | 0x39 => {
                 let wb = opcode != 0x39;
+                let idx = (opcode >> 3) as usize;
                 if self.osize32 {
-                    let f = ALU32[(opcode >> 3) as usize];
-                    self.op_rm_r32(bus, f, wb)
+                    self.op_rm_r32(bus, idx, wb)
                 } else {
-                    let f = ALU16[(opcode >> 3) as usize];
-                    self.op_rm_r16(bus, f, wb)
+                    self.op_rm_r16(bus, idx, wb)
                 }
             }
             0x02 | 0x0A | 0x12 | 0x1A | 0x22 | 0x2A | 0x32 | 0x3A => {
-                let f = ALU8[(opcode >> 3) as usize];
-                self.op_r_rm8(bus, f, opcode != 0x3A)
+                self.op_r_rm8(bus, (opcode >> 3) as usize, opcode != 0x3A)
             }
             0x03 | 0x0B | 0x13 | 0x1B | 0x23 | 0x2B | 0x33 | 0x3B => {
                 let wb = opcode != 0x3B;
+                let idx = (opcode >> 3) as usize;
                 if self.osize32 {
-                    let f = ALU32[(opcode >> 3) as usize];
-                    self.op_r_rm32(bus, f, wb)
+                    self.op_r_rm32(bus, idx, wb)
                 } else {
-                    let f = ALU16[(opcode >> 3) as usize];
-                    self.op_r_rm16(bus, f, wb)
+                    self.op_r_rm16(bus, idx, wb)
                 }
             }
             0x04 | 0x0C | 0x14 | 0x1C | 0x24 | 0x2C | 0x34 | 0x3C => {
-                let f = ALU8[(opcode >> 3) as usize];
+                let idx = (opcode >> 3) as usize;
+                let a = self.regs.reg8(0);
                 let b = self.fetch8(bus)?;
-                let r = f(self, self.regs.reg8(0), b);
+                let r = ALU8[idx](self, a, b);
+                #[cfg(feature = "symbolic")]
+                if self.sym_active() {
+                    self.sym_alu_acc_imm(idx, 8, opcode != 0x3C, a as u64, b as u64, r as u64);
+                }
                 if opcode != 0x3C {
                     self.regs.set_reg8(0, r);
                 }
                 Ok(2)
             }
             0x05 | 0x0D | 0x15 | 0x1D | 0x25 | 0x2D | 0x35 | 0x3D => {
-                let i = (opcode >> 3) as usize;
+                let idx = (opcode >> 3) as usize;
                 if self.osize32 {
+                    let a = self.regs.gpr[0];
                     let b = self.fetch32(bus)?;
-                    let r = ALU32[i](self, self.regs.gpr[0], b);
+                    let r = ALU32[idx](self, a, b);
+                    #[cfg(feature = "symbolic")]
+                    if self.sym_active() {
+                        self.sym_alu_acc_imm(idx, 32, opcode != 0x3D, a as u64, b as u64, r as u64);
+                    }
                     if opcode != 0x3D {
                         self.regs.gpr[0] = r;
                     }
                 } else {
+                    let a = self.regs.reg16(0);
                     let b = self.fetch16(bus)?;
-                    let r = ALU16[i](self, self.regs.reg16(0), b);
+                    let r = ALU16[idx](self, a, b);
+                    #[cfg(feature = "symbolic")]
+                    if self.sym_active() {
+                        self.sym_alu_acc_imm(idx, 16, opcode != 0x3D, a as u64, b as u64, r as u64);
+                    }
                     if opcode != 0x3D {
                         self.regs.set_reg16(0, r);
                     }
@@ -94,7 +105,12 @@ impl Cpu {
                 self.lock_check(op.is_mem() && m.reg() != 7)?;
                 let a = self.read_op8(bus, op)?;
                 let b = self.fetch8(bus)?;
-                let r = ALU8[m.reg() as usize](self, a, b);
+                let idx = m.reg() as usize;
+                let r = ALU8[idx](self, a, b);
+                #[cfg(feature = "symbolic")]
+                if self.sym_active() {
+                    self.sym_alu_grp1(idx, 8, op, m.reg() != 7, a as u64, b as u64, r as u64);
+                }
                 if m.reg() != 7 {
                     self.write_op8(bus, op, r)?;
                 }
@@ -109,11 +125,17 @@ impl Cpu {
                 } else {
                     self.fetch8(bus)? as i8 as i32 as u32
                 };
+                let idx = m.reg() as usize;
                 let r = if self.osize32 {
-                    ALU32[m.reg() as usize](self, a, b)
+                    ALU32[idx](self, a, b)
                 } else {
-                    ALU16[m.reg() as usize](self, a as u16, b as u16) as u32
+                    ALU16[idx](self, a as u16, b as u16) as u32
                 };
+                #[cfg(feature = "symbolic")]
+                if self.sym_active() {
+                    let w = if self.osize32 { 32 } else { 16 };
+                    self.sym_alu_grp1(idx, w, op, m.reg() != 7, a as u64, b as u64, r as u64);
+                }
                 if m.reg() != 7 {
                     self.write_op(bus, op, r)?;
                 }
@@ -359,7 +381,13 @@ impl Cpu {
             // --- Conditional jumps -------------------------------------------------
             0x70..=0x7F => {
                 let rel = self.fetch8(bus)? as i8 as i32;
-                if self.cond(opcode & 0xF) {
+                let n = opcode & 0xF;
+                let taken = self.cond(n);
+                #[cfg(feature = "symbolic")]
+                if self.sym_active() {
+                    self.sym_branch(n, taken);
+                }
+                if taken {
                     self.jump_rel(rel)?;
                     Ok(7)
                 } else {
@@ -368,12 +396,13 @@ impl Cpu {
             }
 
             // --- TEST / XCHG ----------------------------------------------------------
-            0x84 => self.op_rm_r8(bus, Cpu::and8, false),
+            // TEST is AND (index 4) with no writeback.
+            0x84 => self.op_rm_r8(bus, 4, false),
             0x85 => {
                 if self.osize32 {
-                    self.op_rm_r32(bus, Cpu::and32, false)
+                    self.op_rm_r32(bus, 4, false)
                 } else {
-                    self.op_rm_r16(bus, Cpu::and16, false)
+                    self.op_rm_r16(bus, 4, false)
                 }
             }
             0x86 => {
@@ -436,6 +465,10 @@ impl Cpu {
             0x88 => {
                 let (m, op) = self.modrm(bus)?;
                 let v = self.regs.reg8(m.reg());
+                #[cfg(feature = "symbolic")]
+                if self.sym_active() {
+                    self.sym_mov_rm_r(8, op, m.reg(), v as u64);
+                }
                 self.write_op8(bus, op, v)?;
                 Ok(2)
             }
@@ -443,9 +476,17 @@ impl Cpu {
                 let (m, op) = self.modrm(bus)?;
                 if self.osize32 {
                     let v = self.regs.reg32(m.reg());
+                    #[cfg(feature = "symbolic")]
+                    if self.sym_active() {
+                        self.sym_mov_rm_r(32, op, m.reg(), v as u64);
+                    }
                     self.write_op32(bus, op, v)?;
                 } else {
                     let v = self.regs.reg16(m.reg());
+                    #[cfg(feature = "symbolic")]
+                    if self.sym_active() {
+                        self.sym_mov_rm_r(16, op, m.reg(), v as u64);
+                    }
                     self.write_op16(bus, op, v)?;
                 }
                 Ok(2)
@@ -453,6 +494,10 @@ impl Cpu {
             0x8A => {
                 let (m, op) = self.modrm(bus)?;
                 let v = self.read_op8(bus, op)?;
+                #[cfg(feature = "symbolic")]
+                if self.sym_active() {
+                    self.sym_mov_r_rm(8, op, m.reg(), v as u64);
+                }
                 self.regs.set_reg8(m.reg(), v);
                 Ok(if op.is_mem() { 4 } else { 2 })
             }
@@ -460,9 +505,17 @@ impl Cpu {
                 let (m, op) = self.modrm(bus)?;
                 if self.osize32 {
                     let v = self.read_op32(bus, op)?;
+                    #[cfg(feature = "symbolic")]
+                    if self.sym_active() {
+                        self.sym_mov_r_rm(32, op, m.reg(), v as u64);
+                    }
                     self.regs.set_reg32(m.reg(), v);
                 } else {
                     let v = self.read_op16(bus, op)?;
+                    #[cfg(feature = "symbolic")]
+                    if self.sym_active() {
+                        self.sym_mov_r_rm(16, op, m.reg(), v as u64);
+                    }
                     self.regs.set_reg16(m.reg(), v);
                 }
                 Ok(if op.is_mem() { 4 } else { 2 })
@@ -1309,18 +1362,18 @@ impl Cpu {
     }
 
     /// `op r/m8, r8` — destination is the r/m operand. `wb == false` for CMP/TEST.
+    /// `idx` selects the ALU op (bits 5–3 of the opcode / group sub-op).
     #[inline(always)]
-    fn op_rm_r8<B: Bus>(
-        &mut self,
-        bus: &mut B,
-        f: fn(&mut Cpu, u8, u8) -> u8,
-        wb: bool,
-    ) -> Exec<u32> {
+    fn op_rm_r8<B: Bus>(&mut self, bus: &mut B, idx: usize, wb: bool) -> Exec<u32> {
         let (m, op) = self.modrm(bus)?;
         self.lock_check(wb && op.is_mem())?;
         let a = self.read_op8(bus, op)?;
         let b = self.regs.reg8(m.reg());
-        let r = f(self, a, b);
+        let r = ALU8[idx](self, a, b);
+        #[cfg(feature = "symbolic")]
+        if self.sym_active() {
+            self.sym_alu_rm_r(idx, 8, op, m.reg(), wb, a as u64, b as u64, r as u64);
+        }
         if wb {
             self.write_op8(bus, op, r)?;
         }
@@ -1328,17 +1381,16 @@ impl Cpu {
     }
 
     #[inline(always)]
-    fn op_rm_r16<B: Bus>(
-        &mut self,
-        bus: &mut B,
-        f: fn(&mut Cpu, u16, u16) -> u16,
-        wb: bool,
-    ) -> Exec<u32> {
+    fn op_rm_r16<B: Bus>(&mut self, bus: &mut B, idx: usize, wb: bool) -> Exec<u32> {
         let (m, op) = self.modrm(bus)?;
         self.lock_check(wb && op.is_mem())?;
         let a = self.read_op16(bus, op)?;
         let b = self.regs.reg16(m.reg());
-        let r = f(self, a, b);
+        let r = ALU16[idx](self, a, b);
+        #[cfg(feature = "symbolic")]
+        if self.sym_active() {
+            self.sym_alu_rm_r(idx, 16, op, m.reg(), wb, a as u64, b as u64, r as u64);
+        }
         if wb {
             self.write_op16(bus, op, r)?;
         }
@@ -1346,17 +1398,16 @@ impl Cpu {
     }
 
     #[inline(always)]
-    fn op_rm_r32<B: Bus>(
-        &mut self,
-        bus: &mut B,
-        f: fn(&mut Cpu, u32, u32) -> u32,
-        wb: bool,
-    ) -> Exec<u32> {
+    fn op_rm_r32<B: Bus>(&mut self, bus: &mut B, idx: usize, wb: bool) -> Exec<u32> {
         let (m, op) = self.modrm(bus)?;
         self.lock_check(wb && op.is_mem())?;
         let a = self.read_op32(bus, op)?;
         let b = self.regs.reg32(m.reg());
-        let r = f(self, a, b);
+        let r = ALU32[idx](self, a, b);
+        #[cfg(feature = "symbolic")]
+        if self.sym_active() {
+            self.sym_alu_rm_r(idx, 32, op, m.reg(), wb, a as u64, b as u64, r as u64);
+        }
         if wb {
             self.write_op32(bus, op, r)?;
         }
@@ -1365,16 +1416,15 @@ impl Cpu {
 
     /// `op r8, r/m8` — destination is the register operand.
     #[inline(always)]
-    fn op_r_rm8<B: Bus>(
-        &mut self,
-        bus: &mut B,
-        f: fn(&mut Cpu, u8, u8) -> u8,
-        wb: bool,
-    ) -> Exec<u32> {
+    fn op_r_rm8<B: Bus>(&mut self, bus: &mut B, idx: usize, wb: bool) -> Exec<u32> {
         let (m, op) = self.modrm(bus)?;
         let a = self.regs.reg8(m.reg());
         let b = self.read_op8(bus, op)?;
-        let r = f(self, a, b);
+        let r = ALU8[idx](self, a, b);
+        #[cfg(feature = "symbolic")]
+        if self.sym_active() {
+            self.sym_alu_r_rm(idx, 8, op, m.reg(), wb, a as u64, b as u64, r as u64);
+        }
         if wb {
             self.regs.set_reg8(m.reg(), r);
         }
@@ -1382,16 +1432,15 @@ impl Cpu {
     }
 
     #[inline(always)]
-    fn op_r_rm16<B: Bus>(
-        &mut self,
-        bus: &mut B,
-        f: fn(&mut Cpu, u16, u16) -> u16,
-        wb: bool,
-    ) -> Exec<u32> {
+    fn op_r_rm16<B: Bus>(&mut self, bus: &mut B, idx: usize, wb: bool) -> Exec<u32> {
         let (m, op) = self.modrm(bus)?;
         let a = self.regs.reg16(m.reg());
         let b = self.read_op16(bus, op)?;
-        let r = f(self, a, b);
+        let r = ALU16[idx](self, a, b);
+        #[cfg(feature = "symbolic")]
+        if self.sym_active() {
+            self.sym_alu_r_rm(idx, 16, op, m.reg(), wb, a as u64, b as u64, r as u64);
+        }
         if wb {
             self.regs.set_reg16(m.reg(), r);
         }
@@ -1399,16 +1448,15 @@ impl Cpu {
     }
 
     #[inline(always)]
-    fn op_r_rm32<B: Bus>(
-        &mut self,
-        bus: &mut B,
-        f: fn(&mut Cpu, u32, u32) -> u32,
-        wb: bool,
-    ) -> Exec<u32> {
+    fn op_r_rm32<B: Bus>(&mut self, bus: &mut B, idx: usize, wb: bool) -> Exec<u32> {
         let (m, op) = self.modrm(bus)?;
         let a = self.regs.reg32(m.reg());
         let b = self.read_op32(bus, op)?;
-        let r = f(self, a, b);
+        let r = ALU32[idx](self, a, b);
+        #[cfg(feature = "symbolic")]
+        if self.sym_active() {
+            self.sym_alu_r_rm(idx, 32, op, m.reg(), wb, a as u64, b as u64, r as u64);
+        }
         if wb {
             self.regs.set_reg32(m.reg(), r);
         }

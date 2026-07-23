@@ -490,7 +490,7 @@ mod tests {
 
     #[test]
     fn inc_dec_neg_match_concrete() {
-        let mut rng = Rng(0xdead_beef_0badf00d);
+        let mut rng = Rng(0xdead_beef_0bad_f00d);
         let model = Model::new();
         for _ in 0..5000 {
             let a = rng.next();

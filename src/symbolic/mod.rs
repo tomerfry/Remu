@@ -12,12 +12,16 @@
 //! is byte-for-byte the current core.
 //!
 //! ## Milestones
-//! - **M0 (this):** [`expr`] — the bitvector AST — and [`alu`] — the symbolic
-//!   ALU, differentially tested against the concrete 386 ALU. Standalone; the
-//!   core is untouched.
-//! - M1: sparse [`state`] overlay + instrumentation seams + constraint
-//!   collection (no solver).
+//! - M0: [`expr`] — the bitvector AST — and [`alu`] — the symbolic ALU,
+//!   differentially tested against the concrete 386 ALU.
+//! - **M1 (this):** the sparse [`state`] overlay ([`SymEngine`]) plus the
+//!   instrumentation seams in the 386 core (see `x86_32::symbolic`), collecting
+//!   path constraints. No solver yet.
 //! - M2: SMT-LIB export + `easy-smt` solver + negation-driven exploration.
 
 pub mod alu;
 pub mod expr;
+pub mod state;
+
+pub use expr::{BoolExpr, Expr, Model, SymId, Width};
+pub use state::{Place, SymEngine};
