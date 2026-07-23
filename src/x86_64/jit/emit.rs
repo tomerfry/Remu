@@ -343,8 +343,13 @@ impl Cpu {
     /// installed. On failure the guest key is remembered as cold.
     pub(super) fn jit_translate<B: Bus>(&mut self, bus: &mut B, key: u64, phys: u64) -> bool {
         let start_rip = self.regs.rip;
+        // Decode-ahead is speculative: a fetch that page-faults is discarded,
+        // but the walker has already written CR2 by then, and a fault that is
+        // never delivered must not be architecturally visible.
+        let saved_cr2 = self.regs.cr2;
         let plan = self.jit_plan(bus, phys, start_rip);
         self.regs.rip = start_rip; // decode-ahead advanced it
+        self.regs.cr2 = saved_cr2;
         let Some(plan) = plan else {
             self.jit_mark_cold(key, phys);
             return false;

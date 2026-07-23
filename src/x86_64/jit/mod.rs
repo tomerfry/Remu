@@ -84,9 +84,10 @@ struct Slot {
     idx: u32,
 }
 
-/// A translated block. `key`/`version`/`stamp_slot`/`start_rip` are retained
-/// for cross-block chaining and debugging in later stages; stage A validates
-/// through the table [`Slot`] and the block's own prologue.
+/// A translated block. `key`/`version`/`stamp_slot` are retained for
+/// cross-block chaining and debugging in later stages; stage A validates
+/// through the table [`Slot`], the block's own prologue, and the dispatcher's
+/// `start_rip` guard.
 #[allow(dead_code)]
 struct BlockMeta {
     /// `phys | icache_ctx()` of the first instruction.
@@ -191,7 +192,14 @@ impl Cpu {
             let key = phys | self.icache_ctx();
             let budget = n - executed;
             match self.jit_lookup(key, phys) {
-                Lookup::Hit(idx) if self.jit.blocks[idx].ninsns as u64 <= budget => {
+                // The `start_rip` guard: the key is physical, but exits bake
+                // absolute RIP constants, so the same physical code reached at
+                // a different RIP (two linear pages mapped to one frame) must
+                // not enter this block.
+                Lookup::Hit(idx)
+                    if self.jit.blocks[idx].start_rip == self.regs.rip
+                        && self.jit.blocks[idx].ninsns as u64 <= budget =>
+                {
                     let retired = self.jit_enter(idx, budget);
                     if retired == 0 {
                         // Stale prologue exit: drop the block and step once so

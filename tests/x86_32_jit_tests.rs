@@ -252,6 +252,45 @@ fn large_self_loop_backedge() {
 }
 
 #[test]
+fn cs_base_alias_does_not_reuse_block() {
+    // The block table is keyed by physical address, but block exits bake
+    // absolute EIP constants — so the same physical code reached at a
+    // different EIP (here via a CS-base change) must not enter the block
+    // translated for the original mapping. Warm + translate a loop at
+    // CS.base = 0, then rerun the identical physical bytes at CS.base = CODE
+    // (EIP shifted down to compensate) and lockstep against a step() twin.
+    let n = 100u32;
+    let prog = tight(n);
+    let total = 1 + 2 * n as u64;
+    // Skip the MOV ECX head on the aliased pass: start straight at the DEC
+    // (EIP 5) with ECX reloaded, so the aliased EIP differs from the block's
+    // baked start while hitting the same physical head.
+    let alias = |cpu: &mut Cpu| {
+        cpu.regs.seg[reg::CS as usize].base = CODE;
+        cpu.regs.eip = 5;
+        cpu.regs.gpr[reg::ECX as usize] = n;
+    };
+
+    let (mut ja, mut ma) = flat32(&prog);
+    let r = ja.run(&mut ma, total); // translates the self-loop block
+    assert_eq!((r.executed, r.exit), (total, RunExit::Completed));
+    alias(&mut ja);
+    let r = ja.run(&mut ma, 2 * n as u64);
+    assert_eq!((r.executed, r.exit), (2 * n as u64, RunExit::Completed));
+
+    let (mut jb, mut mb) = flat32(&prog);
+    for _ in 0..total {
+        jb.step(&mut mb);
+    }
+    alias(&mut jb);
+    for _ in 0..2 * n {
+        jb.step(&mut mb);
+    }
+    assert_eq!(ja.regs, jb.regs, "aliased-EIP run diverged from interpreter");
+    assert_eq!(ja.cycles, jb.cycles, "aliased-EIP cycles diverged");
+}
+
+#[test]
 fn smc_invalidates_jit_block() {
     // Warm + translate a tight loop, then overwrite the loop body with a HLT
     // via a host-side store + invalidation (mirroring an os-layer trap) and
