@@ -285,3 +285,15 @@ class TestDisassemble:
 
 def test_version():
     assert remu.__version__ == "0.1.0"
+
+
+class TestRunExit:
+    def test_int_semantics(self):
+        assert remu.RunExit.Completed == 0
+        assert remu.RunExit.Halted == 2
+        assert int(remu.RunExit.Shutdown) == 3
+
+    def test_hashable(self):
+        exits = {remu.RunExit.Completed, remu.RunExit.Halted, remu.RunExit.Completed}
+        assert len(exits) == 2
+        assert remu.RunExit.Completed in exits
