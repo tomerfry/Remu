@@ -91,6 +91,32 @@ fn unmapped(addr: u64, len: usize) -> PyErr {
     ))
 }
 
+/// Read `length` guest bytes via `read_at(addr, buf) -> mapped?`, in 64 KiB
+/// chunks so the output grows only as reads succeed. An absurd `length` over
+/// unmapped memory thus raises `ValueError` at the first unmapped chunk
+/// instead of first attempting one huge up-front allocation (whose failure
+/// would abort the whole process, not raise).
+fn read_guest(
+    addr: u64,
+    length: usize,
+    mut read_at: impl FnMut(u64, &mut [u8]) -> bool,
+) -> PyResult<Vec<u8>> {
+    const CHUNK: usize = 0x10000;
+    let mut out = Vec::new();
+    let mut done = 0;
+    while done < length {
+        let n = (length - done).min(CHUNK);
+        let start = out.len();
+        out.resize(start + n, 0);
+        let a = addr.wrapping_add(done as u64);
+        if !read_at(a, &mut out[start..]) {
+            return Err(unmapped(a, n));
+        }
+        done += n;
+    }
+    Ok(out)
+}
+
 // --- Usermode (qemu-user style, Linux i386) -----------------------------------
 
 /// How a finished process ended, kept so later `run`/`step`/`__repr__` calls
@@ -234,11 +260,10 @@ impl PyUsermode {
         addr: u32,
         length: usize,
     ) -> PyResult<Bound<'py, PyBytes>> {
-        let mut buf = vec![0u8; length];
-        self.inner
-            .mem
-            .read_bytes(addr, &mut buf)
-            .map_err(|_| unmapped(addr as u64, length))?;
+        let mem = &mut self.inner.mem;
+        let buf = read_guest(addr as u64, length, |a, b| {
+            mem.read_bytes(a as u32, b).is_ok()
+        })?;
         Ok(PyBytes::new(py, &buf))
     }
 
@@ -458,10 +483,10 @@ impl PyEmulator386 {
         addr: u32,
         length: usize,
     ) -> PyResult<Bound<'py, PyBytes>> {
-        let mut buf = vec![0u8; length];
-        if !self.inner.aspace.read_bytes(&self.inner.mem, addr, &mut buf) {
-            return Err(unmapped(addr as u64, length));
-        }
+        let emu = &self.inner;
+        let buf = read_guest(addr as u64, length, |a, b| {
+            emu.aspace.read_bytes(&emu.mem, a as u32, b)
+        })?;
         Ok(PyBytes::new(py, &buf))
     }
 
@@ -671,10 +696,10 @@ impl PyEmulator64 {
         addr: u64,
         length: usize,
     ) -> PyResult<Bound<'py, PyBytes>> {
-        let mut buf = vec![0u8; length];
-        if !self.inner.aspace.read_bytes(&self.inner.mem, addr, &mut buf) {
-            return Err(unmapped(addr, length));
-        }
+        let emu = &self.inner;
+        let buf = read_guest(addr, length, |a, b| {
+            emu.aspace.read_bytes(&emu.mem, a, b)
+        })?;
         Ok(PyBytes::new(py, &buf))
     }
 

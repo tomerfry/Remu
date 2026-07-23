@@ -123,6 +123,14 @@ class TestUsermode:
         with pytest.raises(ValueError):
             um.read(0x1000, 4), "null page is unmapped"
 
+    def test_huge_read_raises(self, nolibc_bytes):
+        # An absurd length must raise at the first unmapped chunk — never
+        # attempt the full up-front allocation (whose failure would abort the
+        # interpreter, not raise).
+        um = Usermode(nolibc_bytes)
+        with pytest.raises(ValueError):
+            um.read(0x1000, 1 << 45)
+
     def test_strace_and_dump(self, nolibc_bytes):
         um = Usermode(nolibc_bytes)
         assert um.strace is False
@@ -189,6 +197,11 @@ class TestEmulator386:
         with pytest.raises(ValueError):
             emu.read(0x10, 4), "null page is unmapped"
 
+    def test_huge_read_raises(self):
+        emu = Emulator386(str(HELLO_NOLIBC))
+        with pytest.raises(ValueError):
+            emu.read(0x10, 1 << 40)
+
     def test_non_elf_path_raises(self, tmp_path):
         bad = tmp_path / "bad.bin"
         bad.write_bytes(b"this is definitely not an ELF binary")
@@ -244,6 +257,11 @@ class TestEmulator64:
         assert emu.running is True
         assert emu.run() == 7
         assert emu.running is False
+
+    def test_huge_read_raises(self):
+        emu = Emulator64(hello_elf64(MSG64, 7))
+        with pytest.raises(ValueError):
+            emu.read(0x1000, 1 << 45)
 
     def test_bad_program_raises(self):
         with pytest.raises(ValueError):

@@ -34,8 +34,16 @@ use pyo3::prelude::*;
 
 /// Why a batched `run(bus, n)` call returned, for the cores whose Rust `run`
 /// reports an exit reason (386, x86-64, ARM32).
-#[pyclass(name = "RunExit", module = "remu._remu", eq, eq_int, skip_from_py_object)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[pyclass(
+    name = "RunExit",
+    module = "remu._remu",
+    frozen,
+    eq,
+    eq_int,
+    hash,
+    skip_from_py_object
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PyRunExit {
     /// The full instruction budget was executed.
     Completed,
