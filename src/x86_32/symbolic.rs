@@ -64,6 +64,53 @@ impl Cpu {
         }
     }
 
+    /// An SMT-LIB 2 (QF_BV) script for the current path — all constraints
+    /// asserted. Solver-agnostic; run it through any SMT solver.
+    pub fn sym_smtlib(&self) -> String {
+        self.sym.as_deref().map(|e| e.smtlib(None)).unwrap_or_default()
+    }
+
+    /// An SMT-LIB 2 script that flips branch `i`: a satisfying model takes the
+    /// *other* side of that branch (the solve-for-input query).
+    pub fn sym_smtlib_flip(&self, i: usize) -> String {
+        self.sym.as_deref().map(|e| e.smtlib(Some(i))).unwrap_or_default()
+    }
+
+    /// Whether an SMT solver binary is launchable (see `REMU_SMT_SOLVER`).
+    #[cfg(feature = "symbolic-solver")]
+    pub fn sym_solver_available() -> bool {
+        crate::symbolic::Solver::new().available()
+    }
+
+    /// Solve the current path's constraints, returning a model keyed by input
+    /// name. `None` on unsat or solver failure.
+    #[cfg(feature = "symbolic-solver")]
+    pub fn sym_solve(&self) -> Option<std::collections::HashMap<String, u64>> {
+        self.sym_solve_impl(None)
+    }
+
+    /// Solve for an input that flips branch `i` (reaches the other path).
+    #[cfg(feature = "symbolic-solver")]
+    pub fn sym_solve_flip(&self, i: usize) -> Option<std::collections::HashMap<String, u64>> {
+        self.sym_solve_impl(Some(i))
+    }
+
+    #[cfg(feature = "symbolic-solver")]
+    fn sym_solve_impl(&self, flip: Option<usize>) -> Option<std::collections::HashMap<String, u64>> {
+        let eng = self.sym.as_deref()?;
+        let raw = crate::symbolic::Solver::new().solve(&eng.smtlib(flip))?;
+        // Map the SMT variable names (x!<id>) back to friendly input names.
+        let mut out = std::collections::HashMap::new();
+        for (k, v) in raw {
+            if let Some(id) = k.strip_prefix("x!").and_then(|d| d.parse::<u32>().ok())
+                && let Some(name) = eng.input_name(id)
+            {
+                out.insert(name.to_string(), v);
+            }
+        }
+        Some(out)
+    }
+
     /// The engine, for inspection (inputs, seed, constraints).
     pub fn sym_engine(&self) -> Option<&SymEngine> {
         self.sym.as_deref()

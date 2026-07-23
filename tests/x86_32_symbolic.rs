@@ -136,6 +136,56 @@ fn mov_load_then_branch() {
     assert!(!cons[0].eval(&solved), "input = MAGIC flips the branch");
 }
 
+/// The SMT-LIB export for a flipped branch is a well-formed QF_BV query.
+#[test]
+fn smtlib_export_is_wellformed() {
+    let (mut cpu, mut mem) = setup(&[
+        0x66, 0x3D, 0x2A, 0x00, 0x00, 0x00, // CMP EAX, 42
+        0x75, 0x02, 0x90, 0x90, // JNE +2 / NOPs
+    ]);
+    cpu.regs.gpr[0] = 7;
+    cpu.sym_init();
+    cpu.sym_symbolize_reg32(0, "eax");
+    cpu.step(&mut mem);
+    cpu.step(&mut mem);
+
+    let script = cpu.sym_smtlib_flip(0);
+    assert!(script.contains("(set-logic QF_BV)"));
+    assert!(script.contains("(declare-const x!0 (_ BitVec 32))"));
+    assert!(script.contains("(assert (not"), "flipped branch is negated");
+    assert!(script.contains("(check-sat)"));
+    assert!(script.contains("(get-value (x!0))"));
+}
+
+/// End-to-end: run concretely with a symbolic input, then solve for the input
+/// that reaches the other side of the branch — recovering the magic value.
+/// Skips when no SMT solver is available (set `REMU_SMT_SOLVER` or put z3 on
+/// PATH).
+#[cfg(feature = "symbolic-solver")]
+#[test]
+fn solve_for_input_recovers_magic() {
+    if !Cpu::sym_solver_available() {
+        eprintln!("no SMT solver on PATH (set REMU_SMT_SOLVER) — skipping");
+        return;
+    }
+    const MAGIC: u32 = 0x1234_5678;
+    let (mut cpu, mut mem) = setup(&[
+        0x66, 0x8B, 0x06, 0x00, 0x20, // MOV EAX, [0x2000]
+        0x66, 0x3D, 0x78, 0x56, 0x34, 0x12, // CMP EAX, MAGIC
+        0x75, 0x02, 0x90, 0x90, // JNE +2 / NOPs
+    ]);
+    mem.ram[0x2000..0x2004].copy_from_slice(&0u32.to_le_bytes()); // seed input = 0
+    cpu.sym_init();
+    cpu.sym_symbolize_mem(0x2000, 32, "input", 0);
+
+    cpu.step(&mut mem); // MOV EAX, [input]
+    cpu.step(&mut mem); // CMP EAX, MAGIC
+    cpu.step(&mut mem); // JNE (taken, since 0 != MAGIC)
+
+    let model = cpu.sym_solve_flip(0).expect("constraints should be satisfiable");
+    assert_eq!(model.get("input"), Some(&(MAGIC as u64)), "solver recovered the magic input");
+}
+
 /// A concrete branch (EAX never symbolized) records nothing.
 #[test]
 fn concrete_branch_records_nothing() {

@@ -145,6 +145,48 @@ impl SymEngine {
         true
     }
 
+    /// The friendly name of an input symbol by its numeric id.
+    pub fn input_name(&self, id: u32) -> Option<&str> {
+        self.inputs.iter().find(|i| i.id.0 == id).map(|i| i.name.as_str())
+    }
+
+    /// An SMT-LIB 2 (QF_BV) script for the current path. With `flip = Some(i)`,
+    /// the constraints up to and including branch `i` are asserted with `i`
+    /// negated (and later constraints dropped) — i.e. solve for an input that
+    /// takes the *other* side of branch `i`. With `None`, all constraints are
+    /// asserted (the current path).
+    pub fn smtlib(&self, flip: Option<usize>) -> String {
+        use super::smtlib::write_bool;
+        let mut s = String::from("(set-logic QF_BV)\n");
+        for inp in &self.inputs {
+            s.push_str(&format!("(declare-const x!{} (_ BitVec {}))\n", inp.id.0, inp.width));
+        }
+        let end = flip.map_or(self.constraints.len(), |i| i + 1);
+        for (k, c) in self.constraints[..end].iter().enumerate() {
+            s.push_str("(assert ");
+            if Some(k) == flip {
+                s.push_str("(not ");
+                write_bool(c, &mut s);
+                s.push(')');
+            } else {
+                write_bool(c, &mut s);
+            }
+            s.push_str(")\n");
+        }
+        s.push_str("(check-sat)\n");
+        if !self.inputs.is_empty() {
+            s.push_str("(get-value (");
+            for (k, inp) in self.inputs.iter().enumerate() {
+                if k > 0 {
+                    s.push(' ');
+                }
+                s.push_str(&format!("x!{}", inp.id.0));
+            }
+            s.push_str("))\n");
+        }
+        s
+    }
+
     /// Allocate a fresh input symbol seeded with `seed_val`.
     fn fresh(&mut self, name: String, width: Width, seed_val: u64) -> SymId {
         let id = SymId(self.next_id);

@@ -417,6 +417,11 @@ impl BoolExpr {
         }
     }
 
+    #[inline]
+    pub fn kind(&self) -> &BoolKind {
+        &self.0
+    }
+
     /// A comparison, folding when both operands are constant.
     pub fn cmp(op: CmpOp, a: Expr, b: Expr) -> BoolExpr {
         debug_assert_eq!(a.width(), b.width(), "cmp operand width mismatch");
