@@ -107,14 +107,14 @@ pub fn add(a: &Expr, b: &Expr, w: Width) -> (Expr, FlagDefs) {
 pub fn adc(a: &Expr, b: &Expr, cin: &BoolExpr, w: Width) -> (Expr, FlagDefs) {
     let c = Expr::ite(cin.clone(), Expr::constant(w, 1), Expr::constant(w, 0));
     let r = Expr::bin(BinOp::Add, Expr::bin(BinOp::Add, a.clone(), b.clone()), c);
-    // CF = carry out of the top bit, computed in width+1 with no wrap.
-    let w1 = w + 1;
-    let ea = Expr::zext(w1, a.clone());
-    let eb = Expr::zext(w1, b.clone());
-    let ec = Expr::ite(cin.clone(), Expr::constant(w1, 1), Expr::constant(w1, 0));
-    let sum = Expr::bin(BinOp::Add, Expr::bin(BinOp::Add, ea, eb), ec);
+    // Width-safe carry (no width+1, which would overflow u64 at width 64):
+    // r = a + b + cin overflowed ⇔ r < a, or r == a with a carry-in of 1.
+    let cf = BoolExpr::or(
+        BoolExpr::cmp(CmpOp::Ult, r.clone(), a.clone()),
+        BoolExpr::and(BoolExpr::cmp(CmpOp::Eq, r.clone(), a.clone()), cin.clone()),
+    );
     let f = FlagDefs {
-        cf: Some(BoolExpr::bit_of(sum, w)),
+        cf: Some(cf),
         af: Some(af_carry(a, b, &r)),
         of: Some(of_add(a, b, &r, w)),
         ..szp(&r, w)
@@ -138,14 +138,14 @@ pub fn sub(a: &Expr, b: &Expr, w: Width) -> (Expr, FlagDefs) {
 pub fn sbb(a: &Expr, b: &Expr, cin: &BoolExpr, w: Width) -> (Expr, FlagDefs) {
     let c = Expr::ite(cin.clone(), Expr::constant(w, 1), Expr::constant(w, 0));
     let r = Expr::bin(BinOp::Sub, Expr::bin(BinOp::Sub, a.clone(), b.clone()), c);
-    // CF = (b + c) > a, computed in width+1.
-    let w1 = w + 1;
-    let ea = Expr::zext(w1, a.clone());
-    let eb = Expr::zext(w1, b.clone());
-    let ec = Expr::ite(cin.clone(), Expr::constant(w1, 1), Expr::constant(w1, 0));
-    let bc = Expr::bin(BinOp::Add, eb, ec);
+    // Width-safe borrow (no width+1): a < b + cin ⇔ a < b, or a == b with a
+    // borrow-in of 1.
+    let cf = BoolExpr::or(
+        BoolExpr::cmp(CmpOp::Ult, a.clone(), b.clone()),
+        BoolExpr::and(BoolExpr::cmp(CmpOp::Eq, a.clone(), b.clone()), cin.clone()),
+    );
     let f = FlagDefs {
-        cf: Some(BoolExpr::cmp(CmpOp::Ult, ea, bc)),
+        cf: Some(cf),
         af: Some(af_carry(a, b, &r)),
         of: Some(of_sub(a, b, &r, w)),
         ..szp(&r, w)
@@ -520,6 +520,70 @@ mod tests {
                 let cflags = concrete_flags(cpu.regs.eflags);
                 assert_eq!(d.0.eval(&model), cres, "unary {op} w32");
                 assert_eq!(sym_flags(&d.1, prior, &model), cflags, "unary {op} flags w32");
+            }
+        }
+    }
+
+    #[test]
+    fn arithmetic_matches_concrete_64() {
+        // The 8-op ALU + INC/DEC/NEG agree between the 386 and x86-64 cores;
+        // here they are pinned at width 64 against the concrete x86-64 ALU
+        // (which is where the width-safe ADC/SBB carry formulas matter).
+        use crate::x86_64::Cpu as Cpu64;
+        use crate::x86_64::registers::RFlags;
+        let mut rng = Rng(0xf00d_cafe_1234_5678);
+        let model = Model::new();
+        let cflags = |f: RFlags| {
+            [
+                f.contains(RFlags::CF),
+                f.contains(RFlags::PF),
+                f.contains(RFlags::AF),
+                f.contains(RFlags::ZF),
+                f.contains(RFlags::SF),
+                f.contains(RFlags::OF),
+            ]
+        };
+
+        for idx in 0..8usize {
+            for _ in 0..3000 {
+                let cin = rng.next() & 1 == 1;
+                let (a, b) = (rng.next(), rng.next());
+                let mut cpu = Cpu64::new();
+                let mut fl = RFlags::from_bits_truncate(rng.next() as u32);
+                fl.set(RFlags::CF, cin);
+                cpu.regs.rflags = fl;
+                let prior = cflags(fl);
+                let cres = match idx {
+                    0 => cpu.add64(a, b),
+                    1 => cpu.or64(a, b),
+                    2 => cpu.adc64(a, b),
+                    3 => cpu.sbb64(a, b),
+                    4 => cpu.and64(a, b),
+                    5 => cpu.sub64(a, b),
+                    6 => cpu.xor64(a, b),
+                    _ => cpu.sub64(a, b),
+                };
+                let after = cflags(cpu.regs.rflags);
+                let (r, d) = alu(idx, &Expr::constant(64, a), &Expr::constant(64, b), &BoolExpr::constant(cin), 64);
+                assert_eq!(r.eval(&model), cres, "op {idx} w64 a={a:x} b={b:x} cin={cin}");
+                assert_eq!(sym_flags(&d, prior, &model), after, "flags op {idx} w64 a={a:x} b={b:x} cin={cin}");
+            }
+        }
+
+        for _ in 0..3000 {
+            let a = rng.next();
+            for op in 0..3 {
+                let mut cpu = Cpu64::new();
+                cpu.regs.rflags = RFlags::from_bits_truncate(rng.next() as u32);
+                let prior = cflags(cpu.regs.rflags);
+                let (cres, d) = match op {
+                    0 => (cpu.inc64(a), inc(&Expr::constant(64, a), 64)),
+                    1 => (cpu.dec64(a), dec(&Expr::constant(64, a), 64)),
+                    _ => (cpu.neg64(a), neg(&Expr::constant(64, a), 64)),
+                };
+                let after = cflags(cpu.regs.rflags);
+                assert_eq!(d.0.eval(&model), cres, "unary {op} w64 a={a:x}");
+                assert_eq!(sym_flags(&d.1, prior, &model), after, "unary {op} flags w64 a={a:x}");
             }
         }
     }
