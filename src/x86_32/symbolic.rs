@@ -14,7 +14,7 @@
 use super::modrm::Operand;
 use super::registers::EFlags;
 use super::Cpu;
-use crate::symbolic::{BoolExpr, Model, Place, SymEngine, SymId, Width};
+use crate::symbolic::{BoolExpr, Model, Place, SymEngine, SymId, UnaryOp, Width};
 
 /// The GPR dword slot a register operand occupies (8-bit maps AH..BH → EAX..EBX).
 #[inline]
@@ -214,6 +214,21 @@ impl Cpu {
         let ap = self.place_of(op, width);
         let dst = if wb { Some(ap) } else { None };
         self.sym_alu(idx, width, ap, Place::Imm, dst, av, bv, rv);
+    }
+
+    /// `INC`/`DEC`/`NEG` on a register.
+    pub(crate) fn sym_unary(&mut self, op: UnaryOp, reg: u8, width: Width, av: u64, rv: u64) {
+        let dst_dword = self.regs.gpr[reg_base(reg, width)];
+        if let Some(eng) = self.sym.as_deref_mut() {
+            eng.unary(op, Place::reg(reg, width), width, av, rv, dst_dword);
+        }
+    }
+
+    /// Drop a register's shadow (after a concrete `MOV reg, imm`).
+    pub(crate) fn sym_concretize_reg(&mut self, reg: u8, width: Width) {
+        if let Some(eng) = self.sym.as_deref_mut() {
+            eng.concretize_reg(reg, width);
+        }
     }
 
     /// `MOV dst, src` forward.

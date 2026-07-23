@@ -6,7 +6,7 @@
 #![cfg(feature = "symbolic")]
 
 use remu::symbolic::{Model, SymId};
-use remu::x86_32::{Cpu, LinearMemory, SegReg, reg};
+use remu::x86_32::{Cpu, EFlags, LinearMemory, SegReg, reg};
 
 /// A CPU + flat memory with `program` at `0000:1100`, real-mode defaults, DS
 /// base 0. Mirrors `x86_32_tests::setup`.
@@ -134,6 +134,61 @@ fn mov_load_then_branch() {
     let mut solved: Model = cpu.sym_seed();
     solved.insert(input, MAGIC as u64);
     assert!(!cons[0].eval(&solved), "input = MAGIC flips the branch");
+}
+
+/// INC then DEC on a symbolic register keeps the golden invariant, and INC
+/// leaves CF untouched (setting OF/SF on the signed-overflow wrap).
+#[test]
+fn inc_dec_keep_invariant() {
+    let (mut cpu, mut mem) = setup(&[0x66, 0x40, 0x66, 0x48]); // INC EAX; DEC EAX
+    cpu.regs.gpr[0] = 0x7FFF_FFFF;
+    cpu.sym_init();
+    cpu.sym_symbolize_reg32(0, "eax");
+
+    cpu.step(&mut mem); // INC -> 0x80000000: OF/SF set, CF preserved
+    assert!(cpu.sym_check_invariant());
+    assert!(cpu.regs.eflags.contains(EFlags::OF));
+    assert_eq!(cpu.regs.gpr[0], 0x8000_0000);
+
+    cpu.step(&mut mem); // DEC -> 0x7FFFFFFF
+    assert!(cpu.sym_check_invariant());
+    assert_eq!(cpu.regs.gpr[0], 0x7FFF_FFFF);
+}
+
+/// A concrete `MOV reg, imm` over a symbolic register drops its taint, so a
+/// later branch on it is concrete and records no constraint.
+#[test]
+fn imm_mov_concretizes_register() {
+    let (mut cpu, mut mem) = setup(&[
+        0x66, 0xB8, 0x63, 0x00, 0x00, 0x00, // MOV EAX, 0x63 (over symbolic EAX)
+        0x66, 0x3D, 0x63, 0x00, 0x00, 0x00, // CMP EAX, 0x63
+        0x74, 0x02, 0x90, 0x90, // JE +2
+    ]);
+    cpu.regs.gpr[0] = 5;
+    cpu.sym_init();
+    cpu.sym_symbolize_reg32(0, "eax");
+
+    cpu.step(&mut mem); // MOV EAX, 0x63 -> concrete
+    assert!(cpu.sym_check_invariant());
+    cpu.step(&mut mem); // CMP
+    cpu.step(&mut mem); // JE
+    assert!(cpu.sym_constraints().is_empty(), "concretized EAX ⇒ no symbolic branch");
+}
+
+/// A near (0F 8x) conditional jump on a symbolic flag records a constraint.
+#[test]
+fn near_jcc_records_constraint() {
+    let (mut cpu, mut mem) = setup(&[
+        0x66, 0x3D, 0x2A, 0x00, 0x00, 0x00, // CMP EAX, 42
+        0x0F, 0x85, 0x02, 0x00, 0x00, 0x00, // JNE near +2
+        0x90, 0x90,
+    ]);
+    cpu.regs.gpr[0] = 7;
+    cpu.sym_init();
+    cpu.sym_symbolize_reg32(0, "eax");
+    cpu.step(&mut mem); // CMP
+    cpu.step(&mut mem); // JNE near
+    assert_eq!(cpu.sym_constraints().len(), 1);
 }
 
 /// The SMT-LIB export for a flipped branch is a well-formed QF_BV query.

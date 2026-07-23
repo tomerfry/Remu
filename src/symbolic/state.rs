@@ -29,6 +29,14 @@ const ZF: usize = 3;
 const SF: usize = 4;
 const OF: usize = 5;
 
+/// A flag-setting unary op (`INC`/`DEC`/`NEG`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOp {
+    Inc,
+    Dec,
+    Neg,
+}
+
 /// Where an operand value lives, so a hook can fetch or store its shadow.
 /// Register indices follow the x86 instruction encoding; 8-bit uses the
 /// `AL CL DL BL AH CH DH BH` convention (index bit 2 selects the high byte).
@@ -427,6 +435,27 @@ impl SymEngine {
         if let Some(d) = dst {
             self.write_place(d, res, dst_dword);
         }
+    }
+
+    /// Symbolic side of a flag-setting unary op (`INC`/`DEC`/`NEG`). Concrete
+    /// operands fold, so this handles both the tainted and concrete cases
+    /// (`INC`/`DEC` correctly leave `CF` untouched).
+    pub fn unary(&mut self, op: UnaryOp, place: Place, width: Width, av: u64, rv: u64, dst_dword: u32) {
+        let e = self.read_place(place, width, av);
+        let (res, defs) = match op {
+            UnaryOp::Inc => alu::inc(&e, width),
+            UnaryOp::Dec => alu::dec(&e, width),
+            UnaryOp::Neg => alu::neg(&e, width),
+        };
+        debug_assert_eq!(res.eval(&self.seed), rv & mask(width), "symbolic unary diverged");
+        self.set_flags(defs);
+        self.write_place(place, res, dst_dword);
+    }
+
+    /// Drop a register's shadow (e.g. after a `MOV reg, imm` writes a concrete
+    /// value over it).
+    pub fn concretize_reg(&mut self, idx: u8, width: Width) {
+        self.concretize(Place::reg(idx, width));
     }
 
     /// Symbolic side of a `MOV dst, src`: propagate the source shadow, or

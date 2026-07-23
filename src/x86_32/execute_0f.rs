@@ -120,7 +120,13 @@ impl Cpu {
                 } else {
                     self.fetch16(bus)? as i16 as i32
                 };
-                if self.cond(opcode & 0xF) {
+                let n = opcode & 0xF;
+                let taken = self.cond(n);
+                #[cfg(feature = "symbolic")]
+                if self.sym_active() {
+                    self.sym_branch(n, taken);
+                }
+                if taken {
                     self.jump_rel(rel)?;
                     Ok(7)
                 } else {

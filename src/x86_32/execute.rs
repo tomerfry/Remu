@@ -186,22 +186,42 @@ impl Cpu {
             0x40..=0x47 => {
                 let i = opcode & 7;
                 if self.osize32 {
-                    let r = self.inc32(self.regs.reg32(i));
+                    let a = self.regs.reg32(i);
+                    let r = self.inc32(a);
                     self.regs.set_reg32(i, r);
+                    #[cfg(feature = "symbolic")]
+                    if self.sym_active() {
+                        self.sym_unary(crate::symbolic::UnaryOp::Inc, i, 32, a as u64, r as u64);
+                    }
                 } else {
-                    let r = self.inc16(self.regs.reg16(i));
+                    let a = self.regs.reg16(i);
+                    let r = self.inc16(a);
                     self.regs.set_reg16(i, r);
+                    #[cfg(feature = "symbolic")]
+                    if self.sym_active() {
+                        self.sym_unary(crate::symbolic::UnaryOp::Inc, i, 16, a as u64, r as u64);
+                    }
                 }
                 Ok(2)
             }
             0x48..=0x4F => {
                 let i = opcode & 7;
                 if self.osize32 {
-                    let r = self.dec32(self.regs.reg32(i));
+                    let a = self.regs.reg32(i);
+                    let r = self.dec32(a);
                     self.regs.set_reg32(i, r);
+                    #[cfg(feature = "symbolic")]
+                    if self.sym_active() {
+                        self.sym_unary(crate::symbolic::UnaryOp::Dec, i, 32, a as u64, r as u64);
+                    }
                 } else {
-                    let r = self.dec16(self.regs.reg16(i));
+                    let a = self.regs.reg16(i);
+                    let r = self.dec16(a);
                     self.regs.set_reg16(i, r);
+                    #[cfg(feature = "symbolic")]
+                    if self.sym_active() {
+                        self.sym_unary(crate::symbolic::UnaryOp::Dec, i, 16, a as u64, r as u64);
+                    }
                 }
                 Ok(2)
             }
@@ -611,15 +631,27 @@ impl Cpu {
             0xB0..=0xB7 => {
                 let v = self.fetch8(bus)?;
                 self.regs.set_reg8(opcode & 7, v);
+                #[cfg(feature = "symbolic")]
+                if self.sym_active() {
+                    self.sym_concretize_reg(opcode & 7, 8);
+                }
                 Ok(2)
             }
             0xB8..=0xBF => {
                 if self.osize32 {
                     let v = self.fetch32(bus)?;
                     self.regs.set_reg32(opcode & 7, v);
+                    #[cfg(feature = "symbolic")]
+                    if self.sym_active() {
+                        self.sym_concretize_reg(opcode & 7, 32);
+                    }
                 } else {
                     let v = self.fetch16(bus)?;
                     self.regs.set_reg16(opcode & 7, v);
+                    #[cfg(feature = "symbolic")]
+                    if self.sym_active() {
+                        self.sym_concretize_reg(opcode & 7, 16);
+                    }
                 }
                 Ok(2)
             }

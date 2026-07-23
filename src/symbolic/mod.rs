@@ -31,7 +31,7 @@ pub mod solver;
 pub mod state;
 
 pub use expr::{BoolExpr, Expr, Model, SymId, Width};
-pub use state::{Place, SymEngine};
+pub use state::{Place, SymEngine, UnaryOp};
 #[cfg(feature = "symbolic-solver")]
 pub use explore::{find_input, InputMap};
 #[cfg(feature = "symbolic-solver")]
