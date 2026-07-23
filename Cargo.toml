@@ -54,8 +54,8 @@ codegen-units = 1
 # touch libpython; maturin enables it (plus `pyo3/extension-module`) — see
 # pyproject.toml.
 python = ["dep:pyo3"]
-# Decode/dispatch profile counters on the 386 and x86-64 cores, for the
-# performance work: `cargo run --release --features perf-stats --example
+# Decode/dispatch profile counters on the 386, x86-64 and ARM32 cores, for
+# the performance work: `cargo run --release --features perf-stats --example
 # bench_x86`. Off by default; compiles to nothing.
 perf-stats = []
 # Template JIT (dynamic binary translation) for the x86-64 core, reached via
