@@ -186,6 +186,53 @@ fn solve_for_input_recovers_magic() {
     assert_eq!(model.get("input"), Some(&(MAGIC as u64)), "solver recovered the magic input");
 }
 
+/// Automatic multi-branch exploration: a two-byte "password" check gated by two
+/// conditional branches. The driver re-executes, flipping a branch each round,
+/// and converges on the input that reaches the success path. Skips without a
+/// solver.
+#[cfg(feature = "symbolic-solver")]
+#[test]
+fn explore_solves_password_check() {
+    use std::collections::HashMap;
+    if !Cpu::sym_solver_available() {
+        eprintln!("no SMT solver on PATH (set REMU_SMT_SOLVER) — skipping");
+        return;
+    }
+    // MOV EAX,[0x2000]; CMP AL,0x11; JNE fail; CMP AH,0x22; JNE fail;
+    // success: MOV EBX,0x600D; HLT   fail: HLT
+    let program: [u8; 22] = [
+        0x66, 0x8B, 0x06, 0x00, 0x20, // MOV EAX, [0x2000]
+        0x3C, 0x11, // CMP AL, 0x11
+        0x75, 0x0C, // JNE fail
+        0x80, 0xFC, 0x22, // CMP AH, 0x22
+        0x75, 0x07, // JNE fail
+        0x66, 0xBB, 0x0D, 0x60, 0x00, 0x00, // MOV EBX, 0x600D  (success marker)
+        0xF4, // HLT (success)
+        0xF4, // HLT (fail)
+    ];
+
+    let mut harness = |inputs: &HashMap<String, u64>| {
+        let (mut cpu, mut mem) = setup(&program);
+        let iv = inputs.get("input").copied().unwrap_or(0) as u32;
+        mem.ram[0x2000..0x2004].copy_from_slice(&iv.to_le_bytes());
+        cpu.sym_init();
+        cpu.sym_symbolize_mem(0x2000, 32, "input", iv as u64);
+        for _ in 0..16 {
+            if cpu.halted {
+                break;
+            }
+            cpu.step(&mut mem);
+        }
+        let reached = cpu.regs.gpr[3] == 0x0000_600D; // EBX marker ⇒ success path
+        (reached, *cpu.sym.take().unwrap())
+    };
+
+    let solution = remu::symbolic::find_input(50, &mut harness).expect("driver should find the input");
+    let input = solution["input"];
+    assert_eq!(input & 0xFF, 0x11, "byte 0 (AL) solved");
+    assert_eq!((input >> 8) & 0xFF, 0x22, "byte 1 (AH) solved");
+}
+
 /// A concrete branch (EAX never symbolized) records nothing.
 #[test]
 fn concrete_branch_records_nothing() {

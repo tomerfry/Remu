@@ -23,6 +23,8 @@
 
 pub mod alu;
 pub mod expr;
+#[cfg(feature = "symbolic-solver")]
+pub mod explore;
 pub mod smtlib;
 #[cfg(feature = "symbolic-solver")]
 pub mod solver;
@@ -30,5 +32,7 @@ pub mod state;
 
 pub use expr::{BoolExpr, Expr, Model, SymId, Width};
 pub use state::{Place, SymEngine};
+#[cfg(feature = "symbolic-solver")]
+pub use explore::{find_input, InputMap};
 #[cfg(feature = "symbolic-solver")]
 pub use solver::Solver;
