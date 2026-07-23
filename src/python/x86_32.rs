@@ -433,8 +433,8 @@ impl PyCpu386 {
     /// `(executed, RunExit)`: how many actually ran, and why the run ended.
     /// `RunExit.Completed` means the full budget ran; `HostTrap` means a
     /// syscall or trapped fault is pending (service `take_host_trap()` and
-    /// call `run` again); `Halted` means HLT with no wake event (assert an
-    /// interrupt to resume); `Shutdown` means triple fault (only `reset`
+    /// call `run` again); `Halted` means HLT (assert an interrupt and `step`
+    /// to resume); `Shutdown` means triple fault (only `reset`
     /// recovers). A Python bus callback raising also ends the run (see `step`
     /// for its bus semantics). The hot loop runs in Rust — with a native
     /// `Memory` it takes the core's batched (JIT-ready) path.

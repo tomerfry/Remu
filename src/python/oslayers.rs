@@ -373,8 +373,9 @@ impl PyEmulator386 {
     }
 
     /// Run the process. With `max_instructions=None`, run to completion and
-    /// return the exit code. With a budget, run at most that many
-    /// instructions: returns the exit code if the process finished, or `None`
+    /// return the exit code. With a budget, run at most about that many
+    /// step-units (the budget is approximate — syscall servicing counts
+    /// toward it): returns the exit code if the process finished, or `None`
     /// if the budget ran out first — the process stays resumable, call `run`
     /// again to continue. Every ~1 Mi instructions the loop polls for signals
     /// (Ctrl-C raises `KeyboardInterrupt`) and briefly releases the GIL.
@@ -592,8 +593,9 @@ impl PyEmulator64 {
     }
 
     /// Run the process. With `max_instructions=None`, run to completion and
-    /// return the exit code. With a budget, run at most that many
-    /// instructions: returns the exit code if the process finished, or `None`
+    /// return the exit code. With a budget, run at most about that many
+    /// step-units (the budget is approximate — syscall servicing counts
+    /// toward it): returns the exit code if the process finished, or `None`
     /// if the budget ran out first — the process stays resumable, call `run`
     /// again to continue. Every ~1 Mi instructions the loop polls for signals
     /// (Ctrl-C raises `KeyboardInterrupt`) and briefly releases the GIL.

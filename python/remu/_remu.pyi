@@ -601,7 +601,7 @@ class Usermode:
         """Data captured on a sink fd (None if `fd` isn't a sink)."""
 
     def read(self, addr: int, length: int) -> bytes:
-        """Read guest virtual memory (unmapped pages read as zeroes)."""
+        """Read guest virtual memory (ValueError on unmapped)."""
 
     def write(self, addr: int, data: _Data) -> None:
         """Write guest virtual memory (ValueError on unmapped)."""
