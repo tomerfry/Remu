@@ -1,8 +1,9 @@
 # Remu
 
 A CPU emulation framework in Rust with cycle-conscious interpreters for the
-MOS 6502, the Intel 8086/8088, the Intel 80386 and x86-64/AMD64. Goals:
-realistic emulation, and emulation speed to the MAXIMUM.
+MOS 6502, the Intel 8086/8088, the Intel 80386, x86-64/AMD64 and the
+ARM7TDMI-class ARMv4T. Goals: realistic emulation, and emulation speed to
+the MAXIMUM.
 
 ## Rust
 
@@ -75,6 +76,31 @@ cpu.step(&mut mem);
 assert_eq!(cpu.regs.gpr[0], 0x1234_5678);
 ```
 
+The ARM32 core lives in `remu::arm32` — an ARM7TDMI-class ARMv4T: the full
+ARM and Thumb instruction sets, the seven processor modes with banked
+registers, IRQ/FIQ lines and the exception vectors, and the ARM7TDMI's
+hardware quirks (unaligned-load rotation, `STR pc` = +12, R15 pipeline
+offsets per instruction class, LDM/STM base-in-list, user-bank and
+empty-list behavior, raw PSR bit storage). The instruction set is validated
+against all 2.25 million cases of the
+[SingleStepTests ARM7TDMI](https://github.com/SingleStepTests/ARM7TDMI)
+suite (`tests/harte_arm7tdmi.rs`; the S-bit multiplies' corrupted C/V flags
+are the one masked divergence). Like the other cores it carries a
+physically-keyed decoded-instruction cache with SMC write stamps, a batched
+`Cpu::run` entry point, host traps for OS-emulation layers (`trap_swi`,
+`trap_faults`), and `perf-stats` counters:
+
+```rust
+use remu::arm32::{Cpu, LinearMemory};
+
+let mut mem = LinearMemory::new();          // flat 16 MiB space
+mem.load(0, &0xE3A0_0042u32.to_le_bytes()); // MOV r0, #0x42
+
+let mut cpu = Cpu::new();                   // reset: PC = 0, Supervisor mode
+cpu.step(&mut mem);
+assert_eq!(cpu.regs.gpr[0], 0x42);
+```
+
 ## User-mode emulation (qemu-user style)
 
 `remu-user` runs statically linked Linux i386 ELF executables on the 80386
@@ -105,9 +131,10 @@ cargo test
 
 To run the exhaustive per-opcode hardware suites (data not vendored), point
 `REMU_HARTE_DIR` at a `SingleStepTests/65x02` `6502/v1` checkout,
-`REMU_HARTE_8088_DIR` at a `SingleStepTests/8088` `v2` checkout and/or
+`REMU_HARTE_8088_DIR` at a `SingleStepTests/8088` `v2` checkout,
 `REMU_HARTE_80386_DIR` at a `SingleStepTests/80386` `v1_ex_real_mode`
-checkout, then `cargo test --release`.
+checkout and/or `REMU_HARTE_ARM7_DIR` at a transcoded
+`SingleStepTests/ARM7TDMI` `v1` checkout, then `cargo test --release`.
 
 ## Python
 
