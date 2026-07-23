@@ -458,6 +458,35 @@ impl SymEngine {
         self.concretize(Place::reg(idx, width));
     }
 
+    /// Symbolic side of a shift/rotate. `sub` is the group-2 sub-op
+    /// (0=ROL 1=ROR 2=RCL 3=RCR 4/6=SHL 5=SHR 7=SAR); the count `n` is taken
+    /// **concretely** from the run (a symbolic `CL` is concretized to its seed
+    /// value — a standard concolic simplification). `RCL`/`RCR` aren't modeled,
+    /// so they concretize the destination.
+    #[allow(clippy::too_many_arguments)]
+    pub fn shift(&mut self, sub: u8, place: Place, width: Width, n: u32, vv: u64, rv: u64, dst_dword: u32) {
+        let kind = match sub {
+            0 => alu::ShiftKind::Rol,
+            1 => alu::ShiftKind::Ror,
+            4 | 6 => alu::ShiftKind::Shl,
+            5 => alu::ShiftKind::Shr,
+            7 => alu::ShiftKind::Sar,
+            _ => {
+                // RCL/RCR: not modeled — drop the shadow, clear the flags they
+                // define (CF/OF), which are now concrete.
+                self.concretize(place);
+                self.flags[CF] = None;
+                self.flags[OF] = None;
+                return;
+            }
+        };
+        let e = self.read_place(place, width, vv);
+        let (res, defs) = alu::shift(kind, &e, n, width);
+        debug_assert_eq!(res.eval(&self.seed), rv & mask(width), "symbolic shift diverged");
+        self.set_flags(defs);
+        self.write_place(place, res, dst_dword);
+    }
+
     /// Symbolic side of a `MOV dst, src`: propagate the source shadow, or
     /// concretize `dst` when the source is concrete. `width` is the move width;
     /// `val` the concrete moved value; `dst_dword` the destination register's

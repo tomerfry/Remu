@@ -175,6 +175,34 @@ fn imm_mov_concretizes_register() {
     assert!(cpu.sym_constraints().is_empty(), "concretized EAX ⇒ no symbolic branch");
 }
 
+/// Shifts propagate symbolic data (value tracked, count concretized) and keep
+/// the golden invariant; a post-shift branch is symbolic.
+#[test]
+fn shifts_propagate_and_branch() {
+    // SHL EAX,4 ; SHR EAX,2 ; SAR EAX,1 ; CMP EAX,0 ; JE
+    let (mut cpu, mut mem) = setup(&[
+        0x66, 0xC1, 0xE0, 0x04, // SHL EAX, 4
+        0x66, 0xC1, 0xE8, 0x02, // SHR EAX, 2
+        0x66, 0xC1, 0xF8, 0x01, // SAR EAX, 1
+        0x66, 0x3D, 0x00, 0x00, 0x00, 0x00, // CMP EAX, 0
+        0x74, 0x02, 0x90, 0x90, // JE +2
+    ]);
+    cpu.regs.gpr[0] = 0x1234_5678;
+    cpu.sym_init();
+    cpu.sym_symbolize_reg32(0, "eax");
+
+    for _ in 0..3 {
+        cpu.step(&mut mem);
+        assert!(cpu.sym_check_invariant(), "invariant after shift");
+    }
+    let expect = (((0x1234_5678u32 << 4) >> 2) as i32 >> 1) as u32;
+    assert_eq!(cpu.regs.gpr[0], expect);
+
+    cpu.step(&mut mem); // CMP EAX, 0
+    cpu.step(&mut mem); // JE (symbolic ⇒ constraint)
+    assert_eq!(cpu.sym_constraints().len(), 1);
+}
+
 /// A near (0F 8x) conditional jump on a symbolic flag records a constraint.
 #[test]
 fn near_jcc_records_constraint() {

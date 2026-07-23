@@ -1505,6 +1505,10 @@ impl Cpu {
             None => self.fetch8(bus)? as u32,
         };
         let r = self.shift_dispatch8(m.reg(), v, n);
+        #[cfg(feature = "symbolic")]
+        if self.sym_active() {
+            self.sym_shift(m.reg(), op, 8, n, v as u64, r as u64);
+        }
         self.write_op8(bus, op, r)?;
         Ok(if op.is_mem() { 7 } else { 3 })
     }
@@ -1531,6 +1535,11 @@ impl Cpu {
             None => self.fetch8(bus)? as u32,
         };
         let r = self.shift_dispatch(m.reg(), v, n);
+        #[cfg(feature = "symbolic")]
+        if self.sym_active() {
+            let w = if self.osize32 { 32 } else { 16 };
+            self.sym_shift(m.reg(), op, w, n, v as u64, r as u64);
+        }
         self.write_op(bus, op, r)?;
         Ok(if op.is_mem() { 7 } else { 3 })
     }

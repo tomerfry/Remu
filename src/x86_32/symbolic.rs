@@ -231,6 +231,18 @@ impl Cpu {
         }
     }
 
+    /// Shift/rotate group forward (`sub` = ModRM `reg` field, `n` = concrete count).
+    pub(crate) fn sym_shift(&mut self, sub: u8, op: Operand, width: Width, n: u32, vv: u64, rv: u64) {
+        let place = self.place_of(op, width);
+        let dst_dword = match place {
+            Place::Reg { idx, width } => self.regs.gpr[reg_base(idx, width)],
+            _ => 0,
+        };
+        if let Some(eng) = self.sym.as_deref_mut() {
+            eng.shift(sub, place, width, n, vv, rv, dst_dword);
+        }
+    }
+
     /// `MOV dst, src` forward.
     pub(crate) fn sym_mov(&mut self, dst: Place, src: Place, width: Width, val: u64) {
         let dst_dword = match dst {
