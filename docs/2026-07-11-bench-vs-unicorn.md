@@ -564,3 +564,45 @@ is set on memory-heavy 32-bit code.
   add that would shrink the `mem_rw` fallback fragment.
 - **Stage C block chaining** and the shared **usermode `run(n)`** adoption apply
   to both cores.
+
+---
+
+## 10. 8086 decoded-instruction cache — a negative result (2026-07-23)
+
+The §7 decoded-instruction cache (the +27–72% win on the 386 and x86-64) was
+ported to the 8086 core to complete the `enhance-remaining-cpus` sweep: a
+hot-subset `DecodedInsn` decoder + `exec_decoded`, a direct-mapped cache keyed
+by the 20-bit physical address (no context bits — the 8086 has one mode), SMC
+write stamps, page-cross/segment-wrap exclusions, a debug-build differential
+on every hit, and 7 fused-vs-cached lockstep tests. The port is *correct* —
+the full SingleStepTests 8088 suite (323 files, 3,007,000 cases) passes with
+the cache in the step path, and misses that decode Hot execute through
+`exec_decoded`, so the suite exercises the decoded path, not just the probe.
+
+It is also **slower on every workload** (MIPS, best of 5, same machine):
+
+| Workload | Interp | +icache | Δ |
+|---|---:|---:|---:|
+| tight_loop | 249 | 195 | −22% |
+| alu_mix | 195 | 173 | −11% |
+| mem_rw | 194 | 185 | −5% |
+| call_ret | 255 | 161 | −37% |
+
+The mechanism is the same one §9 found on the 386 JIT fallback, taken to its
+limit: the probe (physical address, slot mask, entry load, key + two version
+compares) is a fixed per-instruction cost, and what a hit *saves* scales with
+how expensive decode-and-fetch was. On the 386/x86-64, fetch goes per-byte
+through the protection stack and `step` snapshots the register file (§3's cost
+centers 1–2), so skipping re-decode paid for the probe several times over. The 8086
+core has neither — no snapshot, no fetch checks, a flat 1 MiB address space —
+and retires ~20–26 host cycles per instruction *total*, so the probe plus the
+decoded-dispatch indirection costs more than the fused `match` it replaces.
+`call_ret` loses most because CALL/RET is outside the hot subset (probe + miss
+every iteration) and every push pays a `stamp_write`. This confirms §6's
+"8086 core untouched by design" the hard way.
+
+**Disposition: not landed.** The code (`src/x86/decode.rs`, `src/x86/icache.rs`,
+the `step()` split in `src/x86/mod.rs`) is kept out of the tree. If an 8086
+template JIT is ever attempted, the SMC write-stamp machinery (not the decoded
+cache) is the piece to resurrect — a JIT's per-*block* amortization is what the
+8086's cheap interpreter denies a per-*instruction* cache.
