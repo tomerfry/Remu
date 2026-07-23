@@ -251,7 +251,105 @@ fn call_ret_x64(c: &mut Criterion) {
     bench_x64(c, "call_ret", &program);
 }
 
+// --- ARM32 core ------------------------------------------------------------
+
+/// Benchmark `STEPS` instructions of an ARM `program` at `0x1000`.
+fn bench_arm32(c: &mut Criterion, name: &str, program: &[u32], thumb: bool) {
+    use remu::arm32;
+
+    let mut mem = arm32::LinearMemory::new();
+    for (i, w) in program.iter().enumerate() {
+        mem.load(0x1000 + i as u32 * 4, &w.to_le_bytes());
+    }
+
+    let mut cpu = arm32::Cpu::new();
+    cpu.regs.cpsr.set(arm32::psr::T, thumb);
+    cpu.regs.gpr[15] = 0x1000;
+    cpu.regs.gpr[13] = 0x8000;
+
+    let mut group = c.benchmark_group("cpuarm32");
+    group.throughput(Throughput::Elements(STEPS));
+    group.bench_function(name, |b| {
+        b.iter(|| {
+            for _ in 0..STEPS {
+                cpu.step(&mut mem);
+            }
+            black_box(cpu.cycles)
+        })
+    });
+    // The same program through the batched entry point, so the step()-loop
+    // vs run() delta stays measurable.
+    group.bench_function(format!("{name}_run"), |b| {
+        b.iter(|| {
+            black_box(cpu.run(&mut mem, STEPS));
+            black_box(cpu.cycles)
+        })
+    });
+    group.finish();
+
+    assert!(cpu.host_trap.is_none(), "benchmark program {name} trapped");
+}
+
+/// Counting loop: SUBS/BNE with a B restart.
+fn tight_loop_arm32(c: &mut Criterion) {
+    #[rustfmt::skip]
+    let program = [
+        0xE3A0_10FFu32, // 1000: MOV r1, #0xFF
+        0xE251_1001,    // 1004: SUBS r1, r1, #1
+        0x1AFF_FFFD,    // 1008: BNE 1004
+        0xEAFF_FFFB,    // 100C: B 1000
+    ];
+    bench_arm32(c, "tight_loop", &program, false);
+}
+
+/// ALU mix on registers and memory (the 386/x64 `arith` shape).
+fn arith_arm32(c: &mut Criterion) {
+    #[rustfmt::skip]
+    let program = [
+        0xE3A0_1A02u32, // 1000: MOV r1, #0x2000
+        0xE3A0_0A12,    // 1004: MOV r0, #0x12000
+        0xE280_0001,    // 1008: ADD r0, r0, #1
+        0xE591_2000,    // 100C: LDR r2, [r1]
+        0xE022_2000,    // 1010: EOR r2, r2, r0
+        0xE581_2000,    // 1014: STR r2, [r1]
+        0xE1A0_0FE0,    // 1018: MOV r0, r0, ROR #31
+        0xE000_0090,    // 101C: MUL r0, r0, r0
+        0xEAFF_FFF8,    // 1020: B 1008
+    ];
+    bench_arm32(c, "arith", &program, false);
+}
+
+/// BL / MOV pc, lr subroutine traffic.
+fn call_ret_arm32(c: &mut Criterion) {
+    #[rustfmt::skip]
+    let program = [
+        0xEB00_0000u32, // 1000: BL 1008
+        0xEAFF_FFFD,    // 1004: B 1000
+        0xE280_0001,    // 1008: ADD r0, r0, #1
+        0xE1A0_F00E,    // 100C: MOV pc, lr
+    ];
+    bench_arm32(c, "call_ret", &program, false);
+}
+
+/// Thumb counting loop (16-bit fetch and decode path).
+fn thumb_loop_arm32(c: &mut Criterion) {
+    // Halfwords packed little-endian into words: 20FF 3801 | D1FD E7FB.
+    #[rustfmt::skip]
+    let program = [
+        0x3801_20FFu32, // 1000: MOVS r0, #0xFF ; 1002: SUBS r0, #1
+        0xE7FB_D1FD,    // 1004: BNE 1002       ; 1006: B 1000
+    ];
+    bench_arm32(c, "thumb_loop", &program, true);
+}
+
 criterion_group!(benches, tight_loop, memcpy, arith, jsr_rts);
 criterion_group!(benches386, tight_loop_386, arith_386, call_ret_386);
 criterion_group!(benchesx64, tight_loop_x64, arith_x64, call_ret_x64);
-criterion_main!(benches, benches386, benchesx64);
+criterion_group!(
+    benchesarm32,
+    tight_loop_arm32,
+    arith_arm32,
+    call_ret_arm32,
+    thumb_loop_arm32
+);
+criterion_main!(benches, benches386, benchesx64, benchesarm32);

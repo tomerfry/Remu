@@ -2,7 +2,8 @@
 //!
 //! An emulation framework with cycle-conscious interpreters for the MOS 6502 /
 //! 65xx CPU ([`cpu`]), the Intel 8086/8088 ([`x86`]), the Intel 80386
-//! ([`x86_32`]) and x86-64/AMD64 ([`x86_64`]).
+//! ([`x86_32`]), x86-64/AMD64 ([`x86_64`]) and the ARM7TDMI-class ARMv4T
+//! ([`arm32`]).
 //!
 //! The design keeps each CPU decoupled from memory and devices behind a bus
 //! trait ([`bus::Bus`] for the 6502, per-core `Bus` traits for the x86
@@ -28,6 +29,7 @@
 //! assert_eq!(cpu.regs.a, 0x42);
 //! ```
 
+pub mod arm32;
 pub mod bus;
 pub mod cpu;
 pub mod device;
