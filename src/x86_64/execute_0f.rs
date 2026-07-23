@@ -158,7 +158,13 @@ impl Cpu {
             0x80..=0x8F => {
                 self.osize = self.branch_osize();
                 let rel = self.fetch_rel(bus)?;
-                if self.cond(opcode & 0xF) {
+                let n = opcode & 0xF;
+                let taken = self.cond(n);
+                #[cfg(feature = "symbolic")]
+                if self.sym_active() {
+                    self.sym_branch(n, taken);
+                }
+                if taken {
                     self.jump_rel(rel)?;
                     Ok(7)
                 } else {
