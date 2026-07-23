@@ -316,7 +316,7 @@ impl PerfStats {
             .filter(|&(_, &c)| c > 0)
             .map(|(i, &c)| (OP_NAMES.get(i).copied().unwrap_or("?"), c))
             .collect();
-        ops.sort_by(|a, b| b.1.cmp(&a.1));
+        ops.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
         for (name, count) in ops {
             let pct = count as f64 / n * 100.0;
             let _ = writeln!(out, "  {name:>9}  {count:>12}  {pct:5.1}%");
