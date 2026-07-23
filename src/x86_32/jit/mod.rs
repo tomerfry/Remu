@@ -1,17 +1,24 @@
-//! Feature-gated template JIT (dynamic binary translation) for the x86-64
-//! core, reached through [`Cpu::run`]. The interpreter stays the reference:
-//! JIT'd blocks reproduce its architectural effects exactly, and anything a
-//! block cannot represent falls back to a single interpreter step.
+//! Feature-gated template JIT (dynamic binary translation) for the 80386
+//! core, reached through [`Cpu::run`]. It mirrors the x86-64 core's JIT: the
+//! interpreter stays the reference, JIT'd blocks reproduce its architectural
+//! effects exactly, and anything a block cannot represent falls back to a
+//! single interpreter step.
 //!
-//! ## Model (stage A)
+//! ## Model
 //!
-//! - Guest registers stay memory-resident in `regs.gpr`; emitted code
-//!   addresses them as `[rbp + OFF_GPR + 8*i]` (rbp pinned to `*mut Cpu`).
-//!   No register allocator — every side-exit is trivially state-correct.
+//! - Guest registers stay memory-resident in `regs.gpr` (32-bit); emitted
+//!   code addresses them as `[rbp + OFF_GPR + 4*i]` (rbp pinned to `*mut
+//!   Cpu`). No register allocator — every side-exit is trivially
+//!   state-correct.
 //! - Guest status flags live in the host EFLAGS within a block and are
-//!   materialized into `regs.rflags` only at block exits, using the last
+//!   materialized into `regs.eflags` only at block exits, using the last
 //!   flag-writer's *defined-flags* mask (so `INC`/`DEC`, which preserve CF,
 //!   leave the guest CF untouched).
+//! - Only **32-bit code segments** (CS.D = 1) are translated. EIP is then a
+//!   full 32-bit offset and near-branch targets wrap mod 2^32, matching the
+//!   emitted host arithmetic; 16-bit segments and V86 fall back to the
+//!   interpreter. The block key folds in the icache context (CS.D, CR0.PE,
+//!   EFLAGS.VM, `extensions`), so a block never outlives its mode.
 //! - Blocks are single physical page, keyed `phys | icache_ctx()`, and
 //!   revalidated in their own prologue against the icache write-stamp and
 //!   the O(1) invalidation clock — the same SMC machinery the decoded-insn
@@ -28,7 +35,7 @@ use dynasmrt::x64::Assembler;
 use dynasmrt::{AssemblyOffset, DynasmApi};
 
 use super::icache::{ICache, STAMP_SLOTS};
-use super::{Bus, Cpu, Registers, RunExit, RunResult};
+use super::{Bus, Cpu, Registers, RunExit, RunResult, reg};
 
 mod emit;
 
@@ -50,12 +57,12 @@ enum Lookup {
 // address (a `Cpu` may move). `regs`/`icache` are private to the parent
 // module, which this submodule may name.
 
-/// Offset of `regs.gpr[0]`.
+/// Offset of `regs.gpr[0]` (the register file is `[u32; 8]`, stride 4).
 pub(crate) const OFF_GPR: i32 = (offset_of!(Cpu, regs) + offset_of!(Registers, gpr)) as i32;
-/// Offset of `regs.rip`.
-pub(crate) const OFF_RIP: i32 = (offset_of!(Cpu, regs) + offset_of!(Registers, rip)) as i32;
-/// Offset of `regs.rflags` (a `u32`).
-pub(crate) const OFF_RFLAGS: i32 = (offset_of!(Cpu, regs) + offset_of!(Registers, rflags)) as i32;
+/// Offset of `regs.eip` (a `u32`).
+pub(crate) const OFF_EIP: i32 = (offset_of!(Cpu, regs) + offset_of!(Registers, eip)) as i32;
+/// Offset of `regs.eflags` (an `EFlags` newtype over `u32`).
+pub(crate) const OFF_EFLAGS: i32 = (offset_of!(Cpu, regs) + offset_of!(Registers, eflags)) as i32;
 /// Offset of `cycles`.
 pub(crate) const OFF_CYCLES: i32 = offset_of!(Cpu, cycles) as i32;
 /// Offset of the `icache.stamps` boxed-array pointer.
@@ -85,9 +92,9 @@ struct Slot {
 }
 
 /// A translated block. `key`/`version`/`stamp_slot` are retained for
-/// cross-block chaining and debugging in later stages; stage A validates
-/// through the table [`Slot`], the block's own prologue, and the dispatcher's
-/// `start_rip` guard.
+/// cross-block chaining and debugging in later stages; the base stage
+/// validates through the table [`Slot`], the block's own prologue, and the
+/// dispatcher's `start_eip` guard.
 #[allow(dead_code)]
 struct BlockMeta {
     /// `phys | icache_ctx()` of the first instruction.
@@ -98,8 +105,8 @@ struct BlockMeta {
     stamp_slot: usize,
     /// Entry point in the executable buffer.
     entry: AssemblyOffset,
-    /// Guest RIP the block starts at.
-    start_rip: u64,
+    /// Guest EIP the block starts at.
+    start_eip: u32,
     /// Instructions retired by one full traversal (the run() budget unit).
     ninsns: u32,
 }
@@ -158,9 +165,9 @@ impl Cpu {
     }
 
     /// [`Cpu::run`] with the JIT fast path. Falls back to a single
-    /// interpreter step for every boundary, non-64-bit mode, cold code, and
-    /// anything a block cannot yet represent — so its observable behavior is
-    /// identical to the interpreter `run`.
+    /// interpreter step for every boundary, non-32-bit segment, cold code,
+    /// and anything a block cannot yet represent — so its observable behavior
+    /// is identical to the interpreter `run`.
     pub(crate) fn run_jit<B: Bus>(&mut self, bus: &mut B, n: u64) -> RunResult {
         if self.host_trap.is_some() {
             return RunResult {
@@ -177,8 +184,9 @@ impl Cpu {
                 executed += 1;
                 continue;
             }
-            self.m64 = self.mode64();
-            if !self.m64 {
+            // The template JIT only translates 32-bit code segments (CS.D =
+            // 1); everything else interprets. See the module docs.
+            if !self.regs.seg[reg::CS as usize].db() {
                 self.step_fast(bus);
                 executed += 1;
                 continue;
@@ -189,15 +197,15 @@ impl Cpu {
                 executed += 1;
                 continue;
             };
-            let key = phys | self.icache_ctx();
+            let key = phys as u64 | self.icache_ctx();
             let budget = n - executed;
             match self.jit_lookup(key, phys) {
-                // The `start_rip` guard: the key is physical, but exits bake
-                // absolute RIP constants, so the same physical code reached at
-                // a different RIP (two linear pages mapped to one frame) must
-                // not enter this block.
+                // The `start_eip` guard: the key is physical, but exits bake
+                // absolute EIP constants, so the same physical code reached at
+                // a different EIP (a CS-base change, or two linear pages
+                // mapped to one frame) must not enter this block.
                 Lookup::Hit(idx)
-                    if self.jit.blocks[idx].start_rip == self.regs.rip
+                    if self.jit.blocks[idx].start_eip == self.regs.eip
                         && self.jit.blocks[idx].ninsns as u64 <= budget =>
                 {
                     let retired = self.jit_enter(idx, budget);
@@ -237,7 +245,7 @@ impl Cpu {
     /// icache write-stamp and invalidation clock. A [`COLD`] sentinel marks a
     /// head known to be untranslatable, so cold code needs no hash lookup on
     /// the fallback path.
-    fn jit_lookup(&self, key: u64, phys: u64) -> Lookup {
+    fn jit_lookup(&self, key: u64, phys: u32) -> Lookup {
         let slot = &self.jit.table[phys as usize & (JIT_SLOTS - 1)];
         if slot.key != key {
             return Lookup::Miss;
@@ -271,7 +279,7 @@ impl Cpu {
 
     /// Warm `key`'s hot counter and, once hot, translate it. Returns whether a
     /// block was installed (so the caller re-probes instead of stepping).
-    fn jit_should_translate<B: Bus>(&mut self, bus: &mut B, key: u64, phys: u64) -> bool {
+    fn jit_should_translate<B: Bus>(&mut self, bus: &mut B, key: u64, phys: u32) -> bool {
         let h = &mut self.jit.hot[phys as usize & (HOT_SLOTS - 1)];
         *h = h.saturating_add(1);
         if *h < HOT_THRESHOLD {
@@ -286,7 +294,7 @@ impl Cpu {
     /// Mark `key` as untranslatable in the direct-mapped table so the fallback
     /// path recognizes it without a hash lookup. Version-tagged, so a later
     /// guest write to the page (bumping the stamp) re-opens translation.
-    pub(super) fn jit_mark_cold(&mut self, key: u64, phys: u64) {
+    pub(super) fn jit_mark_cold(&mut self, key: u64, phys: u32) {
         let version = self.icache.clock;
         self.jit.table[phys as usize & (JIT_SLOTS - 1)] = Slot {
             key,
@@ -298,13 +306,13 @@ impl Cpu {
     /// Drop the block at `phys`'s direct-mapped slot (its code stays in the
     /// buffer until the next flush). O(1): a physical address maps to exactly
     /// one slot.
-    fn jit_evict(&mut self, phys: u64) {
+    fn jit_evict(&mut self, phys: u32) {
         self.jit.table[phys as usize & (JIT_SLOTS - 1)].key = 0;
     }
 
     /// Read the per-page write-stamp the way the icache does.
     #[inline]
-    fn icache_stamp(&self, phys: u64) -> u64 {
+    fn icache_stamp(&self, phys: u32) -> u64 {
         self.icache.stamps[(phys >> 12) as usize & (STAMP_SLOTS - 1)]
     }
 }

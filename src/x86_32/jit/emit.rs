@@ -1,37 +1,35 @@
-//! Translator and x86-64 code emitter (stages A–B).
+//! Translator and x86-64 code emitter for the 80386 core's template JIT.
 //!
 //! Decode-ahead reuses the interpreter's `try_decode`, so the translatable
-//! set is a subset of the decoded-instruction cache's hot set. Emission maps
-//! each guest instruction to the equivalent host instruction (same ISA);
-//! guest status flags ride the host EFLAGS and are materialized into
-//! `regs.rflags` only at block exits.
+//! set is a subset of the decoded-instruction cache's hot set. Each 32-bit
+//! guest instruction maps to the equivalent 32-bit host instruction (the host
+//! is x86-64, a superset of the 386 integer ISA); guest status flags ride the
+//! host EFLAGS and are materialized into `regs.eflags` only at block exits.
 //!
 //! ## Flag exactness
 //!
 //! Host and guest agree on most status-flag results, but not all: `AND`/`OR`/
 //! `XOR` leave AF undefined on the host (the interpreter clears it), multi-bit
 //! shifts/rotates leave OF undefined (the interpreter computes a value), and
-//! `IMUL` leaves SF/ZF/PF undefined. A forward flag-state machine tracks, per
-//! flag, whether the host EFLAGS currently holds the exact value, a known
-//! constant, or garbage. A block may only end where no flag is garbage, and a
-//! flag consumer (`Jcc`, `ADC`…) may only run where the flags it reads are
-//! exact; otherwise the block is cut short and the tail is interpreted.
+//! two-operand `IMUL` leaves SF/ZF/PF undefined on the host (the interpreter
+//! computes them). A forward flag-state machine tracks, per flag, whether the
+//! host EFLAGS currently holds the exact value, a known constant, or garbage.
+//! A block may only end where no flag is garbage, and a flag consumer (`Jcc`,
+//! `ADC`…) may only run where the flags it reads are exact; otherwise the
+//! block is cut short and the tail is interpreted.
 
 use dynasmrt::x64::Assembler;
 use dynasmrt::{AssemblyOffset, DynasmApi, DynasmLabelApi, dynasm};
 
-use super::super::OpSize::{O32, O64};
 use super::super::decode::{Decoded, DecodedInsn, Op, OpKind};
 use super::super::icache::STAMP_SLOTS;
 use super::super::{Bus, Cpu};
-use super::{
-    BlockMeta, JIT_SLOTS, OFF_CYCLES, OFF_GPR, OFF_INVAL, OFF_RFLAGS, OFF_RIP, OFF_STAMPS, Slot,
-};
+use super::{BlockMeta, JIT_SLOTS, OFF_CYCLES, OFF_EFLAGS, OFF_EIP, OFF_INVAL, OFF_STAMPS, Slot};
 
 /// Longest block the translator will build.
 const MAX_BLOCK_INSNS: usize = 64;
 
-// RFLAGS status-bit positions.
+// EFLAGS status-bit positions.
 const CF: u32 = 0x001;
 const PF: u32 = 0x004;
 const AF: u32 = 0x010;
@@ -40,8 +38,10 @@ const SF: u32 = 0x080;
 const OF: u32 = 0x800;
 const ALL: u32 = CF | PF | AF | ZF | SF | OF; // 0x8D5
 
-// Per-instruction cycle weights, mirroring `exec_decoded` exactly so JIT'd
-// blocks keep `Cpu::cycles` in lockstep with the interpreter.
+// Per-instruction cycle weights, mirroring `exec_decoded`'s register-form
+// counts exactly so JIT'd blocks keep `Cpu::cycles` in lockstep with the
+// interpreter. (Only register operands are translated, so the memory-form
+// weights never apply.)
 const CYC_MOV: u32 = 2;
 const CYC_INCDEC: u32 = 2;
 const CYC_ALU: u32 = 2;
@@ -51,44 +51,27 @@ const CYC_JCC_TAKEN: u32 = 7;
 const CYC_JCC_NOT: u32 = 3;
 const CYC_JMP: u32 = 7;
 
-/// Guest reg at `[rbp + gpr_off(i)]`.
+/// Guest reg at `[rbp + gpr_off(i)]` (register file is `[u32; 8]`, stride 4).
 #[inline]
 fn gpr_off(i: u8) -> i32 {
-    OFF_GPR + 8 * (i as i32)
+    super::OFF_GPR + 4 * (i as i32)
 }
 
-/// A translated non-terminator body operation.
+/// A translated non-terminator body operation. Every operand is 32-bit.
 #[derive(Clone, Copy)]
 enum Body {
-    /// `MOV reg, imm` (full-register value already resolved).
-    StoreImm { reg: u8, val: u64, o64: bool },
+    /// `MOV reg, imm32`.
+    StoreImm { reg: u8, val: u32 },
     /// `INC`/`DEC reg`.
-    IncDec { reg: u8, dec: bool, o64: bool },
-    /// `dst = dst OP src` (register/register ALU).
-    AluRR {
-        dst: u8,
-        src: u8,
-        aluop: u8,
-        wb: bool,
-        o64: bool,
-    },
-    /// `dst = dst OP imm`.
-    AluImm {
-        dst: u8,
-        aluop: u8,
-        imm: i32,
-        wb: bool,
-        o64: bool,
-    },
+    IncDec { reg: u8, dec: bool },
+    /// `dst = dst OP src` (register/register ALU); `wb` false means TEST/CMP.
+    AluRR { dst: u8, src: u8, aluop: u8, wb: bool },
+    /// `dst = dst OP imm32`.
+    AluImm { dst: u8, aluop: u8, imm: i32, wb: bool },
     /// Shift/rotate by an immediate count.
-    Shift {
-        reg: u8,
-        shop: u8,
-        count: u8,
-        o64: bool,
-    },
+    Shift { reg: u8, shop: u8, count: u8 },
     /// `dst = dst * src` (two-operand IMUL).
-    Imul { dst: u8, src: u8, o64: bool },
+    Imul { dst: u8, src: u8 },
 }
 
 /// Which status flags an operation defines exactly (host == interpreter),
@@ -113,14 +96,14 @@ impl FlagEffect {
 enum Term {
     Jcc {
         cc: u8,
-        taken: u64,
-        fallthrough: u64,
+        taken: u32,
+        fallthrough: u32,
     },
     Jmp {
-        target: u64,
+        target: u32,
     },
     Fall {
-        rip: u64,
+        eip: u32,
     },
 }
 
@@ -136,7 +119,7 @@ struct Plan {
     mat_const1: u32,
     ninsns: u32,
     body_cycles: u32,
-    start_rip: u64,
+    start_eip: u32,
 }
 
 impl Plan {
@@ -151,7 +134,7 @@ struct Cand {
     term: Option<Term>,
     effect: FlagEffect,
     cyc: u32,
-    end_rip: u64,
+    end_eip: u32,
 }
 
 /// Flags read by a `Jcc` condition code.
@@ -181,7 +164,8 @@ fn alu_effect(aluop: u8) -> FlagEffect {
             ..Default::default()
         }, // ADC SBB
         1 | 4 | 6 => FlagEffect {
-            // OR AND XOR: CF/OF = 0, SF/ZF/PF exact, AF cleared.
+            // OR AND XOR (and TEST, encoded as AND): CF/OF = 0, SF/ZF/PF
+            // exact, AF cleared.
             exact: CF | OF | SF | ZF | PF,
             const0: AF,
             ..Default::default()
@@ -191,20 +175,16 @@ fn alu_effect(aluop: u8) -> FlagEffect {
 }
 
 impl Cpu {
-    /// Decode-ahead one instruction at the current RIP without executing it.
+    /// Decode-ahead one instruction at the current EIP without executing it.
     fn jit_decode_one<B: Bus>(&mut self, bus: &mut B) -> Option<DecodedInsn> {
         self.ilen = 0;
         self.seg_override = None;
         self.rep = None;
         self.lock = false;
         self.lock_ok = false;
-        self.rex = None;
-        self.prefix66 = false;
         self.commit_on_fault = false;
         self.cold_saved = false;
         self.supervisor_override = false;
-        self.imm_len = 0;
-        self.used_rip_rel = false;
         let (opcode, npfx) = self.scan_prefixes(bus).ok()?;
         if self.lock || self.rep.is_some() {
             return None;
@@ -218,19 +198,20 @@ impl Cpu {
 
     /// Classify a decoded instruction as a translatable body op with its flag
     /// effect and cycle weight (terminators are handled separately).
+    ///
+    /// Only 32-bit operand size is translated (16-bit forms write partial
+    /// registers, which the register-slot model does not preserve) and only
+    /// register operands (memory operands are a later stage).
     fn classify_body(d: &DecodedInsn) -> Option<(Body, FlagEffect, u32)> {
-        let o64 = match d.osize() {
-            O64 => true,
-            O32 => false,
-            _ => return None,
-        };
+        if !d.osize32() {
+            return None;
+        }
         let reg = d.kind() == OpKind::Reg;
         match d.op {
             Op::MovRegImmW => Some((
                 Body::StoreImm {
                     reg: d.reg,
-                    val: if o64 { d.imm } else { d.imm as u32 as u64 },
-                    o64,
+                    val: d.imm,
                 },
                 FlagEffect::default(),
                 CYC_MOV,
@@ -238,17 +219,39 @@ impl Cpu {
             Op::MovRmImmW if reg => Some((
                 Body::StoreImm {
                     reg: d.base,
-                    val: if o64 { d.imm } else { d.imm as u32 as u64 },
-                    o64,
+                    val: d.imm,
                 },
                 FlagEffect::default(),
                 CYC_MOV,
             )),
+            // Single-byte INC/DEC reg (40–4F).
+            Op::IncReg => Some((
+                Body::IncDec {
+                    reg: d.reg,
+                    dec: false,
+                },
+                FlagEffect {
+                    exact: SF | ZF | AF | PF | OF,
+                    ..Default::default()
+                },
+                CYC_INCDEC,
+            )),
+            Op::DecReg => Some((
+                Body::IncDec {
+                    reg: d.reg,
+                    dec: true,
+                },
+                FlagEffect {
+                    exact: SF | ZF | AF | PF | OF,
+                    ..Default::default()
+                },
+                CYC_INCDEC,
+            )),
+            // Group FF /0 /1 INC/DEC r/m, register form.
             Op::IncDecRmW if reg => Some((
                 Body::IncDec {
                     reg: d.base,
                     dec: d.aux != 0,
-                    o64,
                 },
                 FlagEffect {
                     exact: SF | ZF | AF | PF | OF,
@@ -263,7 +266,6 @@ impl Cpu {
                     src: d.reg,
                     aluop: d.aux,
                     wb: d.wb(),
-                    o64,
                 },
                 alu_effect(d.aux),
                 CYC_ALU,
@@ -275,7 +277,6 @@ impl Cpu {
                     src: d.base,
                     aluop: d.aux,
                     wb: d.wb(),
-                    o64,
                 },
                 alu_effect(d.aux),
                 CYC_ALU,
@@ -286,7 +287,6 @@ impl Cpu {
                     aluop: d.aux,
                     imm: d.imm as i32,
                     wb: d.wb(),
-                    o64,
                 },
                 alu_effect(d.aux),
                 CYC_ALU,
@@ -297,7 +297,6 @@ impl Cpu {
                     aluop: d.aux,
                     imm: d.imm as i32,
                     wb: d.wb(),
-                    o64,
                 },
                 alu_effect(d.aux),
                 CYC_ALU,
@@ -307,15 +306,13 @@ impl Cpu {
                 if shop == 2 || shop == 3 {
                     return None; // RCL/RCR (carry-chained) not translated yet
                 }
-                let width = if o64 { 64 } else { 32 };
-                let count = (d.imm as u32) & (width - 1);
+                let count = d.imm & 0x1F; // 386 masks the count to 5 bits
                 let eff = shift_effect(shop, count);
                 Some((
                     Body::Shift {
                         reg: d.base,
                         shop,
                         count: count as u8,
-                        o64,
                     },
                     eff,
                     CYC_SHIFT,
@@ -325,7 +322,6 @@ impl Cpu {
                 Body::Imul {
                     dst: d.reg,
                     src: d.base,
-                    o64,
                 },
                 FlagEffect {
                     exact: CF | OF,
@@ -339,16 +335,16 @@ impl Cpu {
         }
     }
 
-    /// Translate the block at the current RIP; returns whether one was
+    /// Translate the block at the current EIP; returns whether one was
     /// installed. On failure the guest key is remembered as cold.
-    pub(super) fn jit_translate<B: Bus>(&mut self, bus: &mut B, key: u64, phys: u64) -> bool {
-        let start_rip = self.regs.rip;
+    pub(super) fn jit_translate<B: Bus>(&mut self, bus: &mut B, key: u64, phys: u32) -> bool {
+        let start_eip = self.regs.eip;
         // Decode-ahead is speculative: a fetch that page-faults is discarded,
         // but the walker has already written CR2 by then, and a fault that is
         // never delivered must not be architecturally visible.
         let saved_cr2 = self.regs.cr2;
-        let plan = self.jit_plan(bus, phys, start_rip);
-        self.regs.rip = start_rip; // decode-ahead advanced it
+        let plan = self.jit_plan(bus, phys, start_eip);
+        self.regs.eip = start_eip; // decode-ahead advanced it
         self.regs.cr2 = saved_cr2;
         let Some(plan) = plan else {
             self.jit_mark_cold(key, phys);
@@ -372,7 +368,7 @@ impl Cpu {
             version,
             stamp_slot,
             entry,
-            start_rip,
+            start_eip,
             ninsns: plan.ninsns,
         });
         self.jit.table[phys as usize & (JIT_SLOTS - 1)] = Slot { key, version, idx };
@@ -380,27 +376,31 @@ impl Cpu {
     }
 
     /// Decode-ahead + two-pass flag analysis into a [`Plan`].
-    fn jit_plan<B: Bus>(&mut self, bus: &mut B, phys: u64, start_rip: u64) -> Option<Plan> {
+    fn jit_plan<B: Bus>(&mut self, bus: &mut B, phys: u32, start_eip: u32) -> Option<Plan> {
         // Pass 1: decode-ahead candidates until a terminator, page end, an
         // untranslatable instruction, or the length cap.
         let mut cands: Vec<Cand> = Vec::new();
-        let mut total_len = 0u64;
+        let mut total_len = 0u32;
         loop {
             if cands.len() >= MAX_BLOCK_INSNS || (phys & 0xFFF) + total_len >= 0x1000 {
                 break;
             }
-            let insn_start = self.regs.rip;
+            let insn_start = self.regs.eip;
             let Some(d) = self.jit_decode_one(bus) else {
-                self.regs.rip = insn_start;
+                self.regs.eip = insn_start;
                 break;
             };
-            if (phys & 0xFFF) + total_len + d.len as u64 > 0x1000 {
-                self.regs.rip = insn_start; // crosses the page
+            // Any legacy prefix costs the interpreter one cycle per byte; the
+            // emitted block does not model that, so refuse prefixed forms to
+            // keep cycles exact. (In a 32-bit segment the hot set is
+            // prefix-free anyway.)
+            if d.npfx() != 0 || (phys & 0xFFF) + total_len + d.len as u32 > 0x1000 {
+                self.regs.eip = insn_start;
                 break;
             }
-            let end = insn_start + d.len as u64;
+            let end = insn_start.wrapping_add(d.len as u32);
             if d.op == Op::Jcc || d.op == Op::JmpRel {
-                let target = end.wrapping_add(d.imm as i64 as u64);
+                let target = end.wrapping_add(d.imm);
                 let (term, reads) = if d.op == Op::JmpRel {
                     (Term::Jmp { target }, 0)
                 } else {
@@ -422,12 +422,12 @@ impl Cpu {
                         ..Default::default()
                     },
                     cyc,
-                    end_rip: end,
+                    end_eip: end,
                 });
                 break;
             }
             let Some((body, effect, cyc)) = Self::classify_body(&d) else {
-                self.regs.rip = insn_start;
+                self.regs.eip = insn_start;
                 break;
             };
             cands.push(Cand {
@@ -435,9 +435,9 @@ impl Cpu {
                 term: None,
                 effect,
                 cyc,
-                end_rip: end,
+                end_eip: end,
             });
-            total_len += d.len as u64;
+            total_len += d.len as u32;
         }
 
         // Pass 2: forward flag simulation, taking the longest prefix that ends
@@ -445,7 +445,7 @@ impl Cpu {
         let (mut exact, mut const0, mut const1, mut garbage) = (0u32, 0u32, 0u32, 0u32);
         let mut cut = 0usize;
         let mut mat = (0u32, 0u32, 0u32);
-        let mut exit = Term::Fall { rip: start_rip };
+        let mut exit = Term::Fall { eip: start_eip };
         for (i, c) in cands.iter().enumerate() {
             if c.effect.reads & !exact != 0 {
                 break; // reads a non-exact flag
@@ -458,7 +458,7 @@ impl Cpu {
             if garbage == 0 {
                 cut = i + 1;
                 mat = (exact, const0, const1);
-                exit = c.term.unwrap_or(Term::Fall { rip: c.end_rip });
+                exit = c.term.unwrap_or(Term::Fall { eip: c.end_eip });
             }
         }
         if cut == 0 {
@@ -476,7 +476,7 @@ impl Cpu {
             }
         }
         let self_loop = match exit {
-            Term::Jcc { taken, .. } | Term::Jmp { target: taken } => taken == start_rip,
+            Term::Jcc { taken, .. } | Term::Jmp { target: taken } => taken == start_eip,
             Term::Fall { .. } => false,
         };
         Some(Plan {
@@ -488,13 +488,13 @@ impl Cpu {
             mat_const1: mat.2,
             ninsns,
             body_cycles,
-            start_rip,
+            start_eip,
         })
     }
 }
 
 /// Flag effect of a shift/rotate with a known immediate `count` (already
-/// masked to the operand width).
+/// masked to 5 bits).
 fn shift_effect(shop: u8, count: u32) -> FlagEffect {
     if count == 0 {
         return FlagEffect::default(); // no flags change
@@ -552,20 +552,15 @@ macro_rules! jcc_to {
     };
 }
 
-/// Emit `dst = dst OP src` for a memory destination and the value already in
-/// `rax`/`eax`. `aluop` 7 is CMP (no write-back).
-fn emit_alu(ops: &mut Assembler, aluop: u8, dst: i32, o64: bool, wb: bool) {
-    if o64 {
-        match aluop {
-            0 => dynasm!(ops ; .arch x64 ; add QWORD [rbp + dst], rax),
-            1 => dynasm!(ops ; .arch x64 ; or QWORD [rbp + dst], rax),
-            2 => dynasm!(ops ; .arch x64 ; adc QWORD [rbp + dst], rax),
-            3 => dynasm!(ops ; .arch x64 ; sbb QWORD [rbp + dst], rax),
-            4 => dynasm!(ops ; .arch x64 ; and QWORD [rbp + dst], rax),
-            5 => dynasm!(ops ; .arch x64 ; sub QWORD [rbp + dst], rax),
-            6 => dynasm!(ops ; .arch x64 ; xor QWORD [rbp + dst], rax),
-            _ => dynasm!(ops ; .arch x64 ; cmp QWORD [rbp + dst], rax),
-        }
+/// Emit `dst = dst OP src` for the guest register slot at `dst` and the value
+/// already in `eax`. `aluop` 7 is CMP and `wb == false` (with a writing
+/// selector) is TEST — neither writes the destination.
+fn emit_alu(ops: &mut Assembler, aluop: u8, dst: i32, wb: bool) {
+    if aluop == 7 {
+        dynasm!(ops ; .arch x64 ; cmp DWORD [rbp + dst], eax);
+    } else if !wb {
+        // AND without write-back is TEST (the only non-writing ALU selector).
+        dynasm!(ops ; .arch x64 ; test DWORD [rbp + dst], eax);
     } else {
         match aluop {
             0 => dynasm!(ops ; .arch x64 ; add DWORD [rbp + dst], eax),
@@ -574,28 +569,17 @@ fn emit_alu(ops: &mut Assembler, aluop: u8, dst: i32, o64: bool, wb: bool) {
             3 => dynasm!(ops ; .arch x64 ; sbb DWORD [rbp + dst], eax),
             4 => dynasm!(ops ; .arch x64 ; and DWORD [rbp + dst], eax),
             5 => dynasm!(ops ; .arch x64 ; sub DWORD [rbp + dst], eax),
-            6 => dynasm!(ops ; .arch x64 ; xor DWORD [rbp + dst], eax),
-            _ => dynasm!(ops ; .arch x64 ; cmp DWORD [rbp + dst], eax),
-        }
-        if wb {
-            dynasm!(ops ; .arch x64 ; mov DWORD [rbp + dst + 4], 0);
+            _ => dynasm!(ops ; .arch x64 ; xor DWORD [rbp + dst], eax),
         }
     }
 }
 
-/// Emit `dst = dst OP imm` for a memory destination.
-fn emit_alu_imm(ops: &mut Assembler, aluop: u8, dst: i32, imm: i32, o64: bool, wb: bool) {
-    if o64 {
-        match aluop {
-            0 => dynasm!(ops ; .arch x64 ; add QWORD [rbp + dst], imm),
-            1 => dynasm!(ops ; .arch x64 ; or QWORD [rbp + dst], imm),
-            2 => dynasm!(ops ; .arch x64 ; adc QWORD [rbp + dst], imm),
-            3 => dynasm!(ops ; .arch x64 ; sbb QWORD [rbp + dst], imm),
-            4 => dynasm!(ops ; .arch x64 ; and QWORD [rbp + dst], imm),
-            5 => dynasm!(ops ; .arch x64 ; sub QWORD [rbp + dst], imm),
-            6 => dynasm!(ops ; .arch x64 ; xor QWORD [rbp + dst], imm),
-            _ => dynasm!(ops ; .arch x64 ; cmp QWORD [rbp + dst], imm),
-        }
+/// Emit `dst = dst OP imm` for a guest register slot.
+fn emit_alu_imm(ops: &mut Assembler, aluop: u8, dst: i32, imm: i32, wb: bool) {
+    if aluop == 7 {
+        dynasm!(ops ; .arch x64 ; cmp DWORD [rbp + dst], imm);
+    } else if !wb {
+        dynasm!(ops ; .arch x64 ; test DWORD [rbp + dst], imm);
     } else {
         match aluop {
             0 => dynasm!(ops ; .arch x64 ; add DWORD [rbp + dst], imm),
@@ -604,11 +588,7 @@ fn emit_alu_imm(ops: &mut Assembler, aluop: u8, dst: i32, imm: i32, o64: bool, w
             3 => dynasm!(ops ; .arch x64 ; sbb DWORD [rbp + dst], imm),
             4 => dynasm!(ops ; .arch x64 ; and DWORD [rbp + dst], imm),
             5 => dynasm!(ops ; .arch x64 ; sub DWORD [rbp + dst], imm),
-            6 => dynasm!(ops ; .arch x64 ; xor DWORD [rbp + dst], imm),
-            _ => dynasm!(ops ; .arch x64 ; cmp DWORD [rbp + dst], imm),
-        }
-        if wb {
-            dynasm!(ops ; .arch x64 ; mov DWORD [rbp + dst + 4], 0);
+            _ => dynasm!(ops ; .arch x64 ; xor DWORD [rbp + dst], imm),
         }
     }
 }
@@ -616,24 +596,16 @@ fn emit_alu_imm(ops: &mut Assembler, aluop: u8, dst: i32, imm: i32, o64: bool, w
 /// Emit a body op.
 fn emit_body(ops: &mut Assembler, b: &Body) {
     match *b {
-        Body::StoreImm { reg, val, o64 } => {
+        Body::StoreImm { reg, val } => {
             let off = gpr_off(reg);
-            if o64 {
-                dynasm!(ops ; .arch x64 ; mov rax, QWORD val as i64 ; mov [rbp + off], rax);
-            } else {
-                dynasm!(ops ; .arch x64 ; mov eax, DWORD val as i32 ; mov [rbp + off], rax);
-            }
+            dynasm!(ops ; .arch x64 ; mov DWORD [rbp + off], DWORD val as i32);
         }
-        Body::IncDec { reg, dec, o64 } => {
+        Body::IncDec { reg, dec } => {
             let off = gpr_off(reg);
-            match (o64, dec) {
-                (true, true) => dynasm!(ops ; .arch x64 ; dec QWORD [rbp + off]),
-                (true, false) => dynasm!(ops ; .arch x64 ; inc QWORD [rbp + off]),
-                (false, true) => dynasm!(ops ; .arch x64 ; dec DWORD [rbp + off]),
-                (false, false) => dynasm!(ops ; .arch x64 ; inc DWORD [rbp + off]),
-            }
-            if !o64 {
-                dynasm!(ops ; .arch x64 ; mov DWORD [rbp + off + 4], 0);
+            if dec {
+                dynasm!(ops ; .arch x64 ; dec DWORD [rbp + off]);
+            } else {
+                dynasm!(ops ; .arch x64 ; inc DWORD [rbp + off]);
             }
         }
         Body::AluRR {
@@ -641,76 +613,46 @@ fn emit_body(ops: &mut Assembler, b: &Body) {
             src,
             aluop,
             wb,
-            o64,
         } => {
             let (d, s) = (gpr_off(dst), gpr_off(src));
-            if o64 {
-                dynasm!(ops ; .arch x64 ; mov rax, [rbp + s]);
-            } else {
-                dynasm!(ops ; .arch x64 ; mov eax, [rbp + s]);
-            }
-            emit_alu(ops, aluop, d, o64, wb);
+            dynasm!(ops ; .arch x64 ; mov eax, [rbp + s]);
+            emit_alu(ops, aluop, d, wb);
         }
         Body::AluImm {
             dst,
             aluop,
             imm,
             wb,
-            o64,
         } => {
-            emit_alu_imm(ops, aluop, gpr_off(dst), imm, o64, wb);
+            emit_alu_imm(ops, aluop, gpr_off(dst), imm, wb);
         }
-        Body::Shift {
-            reg,
-            shop,
-            count,
-            o64,
-        } => {
+        Body::Shift { reg, shop, count } => {
             let off = gpr_off(reg);
             let c = count as i8;
-            if o64 {
-                match shop {
-                    0 => dynasm!(ops ; .arch x64 ; rol QWORD [rbp + off], c),
-                    1 => dynasm!(ops ; .arch x64 ; ror QWORD [rbp + off], c),
-                    4 => dynasm!(ops ; .arch x64 ; shl QWORD [rbp + off], c),
-                    5 => dynasm!(ops ; .arch x64 ; shr QWORD [rbp + off], c),
-                    _ => dynasm!(ops ; .arch x64 ; sar QWORD [rbp + off], c),
-                }
-            } else {
-                match shop {
-                    0 => dynasm!(ops ; .arch x64 ; rol DWORD [rbp + off], c),
-                    1 => dynasm!(ops ; .arch x64 ; ror DWORD [rbp + off], c),
-                    4 => dynasm!(ops ; .arch x64 ; shl DWORD [rbp + off], c),
-                    5 => dynasm!(ops ; .arch x64 ; shr DWORD [rbp + off], c),
-                    _ => dynasm!(ops ; .arch x64 ; sar DWORD [rbp + off], c),
-                }
-                dynasm!(ops ; .arch x64 ; mov DWORD [rbp + off + 4], 0);
+            match shop {
+                0 => dynasm!(ops ; .arch x64 ; rol DWORD [rbp + off], c),
+                1 => dynasm!(ops ; .arch x64 ; ror DWORD [rbp + off], c),
+                4 => dynasm!(ops ; .arch x64 ; shl DWORD [rbp + off], c),
+                5 => dynasm!(ops ; .arch x64 ; shr DWORD [rbp + off], c),
+                _ => dynasm!(ops ; .arch x64 ; sar DWORD [rbp + off], c),
             }
         }
-        Body::Imul { dst, src, o64 } => {
+        Body::Imul { dst, src } => {
             let (d, s) = (gpr_off(dst), gpr_off(src));
-            if o64 {
-                dynasm!(ops ; .arch x64
-                    ; mov rax, [rbp + d]
-                    ; imul rax, [rbp + s]
-                    ; mov [rbp + d], rax
-                );
-            } else {
-                dynasm!(ops ; .arch x64
-                    ; mov eax, [rbp + d]
-                    ; imul eax, [rbp + s]
-                    ; mov [rbp + d], rax
-                );
-            }
+            dynasm!(ops ; .arch x64
+                ; mov eax, [rbp + d]
+                ; imul eax, [rbp + s]
+                ; mov [rbp + d], eax
+            );
         }
     }
 }
 
-/// Materialize the live host status flags into `regs.rflags`: `from_host` bits
+/// Materialize the live host status flags into `regs.eflags`: `from_host` bits
 /// come from EFLAGS, `const0`/`const1` are forced, everything else is kept.
 ///
 /// Uses `LAHF`/`SETO` to read the flags — universal on modern x86-64 (the
-/// host this JIT targets), though absent on the earliest AMD64 steppings.
+/// host this JIT targets).
 fn emit_materialize(ops: &mut Assembler, from_host: u32, const0: u32, const1: u32) {
     let clear = (from_host | const0 | const1) as i32;
     if clear == 0 {
@@ -729,10 +671,10 @@ fn emit_materialize(ops: &mut Assembler, from_host: u32, const0: u32, const1: u3
         ; and eax, DWORD low
         ; or eax, ecx
         ; or eax, DWORD c1
-        ; mov ecx, [rbp + OFF_RFLAGS]
+        ; mov ecx, [rbp + OFF_EFLAGS]
         ; and ecx, DWORD !clear
         ; or ecx, eax
-        ; mov [rbp + OFF_RFLAGS], ecx
+        ; mov [rbp + OFF_EFLAGS], ecx
     );
 }
 
@@ -742,8 +684,8 @@ enum Cyc {
     Const(u32),
 }
 
-/// Emit an exit: materialize flags, flush cycles, set RIP, load retired count.
-fn emit_exit(ops: &mut Assembler, plan: &Plan, rip: u64, retired_r8: bool, ninsns: u32, cyc: Cyc) {
+/// Emit an exit: materialize flags, flush cycles, set EIP, load retired count.
+fn emit_exit(ops: &mut Assembler, plan: &Plan, eip: u32, retired_r8: bool, ninsns: u32, cyc: Cyc) {
     if plan.flags_dirty() {
         emit_materialize(ops, plan.mat_from_host, plan.mat_const0, plan.mat_const1);
     }
@@ -752,8 +694,7 @@ fn emit_exit(ops: &mut Assembler, plan: &Plan, rip: u64, retired_r8: bool, ninsn
         Cyc::Const(c) => dynasm!(ops ; .arch x64 ; add QWORD [rbp + OFF_CYCLES], DWORD c as i32),
     }
     dynasm!(ops ; .arch x64
-        ; mov r9, QWORD rip as i64
-        ; mov [rbp + OFF_RIP], r9
+        ; mov DWORD [rbp + OFF_EIP], DWORD eip as i32
     );
     if retired_r8 {
         dynasm!(ops ; .arch x64 ; mov rax, r8);
@@ -831,7 +772,7 @@ fn emit_block(ops: &mut Assembler, plan: &Plan, version: u64, stamp_slot: usize)
                 );
                 emit_backedge(ops, body_top);
                 // rcx == 0: budget exhausted after a taken branch.
-                emit_exit(ops, plan, plan.start_rip, true, ninsns, Cyc::R11);
+                emit_exit(ops, plan, plan.start_eip, true, ninsns, Cyc::R11);
                 dynasm!(ops ; .arch x64
                     ; =>exit_ft
                     ; lea r8, [r8 + ninsns as i32]
@@ -846,7 +787,7 @@ fn emit_block(ops: &mut Assembler, plan: &Plan, version: u64, stamp_slot: usize)
                     ; lea r11, [r11 + cyc_iter]
                 );
                 emit_backedge(ops, body_top);
-                emit_exit(ops, plan, plan.start_rip, true, ninsns, Cyc::R11);
+                emit_exit(ops, plan, plan.start_eip, true, ninsns, Cyc::R11);
             }
             Term::Fall { .. } => unreachable!("self_loop implies a branch terminator"),
         }
@@ -883,8 +824,8 @@ fn emit_block(ops: &mut Assembler, plan: &Plan, version: u64, stamp_slot: usize)
             Term::Jmp { target } => {
                 emit_exit(ops, plan, target, false, ninsns, Cyc::Const(bc + CYC_JMP));
             }
-            Term::Fall { rip } => {
-                emit_exit(ops, plan, rip, false, ninsns, Cyc::Const(bc));
+            Term::Fall { eip } => {
+                emit_exit(ops, plan, eip, false, ninsns, Cyc::Const(bc));
             }
         }
     }
