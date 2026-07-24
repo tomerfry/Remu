@@ -123,6 +123,57 @@ user-mode guests. Current limits (v1): `ET_EXEC` only (no dynamic
 linking/PIE), integer-only binaries (no x87), no signals, no threads. See
 `tests/data/README.md` for building compatible test programs.
 
+## Symbolic execution
+
+Behind the `symbolic` feature the 80386, x86-64 and ARM7TDMI cores can run
+**concolically**: the concrete interpreter stays the ground truth and stays
+fast, while a sparse symbolic *shadow* rides alongside it, tracking bitvector
+expressions for the registers, flags and memory bytes derived from marked
+inputs. Any branch whose condition depends on symbolic data records a path
+constraint; an SMT solver then resolves them — to recover an input that reaches
+a target, or to enumerate paths automatically. It is the analysis capability
+Triton layers on Unicorn, native to Remu and driven by one architecture-neutral
+engine shared across all three cores.
+
+The classic "solve for the magic input" flow (build with
+`--features symbolic-solver`, and put a `z3`/`cvc5` binary on `PATH`, or point
+`REMU_SMT_SOLVER` at one):
+
+```rust
+use remu::x86_32::{Cpu, LinearMemory};
+
+let mut mem = LinearMemory::new();
+mem.load(0x1100, &[
+    0x66, 0x8B, 0x06, 0x00, 0x20,       // MOV EAX, [0x2000]
+    0x66, 0x3D, 0x78, 0x56, 0x34, 0x12, // CMP EAX, 0x12345678
+    0x75, 0x02,                         // JNE +2
+]);
+
+let mut cpu = Cpu::new();
+cpu.set_cs_ip(0x0000, 0x1100);
+cpu.sym_init();                                // enable the concolic overlay
+cpu.sym_symbolize_mem(0x2000, 32, "input", 0); // 4 symbolic input bytes
+
+cpu.step(&mut mem); // MOV — EAX now carries the symbolic input
+cpu.step(&mut mem); // CMP
+cpu.step(&mut mem); // JNE — records the branch constraint
+
+// Solve for the input that takes the other side of the branch.
+let model = cpu.sym_solve_flip(0).unwrap();
+assert_eq!(model["input"], 0x1234_5678);
+```
+
+Registers and memory are marked with `sym_symbolize_reg*` / `sym_symbolize_mem`;
+alongside `sym_solve_flip` the overlay exposes the raw path constraints
+(`sym_constraints`), an SMT-LIB 2 export for any external solver (`sym_smtlib`),
+and a generational explorer (`remu::symbolic::find_input`) that re-executes
+while negating branches to reach a goal automatically. Symbolic ALU/flags and a
+symbolic memory model are shared; each core only adds a small binding. A
+symbolic address is concretized with a pinning constraint (SAGE/Triton style).
+Everything is compile-gated: with the feature off the module is not built and the
+cores are byte-for-byte unchanged — the full SingleStepTests suites still pass
+with the overlay compiled in.
+
 ## Tests
 
 ```sh
