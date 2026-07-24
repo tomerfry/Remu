@@ -23,8 +23,9 @@ use std::collections::HashMap;
 use super::alu::{self, FlagDefs};
 use super::expr::{mask, BoolExpr, Expr, Model, SymId, Width};
 
-/// Status-flag slot indices (the order [`FlagDefs`] and [`SymEngine::flags`]
-/// use): carry, parity, aux, zero, sign, overflow.
+/// x86 status-flag slot indices (the order [`FlagDefs`] and the x86 hooks use):
+/// carry, parity, aux, zero, sign, overflow. Other cores index [`SymEngine::flags`]
+/// with their own convention (e.g. ARM's N/Z/C/V) — the store is just a slice.
 const CF: usize = 0;
 const PF: usize = 1;
 const AF: usize = 2;
@@ -81,7 +82,9 @@ pub struct SymEngine {
     /// Per-register `reg_bits`-wide symbolic value; `None` = concrete.
     regs: Vec<Option<Expr>>,
     /// Per-status-flag symbolic value; `None` = concrete (read real flags).
-    flags: [Option<BoolExpr>; 6],
+    /// Sized per architecture (6 for x86, 4 for ARM NZCV); indexed by the
+    /// core's own flag convention.
+    flags: Vec<Option<BoolExpr>>,
     /// Symbolic memory, one 8-bit expr per linear address; absent = concrete.
     mem: HashMap<u64, Expr>,
     /// Concrete seed value for each input symbol (the concolic witness).
@@ -94,13 +97,14 @@ pub struct SymEngine {
 }
 
 impl SymEngine {
-    /// A fresh engine for a core with `num_regs` registers of `reg_bits` bits.
-    pub fn new(num_regs: usize, reg_bits: Width) -> Self {
+    /// A fresh engine for a core with `num_regs` registers of `reg_bits` bits
+    /// and `num_flags` status flags.
+    pub fn new(num_regs: usize, reg_bits: Width, num_flags: usize) -> Self {
         SymEngine {
             enabled: false,
             reg_bits,
             regs: vec![None; num_regs],
-            flags: std::array::from_fn(|_| None),
+            flags: vec![None; num_flags],
             mem: HashMap::new(),
             seed: Model::new(),
             inputs: Vec::new(),
@@ -326,7 +330,8 @@ impl SymEngine {
 
     // --- Places -----------------------------------------------------------------
 
-    fn place_symbolic(&self, place: Place) -> bool {
+    /// Whether any bit of `place` currently carries a symbolic value.
+    pub fn place_symbolic(&self, place: Place) -> bool {
         match place {
             Place::Reg { slot, .. } => self.reg_symbolic(slot),
             Place::Mem { lin, width } => self.mem_symbolic(lin, width),
@@ -334,7 +339,9 @@ impl SymEngine {
         }
     }
 
-    fn read_place(&mut self, place: Place, width: Width, concrete: u64) -> Expr {
+    /// Read the symbolic value of `place` at `width` bits, self-healing a stale
+    /// shadow against the observed `concrete` value.
+    pub fn read_place(&mut self, place: Place, width: Width, concrete: u64) -> Expr {
         match place {
             Place::Reg { slot, lo, .. } => self.read_reg(slot, lo, width, concrete),
             Place::Mem { lin, .. } => self.read_mem(lin, width, concrete),
@@ -342,7 +349,9 @@ impl SymEngine {
         }
     }
 
-    fn write_place(&mut self, place: Place, value: Expr, concrete_reg: u64) {
+    /// Store a symbolic value into `place`. `concrete_reg` is the destination
+    /// register's concrete value (for sub-register splices; ignored for memory).
+    pub fn write_place(&mut self, place: Place, value: Expr, concrete_reg: u64) {
         match place {
             Place::Reg { slot, lo, width } => self.write_reg(slot, lo, width, value, concrete_reg),
             Place::Mem { lin, width } => self.store_mem(lin, width, value),
@@ -350,7 +359,8 @@ impl SymEngine {
         }
     }
 
-    fn concretize(&mut self, place: Place) {
+    /// Drop the shadow of `place` (make it concrete).
+    pub fn concretize(&mut self, place: Place) {
         match place {
             Place::Reg { slot, .. } => self.regs[slot as usize] = None,
             Place::Mem { lin, width } => {
@@ -369,7 +379,9 @@ impl SymEngine {
 
     // --- Flags ------------------------------------------------------------------
 
-    fn flag_bool(&mut self, i: usize, concrete_bit: bool) -> BoolExpr {
+    /// Read status flag `i` as a boolean expression, self-healing a stale
+    /// shadow against `concrete_bit`.
+    pub fn flag(&mut self, i: usize, concrete_bit: bool) -> BoolExpr {
         match self.flags[i].clone() {
             Some(e) => {
                 if e.eval(&self.seed) != concrete_bit {
@@ -383,19 +395,38 @@ impl SymEngine {
         }
     }
 
-    fn put_flag(&mut self, i: usize, d: Option<BoolExpr>) {
+    /// Set status flag `i`; `None` leaves it unchanged, a folded (concrete)
+    /// expression clears the shadow.
+    pub fn set_flag(&mut self, i: usize, d: Option<BoolExpr>) {
         if let Some(e) = d {
             self.flags[i] = if e.as_const().is_some() { None } else { Some(e) };
         }
     }
 
+    /// Clear every flag shadow (they became concrete).
+    pub fn clear_flags(&mut self) {
+        for f in self.flags.iter_mut() {
+            *f = None;
+        }
+    }
+
+    /// Record a branch/predication constraint from an already-built predicate
+    /// (`pred == taken`). No-op when the predicate folded to a constant.
+    pub fn record_branch(&mut self, pred: BoolExpr, taken: bool) {
+        if pred.as_const().is_some() {
+            return;
+        }
+        debug_assert_eq!(pred.eval(&self.seed), taken, "branch predicate diverged from concrete");
+        self.constraints.push(if taken { pred } else { BoolExpr::not(pred) });
+    }
+
     fn set_flags(&mut self, d: FlagDefs) {
-        self.put_flag(CF, d.cf);
-        self.put_flag(PF, d.pf);
-        self.put_flag(AF, d.af);
-        self.put_flag(ZF, d.zf);
-        self.put_flag(SF, d.sf);
-        self.put_flag(OF, d.of);
+        self.set_flag(CF, d.cf);
+        self.set_flag(PF, d.pf);
+        self.set_flag(AF, d.af);
+        self.set_flag(ZF, d.zf);
+        self.set_flag(SF, d.sf);
+        self.set_flag(OF, d.of);
     }
 
     // --- Hooks (called by the per-core glue) ------------------------------------
@@ -424,12 +455,12 @@ impl SymEngine {
             if let Some(d) = dst {
                 self.concretize(d);
             }
-            self.flags = std::array::from_fn(|_| None);
+            self.clear_flags();
             return;
         }
         let ea = self.read_place(a, width, av);
         let eb = self.read_place(b, width, bv);
-        let cin = self.flag_bool(CF, cin_bit);
+        let cin = self.flag(CF, cin_bit);
         let (res, defs) = alu::alu(idx, &ea, &eb, &cin, width);
         debug_assert_eq!(res.eval(&self.seed), rv & mask(width), "symbolic ALU diverged from concrete");
         self.set_flags(defs);
@@ -495,11 +526,11 @@ impl SymEngine {
     /// the deciding flags are symbolic; `concrete_bits` are the six live flag
     /// bits (CF PF AF ZF SF OF) and `taken` the concrete decision.
     pub fn branch(&mut self, n: u8, taken: bool, concrete_bits: [bool; 6]) {
-        let cf = self.flag_bool(CF, concrete_bits[CF]);
-        let pf = self.flag_bool(PF, concrete_bits[PF]);
-        let zf = self.flag_bool(ZF, concrete_bits[ZF]);
-        let sf = self.flag_bool(SF, concrete_bits[SF]);
-        let of = self.flag_bool(OF, concrete_bits[OF]);
+        let cf = self.flag(CF, concrete_bits[CF]);
+        let pf = self.flag(PF, concrete_bits[PF]);
+        let zf = self.flag(ZF, concrete_bits[ZF]);
+        let sf = self.flag(SF, concrete_bits[SF]);
+        let of = self.flag(OF, concrete_bits[OF]);
         let base = match n >> 1 {
             0 => of,
             1 => cf,
@@ -511,10 +542,6 @@ impl SymEngine {
             _ => BoolExpr::or(zf, BoolExpr::xor(sf, of)),
         };
         let pred = if n & 1 != 0 { BoolExpr::not(base) } else { base };
-        if pred.as_const().is_some() {
-            return; // condition fully concrete — not a symbolic branch
-        }
-        debug_assert_eq!(pred.eval(&self.seed), taken, "branch predicate diverged from concrete");
-        self.constraints.push(if taken { pred } else { BoolExpr::not(pred) });
+        self.record_branch(pred, taken);
     }
 }

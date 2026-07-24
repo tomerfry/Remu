@@ -22,6 +22,7 @@
 //!   input that flips a branch.
 
 pub mod alu;
+pub mod arm_alu;
 pub mod expr;
 #[cfg(feature = "symbolic-solver")]
 pub mod explore;

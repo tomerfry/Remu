@@ -18,7 +18,7 @@ impl Cpu {
     /// Enable the concolic overlay (idempotent).
     pub fn sym_init(&mut self) {
         self.sym
-            .get_or_insert_with(|| Box::new(SymEngine::new(16, 64)))
+            .get_or_insert_with(|| Box::new(SymEngine::new(16, 64, 6)))
             .enable();
     }
 

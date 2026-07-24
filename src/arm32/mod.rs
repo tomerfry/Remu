@@ -36,7 +36,7 @@
 //! assert_eq!(cpu.regs.gpr[0], 0x42);
 //! ```
 
-mod alu;
+pub(crate) mod alu;
 mod decode;
 mod execute;
 mod icache;
