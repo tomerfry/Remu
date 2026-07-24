@@ -36,6 +36,23 @@ fn arm_golden_invariant() {
     assert_eq!(cpu.regs.gpr[0], 0x1234 + 5 - 2);
 }
 
+/// Register-operand data-processing (DpShImm): `MOV r1, r0` propagates taint,
+/// and a shifted-register op tracks through the barrel shifter.
+#[test]
+fn arm_reg_operand_propagates() {
+    // MOV r1, r0 ; ADDS r1, r1, r0, LSL #1
+    let (mut cpu, mut mem) = arm(&[0xE1A0_1000, 0xE091_1080]);
+    cpu.regs.gpr[0] = 0x100;
+    cpu.sym_init();
+    cpu.sym_symbolize_reg(0, "r0");
+
+    cpu.step(&mut mem); // MOV r1, r0        -> r1 = r0
+    assert!(cpu.sym_check_invariant());
+    cpu.step(&mut mem); // ADDS r1, r1, r0<<1 -> r1 = r0 + (r0<<1)
+    assert!(cpu.sym_check_invariant());
+    assert_eq!(cpu.regs.gpr[1], 0x100 + (0x100 << 1));
+}
+
 /// Overlay inert until enabled.
 #[test]
 fn arm_overlay_inert() {

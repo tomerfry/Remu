@@ -144,10 +144,11 @@ impl Cpu {
         eng.record_branch(pred, pass);
     }
 
-    /// Symbolic side of a data-processing instruction. Immediate forms are
-    /// modeled exactly; register-operand forms concretize. The concrete op has
-    /// already run. Concrete values (`cin_c`..`v_c`) are the pre-op carry-in,
-    /// `Rn`, `op2`, shifter-carry, result, and the arithmetic carry/overflow.
+    /// Symbolic side of a data-processing instruction. Immediate (`DpImm`) and
+    /// immediate-shifted-register (`DpShImm`) forms are modeled exactly;
+    /// register-shift (`DpShReg`) and r15 destinations concretize. The concrete
+    /// op has already run. Concrete values (`cin_c`..`v_c`) are the pre-op
+    /// carry-in, `Rn`, `op2`, shifter-carry, result, and arithmetic carry/ovf.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn sym_dp(&mut self, d: &DecodedInsn, cin_c: bool, rn_c: u32, op2_c: u32, sc_c: bool, result_c: u32, _c_c: bool, _v_c: bool) {
         let opn = d.aux & dp::OP;
@@ -155,15 +156,19 @@ impl Cpu {
         let writes_rd = !matches!(opn, alu_op::TST | alu_op::TEQ | alu_op::CMP | alu_op::CMN);
         let rd = d.rd;
         let rn = d.rn;
+        let rm = d.rm;
+        let ty = (d.aux & dp::TY) >> dp::TY_SHIFT;
         let concrete_rd = self.regs.gpr[rd as usize] as u64;
+        // Rm's raw value (before the barrel shift) for the DpShImm read fallback.
+        let rm_c = if d.op == Op::DpShImm { self.reg_op(rm) } else { 0 };
 
         let Some(eng) = self.sym.as_deref_mut() else {
             return;
         };
 
-        // Register-operand forms and r15 destinations aren't modeled: drop the
+        // Register-shift forms and r15 destinations aren't modeled: drop the
         // affected shadows (self-heal keeps reads sound).
-        if d.op != Op::DpImm || (writes_rd && rd == 15) {
+        if d.op == Op::DpShReg || (writes_rd && rd == 15) {
             if writes_rd && rd != 15 {
                 eng.concretize(Place::reg(rd, 0, 32));
             }
@@ -175,12 +180,21 @@ impl Cpu {
 
         let cin = eng.flag(C, cin_c);
         let rn_e = eng.read_place(Place::reg(rn, 0, 32), 32, rn_c as u64);
-        let op2 = Expr::constant(32, op2_c as u64); // immediate ⇒ concrete
-        // Shifter carry feeds the C flag of the logical ops.
-        let sc = if d.aux & dp::ROT != 0 {
-            BoolExpr::constant(sc_c)
-        } else {
-            cin.clone()
+        // Operand 2 and its shifter carry: a concrete rotated immediate, or the
+        // symbolic Rm barrel-shifted by the immediate amount.
+        let (op2, sc) = match d.op {
+            Op::DpImm => (
+                Expr::constant(32, op2_c as u64),
+                if d.aux & dp::ROT != 0 {
+                    BoolExpr::constant(sc_c)
+                } else {
+                    cin.clone()
+                },
+            ),
+            _ => {
+                let rm_e = eng.read_place(Place::reg(rm, 0, 32), 32, rm_c as u64);
+                arm_alu::shift_imm(ty, d.rs, &rm_e, &cin)
+            }
         };
 
         let t = BoolExpr::constant(true);
