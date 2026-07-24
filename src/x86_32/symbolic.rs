@@ -14,7 +14,7 @@
 use super::modrm::Operand;
 use super::registers::EFlags;
 use super::Cpu;
-use crate::symbolic::{BoolExpr, Model, Place, SymEngine, SymId, UnaryOp, Width};
+use crate::symbolic::{BoolExpr, Expr, Model, Place, SymEngine, SymId, UnaryOp, Width};
 
 /// Resolve a register operand index + width into a `{slot, lo, width}` slice,
 /// mapping the 386 `AL CL DL BL AH CH DH BH` 8-bit convention.
@@ -254,6 +254,29 @@ impl Cpu {
     pub(crate) fn sym_mov_r_rm(&mut self, width: Width, op: Operand, reg: u8, val: u64) {
         let src = self.place_of(op, width);
         self.sym_mov(reg_place(reg, width), src, width, val);
+    }
+
+    /// Symbolic memory addressing: when a `[base + disp]` effective address
+    /// uses a symbolic base register, pin it to its concrete value with a path
+    /// constraint (`base + disp == concrete`). The access itself still uses the
+    /// concrete address; negating this pin during exploration reaches a
+    /// different address (SAGE/Triton-style concretization).
+    pub(crate) fn sym_pin_addr(&mut self, base_reg: u8, disp: u32, concrete_off: u32) {
+        let base_c = self.regs.gpr[(base_reg & 7) as usize];
+        let place = Place::reg(base_reg & 7, 0, 32);
+        if let Some(eng) = self.sym.as_deref_mut() {
+            if !eng.place_symbolic(place) {
+                return;
+            }
+            let base_e = eng.read_place(place, 32, base_c as u64);
+            let off_e = if disp == 0 {
+                base_e
+            } else {
+                Expr::bin(crate::symbolic::expr::BinOp::Add, base_e, Expr::constant(32, disp as u64))
+            };
+            let pin = BoolExpr::cmp(crate::symbolic::expr::CmpOp::Eq, off_e, Expr::constant(32, concrete_off as u64));
+            eng.record_branch(pin, true);
+        }
     }
 
     /// Conditional branch: record a path constraint when the condition is

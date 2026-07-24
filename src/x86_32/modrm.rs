@@ -127,9 +127,16 @@ impl Cpu {
             1 => self.fetch8(bus)? as i8 as u32,
             _ => self.fetch32(bus)?,
         };
+        let off = base.wrapping_add(disp);
+        // A non-SIB base register (rm != 4) may be symbolic — pin the address.
+        // SIB (scaled index) forms are deferred.
+        #[cfg(feature = "symbolic")]
+        if self.sym_active() && m.rm() != 4 {
+            self.sym_pin_addr(m.rm(), disp, off);
+        }
         Ok(Operand::Mem {
             seg: self.seg_or(seg),
-            off: base.wrapping_add(disp),
+            off,
         })
     }
 

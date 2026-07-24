@@ -316,6 +316,31 @@ fn explore_solves_password_check() {
     assert_eq!((input >> 8) & 0xFF, 0x22, "byte 1 (AH) solved");
 }
 
+/// A symbolic address (base register) is concretized with a pinning constraint:
+/// the access uses the concrete address, and `base == concrete` is recorded so
+/// exploration can negate it to reach a different address.
+#[test]
+fn symbolic_address_pins() {
+    // 66 67 8B 03: MOV EAX, [EBX]  (32-bit operand + 32-bit address).
+    let (mut cpu, mut mem) = setup(&[0x66, 0x67, 0x8B, 0x03]);
+    cpu.regs.gpr[reg::EBX as usize] = 0x2000;
+    mem.ram[0x2000..0x2004].copy_from_slice(&0xCAFE_BABEu32.to_le_bytes());
+    cpu.sym_init();
+    let ebx = cpu.sym_symbolize_reg32(reg::EBX, "ebx"); // the address is symbolic
+
+    cpu.step(&mut mem); // MOV EAX, [EBX]
+    assert_eq!(cpu.regs.gpr[0], 0xCAFE_BABE, "data read from the concrete address");
+    assert!(cpu.sym_check_invariant());
+
+    let cons = cpu.sym_constraints();
+    assert_eq!(cons.len(), 1, "one symbolic-address pin");
+    let seed = cpu.sym_seed();
+    assert!(cons[0].eval(&seed), "pin holds at the concrete address");
+    let mut other = seed.clone();
+    other.insert(ebx, 0x3000);
+    assert!(!cons[0].eval(&other), "pin fails at a different address");
+}
+
 /// A concrete branch (EAX never symbolized) records nothing.
 #[test]
 fn concrete_branch_records_nothing() {
