@@ -115,7 +115,14 @@ impl Cpu {
     /// it; `self.start_pc`/`self.thumb` describe it. Returns the cycles
     /// consumed, or the exception to deliver.
     pub(crate) fn exec_decoded<B: Bus>(&mut self, bus: &mut B, d: &DecodedInsn) -> Exec<u32> {
-        if !self.cond_pass(d.cond) {
+        let pass = self.cond_pass(d.cond);
+        // Every ARM instruction is predicated, so a conditional instruction on a
+        // symbolic flag is a path fork (not just branches).
+        #[cfg(feature = "symbolic")]
+        if self.sym_active() && d.cond < 0xE {
+            self.sym_cond(d.cond, pass);
+        }
+        if !pass {
             return Ok(1);
         }
         match d.op {
@@ -304,6 +311,10 @@ impl Cpu {
             } else {
                 self.regs.gpr[d.rd as usize] = result;
             }
+        }
+        #[cfg(feature = "symbolic")]
+        if self.sym_active() {
+            self.sym_dp(d, carry_in, rn, op2, sc, result, c, v);
         }
         Ok(cycles)
     }
