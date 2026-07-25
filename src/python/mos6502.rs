@@ -1,8 +1,5 @@
-//! Python bindings (PyO3), compiled only with the `python` cargo feature.
-//!
-//! Exposes the crate as the `remu` extension module, built with
-//! [maturin](https://www.maturin.rs) — see `pyproject.toml`. The API mirrors the
-//! Rust one but leans pythonic:
+//! Python bindings for the MOS 6502 core (`remu.mos6502`, also re-exported at
+//! the top level as `remu.Cpu` / `remu.Memory` / `remu.disassemble`).
 //!
 //! ```python
 //! import remu
@@ -16,88 +13,47 @@
 //! cpu.step(mem)
 //! assert cpu.a == 0x42
 //! ```
-//!
-//! Anywhere a bus is expected, either a [`Memory`](PyMemory) (fast, stays in
-//! Rust) or any Python object with `read(addr)` / `write(addr, value)` methods
-//! (flexible, for MMIO experiments) is accepted.
 
-use pyo3::IntoPyObjectExt;
-use pyo3::exceptions::{PyIndexError, PyTypeError, PyValueError};
-use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PySlice};
+use pyo3::types::PyBytes;
 
+use super::util;
 use crate::bus::Bus;
 use crate::cpu::disasm;
 use crate::memory::FlatMemory;
 use crate::{Cpu, Status};
 
-const ADDRESS_SPACE: isize = 0x10000;
-
-// --- Bus dispatch -----------------------------------------------------------
+// --- Bus dispatch -------------------------------------------------------------
 
 /// A [`Bus`] that forwards each access to a Python object's `read`/`write`
-/// methods. The first exception raised by a callback is stashed (the 6502 has
-/// no bus fault to map it to, so the access reads as 0 / the write is dropped)
-/// and re-raised once the current instruction finishes.
+/// methods (the 6502 has no bus fault to map an exception to, so the access
+/// reads as 0 / the write is dropped and the exception re-raises once the
+/// current instruction finishes).
 struct CallbackBus<'py> {
     obj: Bound<'py, PyAny>,
     error: Option<PyErr>,
 }
 
-impl Bus for CallbackBus<'_> {
-    fn read(&mut self, addr: u16) -> u8 {
-        if self.error.is_some() {
-            return 0;
-        }
-        let read = intern!(self.obj.py(), "read");
-        match self
-            .obj
-            .call_method1(read, (addr,))
-            .and_then(|v| v.extract::<u8>())
-        {
-            Ok(v) => v,
-            Err(e) => {
-                self.error = Some(e);
-                0
-            }
-        }
-    }
-
-    fn write(&mut self, addr: u16, value: u8) {
-        if self.error.is_some() {
-            return;
-        }
-        let write = intern!(self.obj.py(), "write");
-        if let Err(e) = self.obj.call_method1(write, (addr, value)) {
-            self.error = Some(e);
-        }
-    }
-}
-
-/// The bus argument accepted by every CPU entry point: a native [`PyMemory`]
-/// (borrowed mutably for the duration of the call, no Python overhead per
-/// access) or a duck-typed Python object.
+/// The bus argument accepted by every CPU entry point: a native
+/// [`Memory6502`](PyMemory6502) (borrowed mutably for the duration of the
+/// call, no Python overhead per access) or a duck-typed Python object.
 enum BusArg<'py> {
-    Flat(PyRefMut<'py, PyMemory>),
+    Flat(PyRefMut<'py, PyMemory6502>),
     Callback(CallbackBus<'py>),
 }
 
 impl<'py> BusArg<'py> {
     fn from_any(bus: &Bound<'py, PyAny>) -> PyResult<Self> {
-        if let Ok(mem) = bus.cast::<PyMemory>() {
+        if let Ok(mem) = bus.cast::<PyMemory6502>() {
             return Ok(BusArg::Flat(mem.try_borrow_mut()?));
         }
-        let py = bus.py();
-        if bus.hasattr(intern!(py, "read"))? && bus.hasattr(intern!(py, "write"))? {
+        if util::is_duck_bus(bus)? {
             return Ok(BusArg::Callback(CallbackBus {
                 obj: bus.clone(),
                 error: None,
             }));
         }
-        Err(PyTypeError::new_err(
-            "bus must be a remu.Memory or an object with read(addr) and write(addr, value) methods",
-        ))
+        Err(util::bus_type_error("remu.Memory"))
     }
 
     /// Re-raise an exception stashed by a Python bus callback, if any.
@@ -109,6 +65,16 @@ impl<'py> BusArg<'py> {
                 None => Ok(()),
             },
         }
+    }
+}
+
+impl Bus for CallbackBus<'_> {
+    fn read(&mut self, addr: u16) -> u8 {
+        util::cb_read(&self.obj, &mut self.error, addr as u64)
+    }
+
+    fn write(&mut self, addr: u16, value: u8) {
+        util::cb_write(&self.obj, &mut self.error, addr as u64, value)
     }
 }
 
@@ -128,38 +94,21 @@ impl Bus for BusArg<'_> {
     }
 }
 
-// --- Memory ------------------------------------------------------------------
+// --- Memory -------------------------------------------------------------------
 
 /// Python-facing wrapper over [`FlatMemory`]: a flat 64 KiB address space with
 /// `mem[addr]` / `mem[start:stop]` indexing.
-#[pyclass(name = "Memory", module = "remu")]
-pub struct PyMemory {
+#[pyclass(name = "Memory6502", module = "remu._remu")]
+pub struct PyMemory6502 {
     inner: FlatMemory,
 }
 
-fn normalize_index(index: &Bound<'_, PyAny>) -> PyResult<usize> {
-    if !index.is_instance_of::<pyo3::types::PyInt>() {
-        return Err(PyTypeError::new_err(
-            "memory indices must be integers or slices",
-        ));
-    }
-    // An int that doesn't fit isize is out of range like any other (list semantics).
-    let i: isize = index
-        .extract()
-        .map_err(|_| PyIndexError::new_err("address out of range (0..=0xFFFF)"))?;
-    let i = if i < 0 { i + ADDRESS_SPACE } else { i };
-    if !(0..ADDRESS_SPACE).contains(&i) {
-        return Err(PyIndexError::new_err("address out of range (0..=0xFFFF)"));
-    }
-    Ok(i as usize)
-}
-
 #[pymethods]
-impl PyMemory {
+impl PyMemory6502 {
     /// Create a zero-initialized 64 KiB memory.
     #[new]
     fn new() -> Self {
-        PyMemory {
+        PyMemory6502 {
             inner: FlatMemory::new(),
         }
     }
@@ -185,48 +134,15 @@ impl PyMemory {
     }
 
     fn __len__(&self) -> usize {
-        ADDRESS_SPACE as usize
+        0x10000
     }
 
     fn __getitem__(&self, py: Python<'_>, index: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        if let Ok(slice) = index.cast::<PySlice>() {
-            let idx = slice.indices(ADDRESS_SPACE)?;
-            let mut out = Vec::with_capacity(idx.slicelength);
-            let mut i = idx.start;
-            for _ in 0..idx.slicelength {
-                out.push(self.inner.ram[i as usize]);
-                i += idx.step;
-            }
-            PyBytes::new(py, &out).into_py_any(py)
-        } else {
-            self.inner.ram[normalize_index(index)?].into_py_any(py)
-        }
+        util::ram_getitem(py, &self.inner.ram[..], index)
     }
 
     fn __setitem__(&mut self, index: &Bound<'_, PyAny>, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        if let Ok(slice) = index.cast::<PySlice>() {
-            let idx = slice.indices(ADDRESS_SPACE)?;
-            let data: Vec<u8> = value.extract().map_err(|_| {
-                PyTypeError::new_err("expected bytes-like or iterable of ints in 0..=255")
-            })?;
-            if data.len() != idx.slicelength {
-                return Err(PyValueError::new_err(format!(
-                    "cannot assign {} bytes to slice of length {}",
-                    data.len(),
-                    idx.slicelength
-                )));
-            }
-            let mut i = idx.start;
-            for b in data {
-                self.inner.ram[i as usize] = b;
-                i += idx.step;
-            }
-            Ok(())
-        } else {
-            let i = normalize_index(index)?;
-            self.inner.ram[i] = value.extract()?;
-            Ok(())
-        }
+        util::ram_setitem(&mut self.inner.ram[..], index, value)
     }
 
     /// The full 64 KiB as `bytes` (supports `bytes(mem)`).
@@ -261,20 +177,60 @@ fn flags_str(p: Status) -> String {
     )
 }
 
+/// Getter/setter pairs for plain `u8`/`u16` register fields.
+macro_rules! reg_props {
+    ($($(#[doc = $doc:expr])* $name:ident : $ty:ty = $get:ident / $set:ident),+ $(,)?) => {
+        #[pymethods]
+        impl PyCpu6502 {
+            $(
+                $(#[doc = $doc])*
+                #[getter]
+                fn $get(&self) -> $ty {
+                    self.inner.regs.$name
+                }
+                #[setter]
+                fn $set(&mut self, v: $ty) {
+                    self.inner.regs.$name = v;
+                }
+            )+
+        }
+    };
+}
+
+/// Getter/setter pairs for individual status-register bits.
+macro_rules! flag_props {
+    ($($(#[doc = $doc:expr])* $bit:ident : $get:ident / $set:ident),+ $(,)?) => {
+        #[pymethods]
+        impl PyCpu6502 {
+            $(
+                $(#[doc = $doc])*
+                #[getter]
+                fn $get(&self) -> bool {
+                    self.inner.regs.p.contains(Status::$bit)
+                }
+                #[setter]
+                fn $set(&mut self, v: bool) {
+                    self.inner.regs.p.set(Status::$bit, v);
+                }
+            )+
+        }
+    };
+}
+
 /// Python-facing wrapper over [`Cpu`]. Registers and flags are flat read/write
 /// properties; every method that touches memory takes the bus as an argument,
 /// mirroring the Rust design (the CPU does not own its bus).
-#[pyclass(name = "Cpu", module = "remu")]
-pub struct PyCpu {
+#[pyclass(name = "Cpu6502", module = "remu._remu")]
+pub struct PyCpu6502 {
     inner: Cpu,
 }
 
 #[pymethods]
-impl PyCpu {
+impl PyCpu6502 {
     /// Create a CPU in its power-on state. Call `reset(bus)` before running.
     #[new]
     fn new() -> Self {
-        PyCpu { inner: Cpu::new() }
+        PyCpu6502 { inner: Cpu::new() }
     }
 
     /// RESET: load `pc` from the reset vector ($FFFC), set `i`, `sp = $FD`.
@@ -355,58 +311,6 @@ impl PyCpu {
         self.inner.trigger_nmi();
     }
 
-    // --- Registers ---
-
-    /// Accumulator.
-    #[getter]
-    fn get_a(&self) -> u8 {
-        self.inner.regs.a
-    }
-    #[setter]
-    fn set_a(&mut self, v: u8) {
-        self.inner.regs.a = v;
-    }
-
-    /// Index register X.
-    #[getter]
-    fn get_x(&self) -> u8 {
-        self.inner.regs.x
-    }
-    #[setter]
-    fn set_x(&mut self, v: u8) {
-        self.inner.regs.x = v;
-    }
-
-    /// Index register Y.
-    #[getter]
-    fn get_y(&self) -> u8 {
-        self.inner.regs.y
-    }
-    #[setter]
-    fn set_y(&mut self, v: u8) {
-        self.inner.regs.y = v;
-    }
-
-    /// Stack pointer (low byte; the stack lives at $0100..=$01FF).
-    #[getter]
-    fn get_sp(&self) -> u8 {
-        self.inner.regs.sp
-    }
-    #[setter]
-    fn set_sp(&mut self, v: u8) {
-        self.inner.regs.sp = v;
-    }
-
-    /// Program counter.
-    #[getter]
-    fn get_pc(&self) -> u16 {
-        self.inner.regs.pc
-    }
-    #[setter]
-    fn set_pc(&mut self, v: u16) {
-        self.inner.regs.pc = v;
-    }
-
     /// Raw status byte. Writes keep the in-memory convention: `U` forced set,
     /// `B` forced clear (neither exists as real storage on the 6502).
     #[getter]
@@ -417,70 +321,6 @@ impl PyCpu {
     fn set_p(&mut self, v: u8) {
         self.inner.regs.p = Status::from_bits_retain((v | Status::U.bits()) & !Status::B.bits());
     }
-
-    // --- Flags ---
-
-    /// Carry flag.
-    #[getter]
-    fn get_carry(&self) -> bool {
-        self.inner.regs.p.contains(Status::C)
-    }
-    #[setter]
-    fn set_carry(&mut self, v: bool) {
-        self.inner.regs.p.set(Status::C, v);
-    }
-
-    /// Zero flag.
-    #[getter]
-    fn get_zero(&self) -> bool {
-        self.inner.regs.p.contains(Status::Z)
-    }
-    #[setter]
-    fn set_zero(&mut self, v: bool) {
-        self.inner.regs.p.set(Status::Z, v);
-    }
-
-    /// Interrupt-disable flag.
-    #[getter]
-    fn get_interrupt_disable(&self) -> bool {
-        self.inner.regs.p.contains(Status::I)
-    }
-    #[setter]
-    fn set_interrupt_disable(&mut self, v: bool) {
-        self.inner.regs.p.set(Status::I, v);
-    }
-
-    /// Decimal-mode flag.
-    #[getter]
-    fn get_decimal(&self) -> bool {
-        self.inner.regs.p.contains(Status::D)
-    }
-    #[setter]
-    fn set_decimal(&mut self, v: bool) {
-        self.inner.regs.p.set(Status::D, v);
-    }
-
-    /// Overflow flag.
-    #[getter]
-    fn get_overflow(&self) -> bool {
-        self.inner.regs.p.contains(Status::V)
-    }
-    #[setter]
-    fn set_overflow(&mut self, v: bool) {
-        self.inner.regs.p.set(Status::V, v);
-    }
-
-    /// Negative flag.
-    #[getter]
-    fn get_negative(&self) -> bool {
-        self.inner.regs.p.contains(Status::N)
-    }
-    #[setter]
-    fn set_negative(&mut self, v: bool) {
-        self.inner.regs.p.set(Status::N, v);
-    }
-
-    // --- State ---
 
     /// Total cycles elapsed since construction.
     #[getter]
@@ -510,23 +350,43 @@ impl PyCpu {
     }
 }
 
-// --- Module -------------------------------------------------------------------
+reg_props! {
+    /// Accumulator.
+    a: u8 = get_a / set_a,
+    /// Index register X.
+    x: u8 = get_x / set_x,
+    /// Index register Y.
+    y: u8 = get_y / set_y,
+    /// Stack pointer (low byte; the stack lives at $0100..=$01FF).
+    sp: u8 = get_sp / set_sp,
+    /// Program counter.
+    pc: u16 = get_pc / set_pc,
+}
+
+flag_props! {
+    /// Carry flag.
+    C: get_carry / set_carry,
+    /// Zero flag.
+    Z: get_zero / set_zero,
+    /// Interrupt-disable flag.
+    I: get_interrupt_disable / set_interrupt_disable,
+    /// Decimal-mode flag.
+    D: get_decimal / set_decimal,
+    /// Overflow flag.
+    V: get_overflow / set_overflow,
+    /// Negative flag.
+    N: get_negative / set_negative,
+}
+
+// --- Functions ----------------------------------------------------------------
 
 /// Disassemble the instruction at `addr`, returning
 /// `(text, address_of_next_instruction)`.
 #[pyfunction]
-fn disassemble(bus: &Bound<'_, PyAny>, addr: u16) -> PyResult<(String, u16)> {
+#[pyo3(name = "disassemble6502")]
+pub fn disassemble6502(bus: &Bound<'_, PyAny>, addr: u16) -> PyResult<(String, u16)> {
     let mut b = BusArg::from_any(bus)?;
     let result = disasm::disassemble(&mut b, addr);
     b.check()?;
     Ok(result)
-}
-
-#[pymodule]
-fn remu(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<PyCpu>()?;
-    m.add_class::<PyMemory>()?;
-    m.add_function(wrap_pyfunction!(disassemble, m)?)?;
-    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
-    Ok(())
 }

@@ -189,8 +189,19 @@ checkout and/or `REMU_HARTE_ARM7_DIR` at a transcoded
 
 ## Python
 
-The same core is exposed as a Python extension module (PyO3 + maturin, ships
-with type stubs):
+The whole framework is exposed as a Python extension module (PyO3 + maturin,
+ships with type stubs) — one submodule per core, mirroring the Rust layout:
+
+| module          | what                                                    |
+|-----------------|---------------------------------------------------------|
+| `remu.mos6502`  | MOS 6502 (also re-exported at the top level)            |
+| `remu.x86`      | Intel 8086/8088, real mode, 1 MiB `Memory`              |
+| `remu.x86_32`   | Intel 80386: real + protected mode, paging, host hooks  |
+| `remu.x86_64`   | x86-64: `setup_long_flat`, MSRs, SYSCALL trap           |
+| `remu.arm32`    | ARM7TDMI (ARMv4T): ARM + Thumb, banked modes            |
+| `remu.usermode` | qemu-user style Linux i386 (static ELF from bytes)      |
+| `remu.os`       | qiling-style Linux i386 (hardware paging, ring 3)       |
+| `remu.os64`     | qiling-style Linux x86-64 (static ELF64)                |
 
 ```sh
 python -m venv .venv
@@ -216,12 +227,35 @@ print(cpu)                          # <remu.Cpu pc=$0602 a=$42 ... p=nv--dIzc cy
 print(remu.disassemble(mem, 0x0600))  # ('0600  LDA #$42', 1538)
 ```
 
-Registers (`a x y sp pc p`) and flags (`carry`, `zero`, `interrupt_disable`,
-`decimal`, `overflow`, `negative`) are plain read/write properties; interrupts
-via `set_irq(level)` / `set_nmi(level)` / `trigger_nmi()`.
+Every core follows the same shape — `Cpu` with flat register/flag properties,
+`Memory` with indexing/slicing, `step(bus)` / `run(bus, n)` with the hot loop
+in Rust:
+
+```python
+from remu.x86_64 import Cpu, Memory, RunExit
+
+mem = Memory()
+mem.load(0x10000, b"\x48\xC7\xC0\x2A\x00\x00\x00\xF4")  # MOV RAX,42; HLT
+cpu = Cpu()
+cpu.setup_long_flat(mem, 0x10000, 0x20000)  # long mode, flat identity paging
+executed, exit = cpu.run(mem, 10)
+assert cpu.rax == 42 and exit == RunExit.Halted
+```
+
+The OS layers run real Linux ELF binaries with syscalls emulated on the host:
+
+```python
+from remu.os64 import Emulator
+
+emu = Emulator(open("hello", "rb").read())  # static Linux x86-64 ELF
+emu.capture_fd(1)                           # stdout -> in-memory sink
+code = emu.run()
+print(code, emu.fd_data(1))
+```
 
 Any Python object with `read(addr)` and `write(addr, value)` works as a bus
-(memory-mapped IO in pure Python):
+for the CPU cores (memory-mapped IO in pure Python; the x86 cores also
+forward IN/OUT to optional `io_read`/`io_write` methods):
 
 ```python
 class MmioBus:

@@ -52,8 +52,9 @@ codegen-units = 1
 [features]
 # Python bindings (PyO3). Off by default so `cargo build`/`cargo test` never
 # touch libpython; maturin enables it (plus `pyo3/extension-module`) — see
-# pyproject.toml.
-python = ["dep:pyo3"]
+# pyproject.toml. `multiple-pymethods` lets the register/flag property blocks
+# be generated per category with macros.
+python = ["dep:pyo3", "pyo3/multiple-pymethods"]
 # Decode/dispatch profile counters on the 386, x86-64 and ARM32 cores, for
 # the performance work: `cargo run --release --features perf-stats --example
 # bench_x86`. Off by default; compiles to nothing.
