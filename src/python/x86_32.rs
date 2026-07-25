@@ -370,7 +370,7 @@ fn host_trap_to_py(py: Python<'_>, trap: Option<HostTrap>) -> PyResult<Py<PyAny>
 /// an argument (the CPU does not own its bus).
 #[pyclass(name = "Cpu386", module = "remu._remu")]
 pub struct PyCpu386 {
-    inner: Cpu,
+    pub(crate) inner: Cpu,
 }
 
 #[pymethods]

@@ -3,7 +3,9 @@
 //! Every value is a width-typed bitvector `Expr`; boolean facts (flags, path
 //! constraints, comparisons) are a separate `BoolExpr`. Both are reference
 //! counted so cloning a node is cheap and structurally-shared subtrees cost
-//! nothing extra.
+//! nothing extra. The handles are `Arc`, not `Rc`, so that a `Cpu` carrying an
+//! overlay stays `Send + Sync` — `#[pyclass]` requires it, and the atomics are
+//! noise next to the solver.
 //!
 //! Constructors **constant-fold on construction**: if every operand is a
 //! `Const`, the node collapses to a single `Const` immediately. This is what
@@ -15,7 +17,7 @@
 //! not need it and M0 exercises only constant leaves.)
 
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Width of a bitvector, in bits. The 386 uses 1/8/16/32; wider temporaries
 /// (9/17/33/64) appear when a construction needs headroom, e.g. the carry-out
@@ -101,7 +103,7 @@ pub struct ExprNode {
 
 /// A reference-counted handle to a bitvector expression. Cloning is cheap.
 #[derive(Debug, Clone)]
-pub struct Expr(Rc<ExprNode>);
+pub struct Expr(Arc<ExprNode>);
 
 /// The shape of a boolean node.
 #[derive(Debug)]
@@ -118,7 +120,7 @@ pub enum BoolKind {
 
 /// A reference-counted handle to a boolean expression.
 #[derive(Debug, Clone)]
-pub struct BoolExpr(Rc<BoolKind>);
+pub struct BoolExpr(Arc<BoolKind>);
 
 /// An assignment of concrete values to symbolic inputs, used by [`Expr::eval`]
 /// / [`BoolExpr::eval`] to evaluate an expression to a concrete result.
@@ -234,7 +236,7 @@ fn eval_cmp(op: CmpOp, a: u64, b: u64, width: Width) -> bool {
 
 impl Expr {
     fn node(width: Width, kind: Kind) -> Expr {
-        Expr(Rc::new(ExprNode { width, kind }))
+        Expr(Arc::new(ExprNode { width, kind }))
     }
 
     /// A concrete constant of the given width (`val` is masked to `width`).
@@ -362,7 +364,7 @@ impl Expr {
     }
 
     fn ptr_eq(a: &Expr, b: &Expr) -> bool {
-        Rc::ptr_eq(&a.0, &b.0)
+        Arc::ptr_eq(&a.0, &b.0)
     }
 
     /// Evaluate to a concrete value under `model` (unbound symbols read as 0).
@@ -402,7 +404,7 @@ impl Expr {
 
 impl BoolExpr {
     fn node(kind: BoolKind) -> BoolExpr {
-        BoolExpr(Rc::new(kind))
+        BoolExpr(Arc::new(kind))
     }
 
     pub fn constant(b: bool) -> BoolExpr {

@@ -21,6 +21,9 @@ MMIO experiments) is accepted.
 
 The 6502 classes stay re-exported at the top level (``remu.Cpu``,
 ``remu.Memory``, ``remu.disassemble``) for backward compatibility.
+
+Builds compiled with the ``symbolic`` feature also carry
+:mod:`remu.symbolic` — concolic execution on the 386, x86-64 and ARM32 cores.
 """
 
 from remu._remu import (
@@ -48,3 +51,12 @@ __all__ = [
     "x86_32",
     "x86_64",
 ]
+
+# Only in builds compiled with the `symbolic` feature; the submodule itself
+# raises ImportError otherwise.
+try:
+    from . import symbolic
+
+    __all__.append("symbolic")
+except ImportError:  # pragma: no cover - depends on the build's features
+    pass

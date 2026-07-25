@@ -89,10 +89,23 @@ impl Cpu {
         crate::symbolic::Solver::new().available()
     }
 
+    /// Solve the current path's constraints, returning a model keyed by input
+    /// name. `None` on unsat or solver failure.
+    #[cfg(feature = "symbolic-solver")]
+    pub fn sym_solve(&self) -> Option<std::collections::HashMap<String, u64>> {
+        self.sym_solve_impl(None)
+    }
+
+    /// Solve for an input that flips branch `i` (reaches the other path).
     #[cfg(feature = "symbolic-solver")]
     pub fn sym_solve_flip(&self, i: usize) -> Option<std::collections::HashMap<String, u64>> {
+        self.sym_solve_impl(Some(i))
+    }
+
+    #[cfg(feature = "symbolic-solver")]
+    fn sym_solve_impl(&self, flip: Option<usize>) -> Option<std::collections::HashMap<String, u64>> {
         let eng = self.sym.as_deref()?;
-        let raw = crate::symbolic::Solver::new().solve(&eng.smtlib(Some(i)))?;
+        let raw = crate::symbolic::Solver::new().solve(&eng.smtlib(flip))?;
         let mut out = std::collections::HashMap::new();
         for (k, v) in raw {
             if let Some(id) = k.strip_prefix("x!").and_then(|d| d.parse::<u32>().ok())

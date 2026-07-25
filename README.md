@@ -172,7 +172,9 @@ symbolic memory model are shared; each core only adds a small binding. A
 symbolic address is concretized with a pinning constraint (SAGE/Triton style).
 Everything is compile-gated: with the feature off the module is not built and the
 cores are byte-for-byte unchanged — the full SingleStepTests suites still pass
-with the overlay compiled in.
+with the overlay compiled in. The whole overlay is also available from Python
+(see below); the wheel is built with it, since an inactive overlay costs no
+measurable throughput.
 
 ## Tests
 
@@ -202,6 +204,7 @@ ships with type stubs) — one submodule per core, mirroring the Rust layout:
 | `remu.usermode` | qemu-user style Linux i386 (static ELF from bytes)      |
 | `remu.os`       | qiling-style Linux i386 (hardware paging, ring 3)       |
 | `remu.os64`     | qiling-style Linux x86-64 (static ELF64)                |
+| `remu.symbolic` | concolic execution on the 386, x86-64 and ARM32 cores   |
 
 ```sh
 python -m venv .venv
@@ -252,6 +255,35 @@ emu.capture_fd(1)                           # stdout -> in-memory sink
 code = emu.run()
 print(code, emu.fd_data(1))
 ```
+
+The concolic overlay is exposed too, as `sym_`-prefixed methods on the 386,
+x86-64 and ARM32 `Cpu` classes — mark an input symbolic, run normally, then
+solve for the input that would have taken the other side of a branch:
+
+```python
+from remu.x86_32 import Cpu, Memory
+
+mem = Memory()
+mem.load(0x1100, bytes([
+    0x66, 0x8B, 0x06, 0x00, 0x20,        # MOV EAX, [0x2000]
+    0x66, 0x3D, 0x78, 0x56, 0x34, 0x12,  # CMP EAX, 0x12345678
+    0x75, 0x02,                          # JNE +2
+]))
+cpu = Cpu()
+cpu.set_cs_ip(0x0000, 0x1100)
+cpu.sym_init()                                 # enable the overlay
+cpu.sym_symbolize_mem(0x2000, 32, "input", 0)  # 4 symbolic input bytes
+cpu.run(mem, 3)
+
+assert cpu.sym_constraint_count == 1           # the JNE was recorded
+assert cpu.sym_solve(flip=0) == {"input": 0x12345678}
+```
+
+`remu.symbolic.find_input` automates the search: give it a harness that builds
+a fresh machine per candidate input and reports whether it hit the goal, and it
+explores by negating branches until it gets there. `cpu.sym_smtlib(flip=...)`
+exports the raw SMT-LIB 2 for any external solver. Solving needs a solver
+binary on `PATH` — check `remu.symbolic.solver_available()`.
 
 Any Python object with `read(addr)` and `write(addr, value)` works as a bus
 for the CPU cores (memory-mapped IO in pure Python; the x86 cores also
