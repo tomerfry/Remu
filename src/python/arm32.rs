@@ -315,7 +315,7 @@ fn map_exit(exit: RunExit) -> PyRunExit {
 /// bus as an argument (the CPU does not own its bus).
 #[pyclass(name = "CpuArm", module = "remu._remu")]
 pub struct PyCpuArm {
-    inner: Cpu,
+    pub(crate) inner: Cpu,
 }
 
 #[pymethods]

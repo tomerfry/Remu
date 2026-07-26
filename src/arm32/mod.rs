@@ -36,11 +36,13 @@
 //! assert_eq!(cpu.regs.gpr[0], 0x42);
 //! ```
 
-mod alu;
+pub(crate) mod alu;
 mod decode;
 mod execute;
 mod icache;
 pub mod registers;
+#[cfg(feature = "symbolic")]
+mod symbolic;
 
 pub use registers::{Mode, Psr, Registers, psr, reg};
 
@@ -380,6 +382,11 @@ pub struct Cpu {
     /// [`Cpu::step`]. Cleared on RESET.
     pub host_trap: Option<HostTrap>,
 
+    /// Concolic-execution overlay (present only with the `symbolic` feature).
+    /// `None` by default and inert until [`Cpu::sym_init`]; see `symbolic.rs`.
+    #[cfg(feature = "symbolic")]
+    pub sym: Option<Box<crate::symbolic::SymEngine>>,
+
     /// Profile counters (present only with the `perf-stats` feature).
     #[cfg(feature = "perf-stats")]
     pub stats: PerfStats,
@@ -405,6 +412,8 @@ impl Cpu {
             trap_swi: false,
             trap_faults: false,
             host_trap: None,
+            #[cfg(feature = "symbolic")]
+            sym: None,
             #[cfg(feature = "perf-stats")]
             stats: PerfStats::default(),
             #[cfg(test)]
@@ -628,6 +637,9 @@ impl Cpu {
         let try_cache = !self.fused_only;
         #[cfg(not(test))]
         let try_cache = true;
+        // An active overlay decodes every step (no icache), so hooks always run.
+        #[cfg(feature = "symbolic")]
+        let try_cache = try_cache && !self.sym_active();
 
         // Decoded-instruction-cache probe: on a hit, skip the fetch and
         // decode entirely (see icache.rs for the validity rules).

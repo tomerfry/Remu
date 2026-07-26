@@ -23,7 +23,10 @@ dev = ["pytest"]
 [tool.maturin]
 # `python` gates the PyO3 code in the crate; `extension-module` is enabled here
 # (not in Cargo.toml) so plain `cargo test` never links against libpython.
-features = ["python", "pyo3/extension-module"]
+# `symbolic-solver` adds the concolic overlay (remu.symbolic) — it pulls in no
+# crate dependencies, costs nothing measurable while inactive, and only needs a
+# solver binary on PATH at runtime, so the wheel always carries it.
+features = ["python", "pyo3/extension-module", "symbolic-solver"]
 # Mixed Rust/Python layout: the extension is `remu._remu`; the thin shim
 # package in python/remu/ re-exports it as `remu`, `remu.x86`, `remu.arm32`, …
 module-name = "remu._remu"

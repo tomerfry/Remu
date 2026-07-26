@@ -63,6 +63,10 @@ impl Cpu {
                 let b = self.fetch_imm(bus)?;
                 let a = self.acc();
                 let r = self.alu(i, a, b);
+                #[cfg(feature = "symbolic")]
+                if self.sym_active() {
+                    self.sym_alu_acc_imm(i, opcode != 0x3D, a, b, r);
+                }
                 if opcode != 0x3D {
                     self.set_acc(r);
                 }
@@ -102,6 +106,10 @@ impl Cpu {
                     self.fetch8(bus)? as i8 as i64 as u64
                 };
                 let r = self.alu(m.sub() as usize, a, b);
+                #[cfg(feature = "symbolic")]
+                if self.sym_active() {
+                    self.sym_alu_grp1(m.sub(), op, a, b, r);
+                }
                 if m.sub() != 7 {
                     self.write_op(bus, op, r)?;
                 }
@@ -410,7 +418,13 @@ impl Cpu {
             0x70..=0x7F => {
                 self.osize = self.branch_osize();
                 let rel = self.fetch8(bus)? as i8 as i64;
-                if self.cond(opcode & 0xF) {
+                let n = opcode & 0xF;
+                let taken = self.cond(n);
+                #[cfg(feature = "symbolic")]
+                if self.sym_active() {
+                    self.sym_branch(n, taken);
+                }
+                if taken {
                     self.jump_rel(rel)?;
                     Ok(7)
                 } else {
@@ -496,11 +510,20 @@ impl Cpu {
             0x88 => {
                 let (m, op) = self.modrm(bus)?;
                 let v = self.gpr8(m.reg());
+                #[cfg(feature = "symbolic")]
+                if self.sym_active() {
+                    self.sym_mov_rm_r(8, op, m.reg(), v as u64);
+                }
                 self.write_op8(bus, op, v)?;
                 Ok(2)
             }
             0x89 => {
                 let (m, op) = self.modrm(bus)?;
+                #[cfg(feature = "symbolic")]
+                if self.sym_active() {
+                    let (w, v) = (self.sym_width(), self.regs.reg64(m.reg()));
+                    self.sym_mov_rm_r(w, op, m.reg(), v);
+                }
                 match self.osize {
                     O16 => {
                         let v = self.regs.reg16(m.reg());
@@ -520,12 +543,20 @@ impl Cpu {
             0x8A => {
                 let (m, op) = self.modrm(bus)?;
                 let v = self.read_op8(bus, op)?;
+                #[cfg(feature = "symbolic")]
+                if self.sym_active() {
+                    self.sym_mov_r_rm(8, op, m.reg(), v as u64);
+                }
                 self.set_gpr8(m.reg(), v);
                 Ok(if op.is_mem() { 4 } else { 2 })
             }
             0x8B => {
                 let (m, op) = self.modrm(bus)?;
                 let v = self.read_op(bus, op)?;
+                #[cfg(feature = "symbolic")]
+                if self.sym_active() {
+                    self.sym_mov_r_rm(self.sym_width(), op, m.reg(), v);
+                }
                 self.write_reg_osize(m.reg(), v);
                 Ok(if op.is_mem() { 4 } else { 2 })
             }
@@ -622,11 +653,20 @@ impl Cpu {
             }
             0xB0..=0xB7 => {
                 let v = self.fetch8(bus)?;
-                self.set_gpr8((opcode & 7) | self.rex_b() << 3, v);
+                let i = (opcode & 7) | self.rex_b() << 3;
+                self.set_gpr8(i, v);
+                #[cfg(feature = "symbolic")]
+                if self.sym_active() {
+                    self.sym_concretize_reg(i, 8);
+                }
                 Ok(2)
             }
             0xB8..=0xBF => {
                 let i = (opcode & 7) | self.rex_b() << 3;
+                #[cfg(feature = "symbolic")]
+                if self.sym_active() {
+                    self.sym_concretize_reg(i, self.sym_width());
+                }
                 match self.osize {
                     O16 => {
                         let v = self.fetch16(bus)?;
@@ -1483,6 +1523,10 @@ impl Cpu {
         let a = self.read_op(bus, op)?;
         let b = self.regs.reg64(m.reg());
         let r = self.alu(i, a, b);
+        #[cfg(feature = "symbolic")]
+        if self.sym_active() {
+            self.sym_alu_rm_r(i, op, m.reg(), wb, a, b, r);
+        }
         if wb {
             self.write_op(bus, op, r)?;
         }
@@ -1500,6 +1544,10 @@ impl Cpu {
         };
         let b = self.read_op(bus, op)?;
         let r = self.alu(i, a, b);
+        #[cfg(feature = "symbolic")]
+        if self.sym_active() {
+            self.sym_alu_r_rm(i, op, m.reg(), wb, a, b, r);
+        }
         if wb {
             self.write_reg_osize(m.reg(), r);
         }

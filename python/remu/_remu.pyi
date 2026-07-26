@@ -5,11 +5,23 @@ The friendly import surface is the shim modules (`remu`, `remu.x86`,
 """
 
 from pathlib import Path
-from typing import Iterable, Optional, Protocol, Tuple, Union, overload
+from typing import Callable, Iterable, Optional, Protocol, Tuple, Union, overload
 
 __version__: str
 
+__symbolic__: bool
+"""Whether this build carries the concolic overlay (`symbolic` feature)."""
+
 _Data = Union[bytes, bytearray, Iterable[int]]
+
+def sym_solver_available() -> bool:
+    """Whether an SMT solver binary is launchable (`REMU_SMT_SOLVER`, else z3)."""
+
+def sym_find_input(
+    harness: Callable[[dict[str, int]], Tuple[bool, object]],
+    max_iters: int = 50,
+) -> Optional[dict[str, int]]:
+    """Concolic search for an input reaching a goal. See remu.symbolic."""
 
 class BusLike(Protocol):
     """Anything with byte read/write over the core's address space.
@@ -335,6 +347,20 @@ class Cpu386:
     def take_host_trap(self) -> _HostTrap:
         """Return and clear the pending host trap."""
 
+    # Concolic overlay; present only in `symbolic` builds. See remu.symbolic.
+    sym_enabled: bool
+    sym_constraint_count: int
+    def sym_init(self) -> None: ...
+    def sym_symbolize_reg(self, slot: int, name: str) -> int: ...
+    def sym_symbolize_mem(
+        self, addr: int, width: int, name: str, concrete: int
+    ) -> int: ...
+    def sym_inputs(self) -> list[Tuple[str, int]]: ...
+    def sym_seed(self) -> dict[str, int]: ...
+    def sym_smtlib(self, flip: Optional[int] = None) -> str: ...
+    def sym_solve(self, flip: Optional[int] = None) -> Optional[dict[str, int]]: ...
+    def sym_check_invariant(self) -> bool: ...
+
 # --- x86-64 / AMD64 (remu.x86_64) ---------------------------------------------
 
 class MemoryX64:
@@ -462,6 +488,20 @@ class CpuX64:
     def take_host_trap(self) -> _HostTrap:
         """Return and clear the pending host trap."""
 
+    # Concolic overlay; present only in `symbolic` builds. See remu.symbolic.
+    sym_enabled: bool
+    sym_constraint_count: int
+    def sym_init(self) -> None: ...
+    def sym_symbolize_reg(self, slot: int, name: str) -> int: ...
+    def sym_symbolize_mem(
+        self, addr: int, width: int, name: str, concrete: int
+    ) -> int: ...
+    def sym_inputs(self) -> list[Tuple[str, int]]: ...
+    def sym_seed(self) -> dict[str, int]: ...
+    def sym_smtlib(self, flip: Optional[int] = None) -> str: ...
+    def sym_solve(self, flip: Optional[int] = None) -> Optional[dict[str, int]]: ...
+    def sym_check_invariant(self) -> bool: ...
+
 # --- ARM7TDMI / ARMv4T (remu.arm32) -------------------------------------------
 
 _ArmHostTrap = Union[None, str, Tuple[str, str]]
@@ -564,6 +604,20 @@ class CpuArm:
 
     def take_host_trap(self) -> _ArmHostTrap:
         """Return and clear the pending host trap."""
+
+    # Concolic overlay; present only in `symbolic` builds. See remu.symbolic.
+    sym_enabled: bool
+    sym_constraint_count: int
+    def sym_init(self) -> None: ...
+    def sym_symbolize_reg(self, slot: int, name: str) -> int: ...
+    def sym_symbolize_mem(
+        self, addr: int, width: int, name: str, concrete: int
+    ) -> int: ...
+    def sym_inputs(self) -> list[Tuple[str, int]]: ...
+    def sym_seed(self) -> dict[str, int]: ...
+    def sym_smtlib(self, flip: Optional[int] = None) -> str: ...
+    def sym_solve(self, flip: Optional[int] = None) -> Optional[dict[str, int]]: ...
+    def sym_check_invariant(self) -> bool: ...
 
 # --- Linux OS-emulation layers (remu.usermode / remu.os / remu.os64) ----------
 

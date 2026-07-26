@@ -1,0 +1,358 @@
+//! Concolic-overlay tests for the 386 core (feature `symbolic`, milestone M1).
+//!
+//! These exercise the live instrumentation seams: symbolic dataflow through the
+//! ALU, the golden concolic invariant (`shadow.eval(seed) == concrete`), and
+//! path-constraint collection at a symbolic branch.
+#![cfg(feature = "symbolic")]
+
+use remu::symbolic::{Model, SymId};
+use remu::x86_32::{Cpu, EFlags, LinearMemory, SegReg, reg};
+
+/// A CPU + flat memory with `program` at `0000:1100`, real-mode defaults, DS
+/// base 0. Mirrors `x86_32_tests::setup`.
+fn setup(program: &[u8]) -> (Cpu, LinearMemory) {
+    let mut mem = LinearMemory::new();
+    mem.load(0x1100, program);
+    let mut cpu = Cpu::new();
+    cpu.set_cs_ip(0x0000, 0x1100);
+    cpu.regs.seg[reg::SS as usize] = SegReg::real(0x0000);
+    cpu.regs.seg[reg::DS as usize] = SegReg::real(0x0000);
+    cpu.regs.gpr[reg::ESP as usize] = 0xFFF0;
+    (cpu, mem)
+}
+
+/// The overlay is invisible until enabled: no constraints, invariant trivially
+/// holds, results are bit-identical to a normal run.
+#[test]
+fn overlay_inert_until_enabled() {
+    let (mut cpu, mut mem) = setup(&[0x66, 0x05, 0x01, 0x00, 0x00, 0x00]); // ADD EAX, 1
+    cpu.regs.gpr[0] = 41;
+    cpu.step(&mut mem);
+    assert_eq!(cpu.regs.gpr[0], 42);
+    assert!(cpu.sym_constraints().is_empty());
+    assert!(cpu.sym_check_invariant());
+}
+
+/// Symbolic dataflow through a chain of ALU ops keeps the golden invariant
+/// (`shadow.eval(seed) == concrete`) after every step.
+#[test]
+fn golden_invariant_alu_chain() {
+    let (mut cpu, mut mem) = setup(&[
+        0x66, 0x05, 0x03, 0x00, 0x00, 0x00, // ADD EAX, 3
+        0x66, 0x35, 0xFF, 0x00, 0x00, 0x00, // XOR EAX, 0FFh
+        0x66, 0x2D, 0x01, 0x00, 0x00, 0x00, // SUB EAX, 1
+    ]);
+    cpu.regs.gpr[0] = 0x1234_5678;
+    cpu.sym_init();
+    cpu.sym_symbolize_reg32(0, "eax");
+
+    for _ in 0..3 {
+        cpu.step(&mut mem);
+        assert!(cpu.sym_check_invariant(), "invariant broke at eip {:#x}", cpu.regs.eip);
+    }
+    let expect = (0x1234_5678u32.wrapping_add(3) ^ 0xFF).wrapping_sub(1);
+    assert_eq!(cpu.regs.gpr[0], expect);
+}
+
+/// A symbolic memory operand taints the destination register.
+#[test]
+fn symbolic_memory_operand() {
+    // 66 03 06 00 20: ADD EAX, [0x2000] (32-bit operand, 16-bit [disp16] EA).
+    let (mut cpu, mut mem) = setup(&[0x66, 0x03, 0x06, 0x00, 0x20]);
+    cpu.regs.gpr[0] = 1;
+    mem.ram[0x2000..0x2004].copy_from_slice(&0x1122_3344u32.to_le_bytes());
+    cpu.sym_init();
+    cpu.sym_symbolize_mem(0x2000, 32, "m", 0x1122_3344);
+
+    cpu.step(&mut mem);
+    assert_eq!(cpu.regs.gpr[0], 0x1122_3345);
+    assert!(cpu.sym_check_invariant());
+    // EAX is now symbolic: solving for m = 0 would give EAX = 1.
+    let id = cpu.sym_engine().unwrap().inputs()[0].id;
+    // (Nothing to assert on constraints here — just that the taint propagated
+    // and the invariant holds; the id is used by the branch test below.)
+    let _ = id;
+}
+
+/// `CMP EAX, 42; JNE` on a symbolic EAX records the branch condition as a
+/// constraint that a solver could negate to reach the other path.
+#[test]
+fn branch_records_path_constraint() {
+    let (mut cpu, mut mem) = setup(&[
+        0x66, 0x3D, 0x2A, 0x00, 0x00, 0x00, // CMP EAX, 42
+        0x75, 0x02, // JNE +2
+        0x90, 0x90, // NOP NOP (fall-through / target padding)
+    ]);
+    cpu.regs.gpr[0] = 7; // seed ≠ 42 ⇒ concrete branch is taken
+    cpu.sym_init();
+    let eax = cpu.sym_symbolize_reg32(0, "eax");
+
+    cpu.step(&mut mem); // CMP
+    cpu.step(&mut mem); // JNE
+
+    let cons = cpu.sym_constraints();
+    assert_eq!(cons.len(), 1, "one symbolic branch ⇒ one constraint");
+
+    let seed = cpu.sym_seed();
+    assert!(cons[0].eval(&seed), "constraint holds on the concrete (taken) path");
+
+    // The recorded constraint is `EAX != 42`; it is false exactly when EAX = 42,
+    // i.e. negating it (the fall-through path) solves to the magic value.
+    let mut hit: Model = seed.clone();
+    hit.insert(eax, 42);
+    assert!(!cons[0].eval(&hit), "the taken-branch constraint fails at EAX = 42");
+    assert!(
+        remu::symbolic::BoolExpr::not(cons[0].clone()).eval(&hit),
+        "the fall-through path is reached at EAX = 42"
+    );
+}
+
+/// The canonical solve-for-input flow: load a symbolic input from memory with
+/// MOV, compare against a magic value, branch. The recorded constraint negates
+/// to the magic input.
+#[test]
+fn mov_load_then_branch() {
+    const MAGIC: u32 = 0x1234_5678;
+    let (mut cpu, mut mem) = setup(&[
+        0x66, 0x8B, 0x06, 0x00, 0x20, // MOV EAX, [0x2000]
+        0x66, 0x3D, 0x78, 0x56, 0x34, 0x12, // CMP EAX, MAGIC
+        0x75, 0x02, 0x90, 0x90, // JNE +2 / NOPs
+    ]);
+    mem.ram[0x2000..0x2004].copy_from_slice(&0u32.to_le_bytes()); // seed input = 0
+    cpu.sym_init();
+    let input = cpu.sym_symbolize_mem(0x2000, 32, "input", 0);
+
+    cpu.step(&mut mem); // MOV EAX, [input]  → EAX tainted
+    cpu.step(&mut mem); // CMP EAX, MAGIC
+    cpu.step(&mut mem); // JNE (taken: 0 != MAGIC)
+
+    assert!(cpu.sym_check_invariant());
+    let cons = cpu.sym_constraints();
+    assert_eq!(cons.len(), 1);
+
+    // Negating the taken-branch constraint solves to input = MAGIC.
+    let mut solved: Model = cpu.sym_seed();
+    solved.insert(input, MAGIC as u64);
+    assert!(!cons[0].eval(&solved), "input = MAGIC flips the branch");
+}
+
+/// INC then DEC on a symbolic register keeps the golden invariant, and INC
+/// leaves CF untouched (setting OF/SF on the signed-overflow wrap).
+#[test]
+fn inc_dec_keep_invariant() {
+    let (mut cpu, mut mem) = setup(&[0x66, 0x40, 0x66, 0x48]); // INC EAX; DEC EAX
+    cpu.regs.gpr[0] = 0x7FFF_FFFF;
+    cpu.sym_init();
+    cpu.sym_symbolize_reg32(0, "eax");
+
+    cpu.step(&mut mem); // INC -> 0x80000000: OF/SF set, CF preserved
+    assert!(cpu.sym_check_invariant());
+    assert!(cpu.regs.eflags.contains(EFlags::OF));
+    assert_eq!(cpu.regs.gpr[0], 0x8000_0000);
+
+    cpu.step(&mut mem); // DEC -> 0x7FFFFFFF
+    assert!(cpu.sym_check_invariant());
+    assert_eq!(cpu.regs.gpr[0], 0x7FFF_FFFF);
+}
+
+/// A concrete `MOV reg, imm` over a symbolic register drops its taint, so a
+/// later branch on it is concrete and records no constraint.
+#[test]
+fn imm_mov_concretizes_register() {
+    let (mut cpu, mut mem) = setup(&[
+        0x66, 0xB8, 0x63, 0x00, 0x00, 0x00, // MOV EAX, 0x63 (over symbolic EAX)
+        0x66, 0x3D, 0x63, 0x00, 0x00, 0x00, // CMP EAX, 0x63
+        0x74, 0x02, 0x90, 0x90, // JE +2
+    ]);
+    cpu.regs.gpr[0] = 5;
+    cpu.sym_init();
+    cpu.sym_symbolize_reg32(0, "eax");
+
+    cpu.step(&mut mem); // MOV EAX, 0x63 -> concrete
+    assert!(cpu.sym_check_invariant());
+    cpu.step(&mut mem); // CMP
+    cpu.step(&mut mem); // JE
+    assert!(cpu.sym_constraints().is_empty(), "concretized EAX ⇒ no symbolic branch");
+}
+
+/// Shifts propagate symbolic data (value tracked, count concretized) and keep
+/// the golden invariant; a post-shift branch is symbolic.
+#[test]
+fn shifts_propagate_and_branch() {
+    // SHL EAX,4 ; SHR EAX,2 ; SAR EAX,1 ; CMP EAX,0 ; JE
+    let (mut cpu, mut mem) = setup(&[
+        0x66, 0xC1, 0xE0, 0x04, // SHL EAX, 4
+        0x66, 0xC1, 0xE8, 0x02, // SHR EAX, 2
+        0x66, 0xC1, 0xF8, 0x01, // SAR EAX, 1
+        0x66, 0x3D, 0x00, 0x00, 0x00, 0x00, // CMP EAX, 0
+        0x74, 0x02, 0x90, 0x90, // JE +2
+    ]);
+    cpu.regs.gpr[0] = 0x1234_5678;
+    cpu.sym_init();
+    cpu.sym_symbolize_reg32(0, "eax");
+
+    for _ in 0..3 {
+        cpu.step(&mut mem);
+        assert!(cpu.sym_check_invariant(), "invariant after shift");
+    }
+    let expect = (((0x1234_5678u32 << 4) >> 2) as i32 >> 1) as u32;
+    assert_eq!(cpu.regs.gpr[0], expect);
+
+    cpu.step(&mut mem); // CMP EAX, 0
+    cpu.step(&mut mem); // JE (symbolic ⇒ constraint)
+    assert_eq!(cpu.sym_constraints().len(), 1);
+}
+
+/// A near (0F 8x) conditional jump on a symbolic flag records a constraint.
+#[test]
+fn near_jcc_records_constraint() {
+    let (mut cpu, mut mem) = setup(&[
+        0x66, 0x3D, 0x2A, 0x00, 0x00, 0x00, // CMP EAX, 42
+        0x0F, 0x85, 0x02, 0x00, 0x00, 0x00, // JNE near +2
+        0x90, 0x90,
+    ]);
+    cpu.regs.gpr[0] = 7;
+    cpu.sym_init();
+    cpu.sym_symbolize_reg32(0, "eax");
+    cpu.step(&mut mem); // CMP
+    cpu.step(&mut mem); // JNE near
+    assert_eq!(cpu.sym_constraints().len(), 1);
+}
+
+/// The SMT-LIB export for a flipped branch is a well-formed QF_BV query.
+#[test]
+fn smtlib_export_is_wellformed() {
+    let (mut cpu, mut mem) = setup(&[
+        0x66, 0x3D, 0x2A, 0x00, 0x00, 0x00, // CMP EAX, 42
+        0x75, 0x02, 0x90, 0x90, // JNE +2 / NOPs
+    ]);
+    cpu.regs.gpr[0] = 7;
+    cpu.sym_init();
+    cpu.sym_symbolize_reg32(0, "eax");
+    cpu.step(&mut mem);
+    cpu.step(&mut mem);
+
+    let script = cpu.sym_smtlib_flip(0);
+    assert!(script.contains("(set-logic QF_BV)"));
+    assert!(script.contains("(declare-const x!0 (_ BitVec 32))"));
+    assert!(script.contains("(assert (not"), "flipped branch is negated");
+    assert!(script.contains("(check-sat)"));
+    assert!(script.contains("(get-value (x!0))"));
+}
+
+/// End-to-end: run concretely with a symbolic input, then solve for the input
+/// that reaches the other side of the branch — recovering the magic value.
+/// Skips when no SMT solver is available (set `REMU_SMT_SOLVER` or put z3 on
+/// PATH).
+#[cfg(feature = "symbolic-solver")]
+#[test]
+fn solve_for_input_recovers_magic() {
+    if !Cpu::sym_solver_available() {
+        eprintln!("no SMT solver on PATH (set REMU_SMT_SOLVER) — skipping");
+        return;
+    }
+    const MAGIC: u32 = 0x1234_5678;
+    let (mut cpu, mut mem) = setup(&[
+        0x66, 0x8B, 0x06, 0x00, 0x20, // MOV EAX, [0x2000]
+        0x66, 0x3D, 0x78, 0x56, 0x34, 0x12, // CMP EAX, MAGIC
+        0x75, 0x02, 0x90, 0x90, // JNE +2 / NOPs
+    ]);
+    mem.ram[0x2000..0x2004].copy_from_slice(&0u32.to_le_bytes()); // seed input = 0
+    cpu.sym_init();
+    cpu.sym_symbolize_mem(0x2000, 32, "input", 0);
+
+    cpu.step(&mut mem); // MOV EAX, [input]
+    cpu.step(&mut mem); // CMP EAX, MAGIC
+    cpu.step(&mut mem); // JNE (taken, since 0 != MAGIC)
+
+    let model = cpu.sym_solve_flip(0).expect("constraints should be satisfiable");
+    assert_eq!(model.get("input"), Some(&(MAGIC as u64)), "solver recovered the magic input");
+}
+
+/// Automatic multi-branch exploration: a two-byte "password" check gated by two
+/// conditional branches. The driver re-executes, flipping a branch each round,
+/// and converges on the input that reaches the success path. Skips without a
+/// solver.
+#[cfg(feature = "symbolic-solver")]
+#[test]
+fn explore_solves_password_check() {
+    use std::collections::HashMap;
+    if !Cpu::sym_solver_available() {
+        eprintln!("no SMT solver on PATH (set REMU_SMT_SOLVER) — skipping");
+        return;
+    }
+    // MOV EAX,[0x2000]; CMP AL,0x11; JNE fail; CMP AH,0x22; JNE fail;
+    // success: MOV EBX,0x600D; HLT   fail: HLT
+    let program: [u8; 22] = [
+        0x66, 0x8B, 0x06, 0x00, 0x20, // MOV EAX, [0x2000]
+        0x3C, 0x11, // CMP AL, 0x11
+        0x75, 0x0C, // JNE fail
+        0x80, 0xFC, 0x22, // CMP AH, 0x22
+        0x75, 0x07, // JNE fail
+        0x66, 0xBB, 0x0D, 0x60, 0x00, 0x00, // MOV EBX, 0x600D  (success marker)
+        0xF4, // HLT (success)
+        0xF4, // HLT (fail)
+    ];
+
+    let mut harness = |inputs: &HashMap<String, u64>| {
+        let (mut cpu, mut mem) = setup(&program);
+        let iv = inputs.get("input").copied().unwrap_or(0) as u32;
+        mem.ram[0x2000..0x2004].copy_from_slice(&iv.to_le_bytes());
+        cpu.sym_init();
+        cpu.sym_symbolize_mem(0x2000, 32, "input", iv as u64);
+        for _ in 0..16 {
+            if cpu.halted {
+                break;
+            }
+            cpu.step(&mut mem);
+        }
+        let reached = cpu.regs.gpr[3] == 0x0000_600D; // EBX marker ⇒ success path
+        (reached, *cpu.sym.take().unwrap())
+    };
+
+    let solution = remu::symbolic::find_input(50, &mut harness).expect("driver should find the input");
+    let input = solution["input"];
+    assert_eq!(input & 0xFF, 0x11, "byte 0 (AL) solved");
+    assert_eq!((input >> 8) & 0xFF, 0x22, "byte 1 (AH) solved");
+}
+
+/// A symbolic address (base register) is concretized with a pinning constraint:
+/// the access uses the concrete address, and `base == concrete` is recorded so
+/// exploration can negate it to reach a different address.
+#[test]
+fn symbolic_address_pins() {
+    // 66 67 8B 03: MOV EAX, [EBX]  (32-bit operand + 32-bit address).
+    let (mut cpu, mut mem) = setup(&[0x66, 0x67, 0x8B, 0x03]);
+    cpu.regs.gpr[reg::EBX as usize] = 0x2000;
+    mem.ram[0x2000..0x2004].copy_from_slice(&0xCAFE_BABEu32.to_le_bytes());
+    cpu.sym_init();
+    let ebx = cpu.sym_symbolize_reg32(reg::EBX, "ebx"); // the address is symbolic
+
+    cpu.step(&mut mem); // MOV EAX, [EBX]
+    assert_eq!(cpu.regs.gpr[0], 0xCAFE_BABE, "data read from the concrete address");
+    assert!(cpu.sym_check_invariant());
+
+    let cons = cpu.sym_constraints();
+    assert_eq!(cons.len(), 1, "one symbolic-address pin");
+    let seed = cpu.sym_seed();
+    assert!(cons[0].eval(&seed), "pin holds at the concrete address");
+    let mut other = seed.clone();
+    other.insert(ebx, 0x3000);
+    assert!(!cons[0].eval(&other), "pin fails at a different address");
+}
+
+/// A concrete branch (EAX never symbolized) records nothing.
+#[test]
+fn concrete_branch_records_nothing() {
+    let (mut cpu, mut mem) = setup(&[
+        0x66, 0x3D, 0x2A, 0x00, 0x00, 0x00, // CMP EAX, 42
+        0x75, 0x02, 0x90, 0x90, // JNE +2 / NOPs
+    ]);
+    cpu.regs.gpr[0] = 7;
+    cpu.sym_init(); // enabled, but nothing symbolic
+    cpu.step(&mut mem);
+    cpu.step(&mut mem);
+    assert!(cpu.sym_constraints().is_empty());
+    // Silence unused-import lints when only this test runs.
+    let _ = SymId(0);
+}

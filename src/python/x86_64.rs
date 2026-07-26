@@ -414,7 +414,7 @@ fn trap_to_py(py: Python<'_>, trap: Option<HostTrap>) -> PyResult<Py<PyAny>> {
 /// bus).
 #[pyclass(name = "CpuX64", module = "remu._remu")]
 pub struct PyCpuX64 {
-    inner: Cpu,
+    pub(crate) inner: Cpu,
 }
 
 #[pymethods]

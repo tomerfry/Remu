@@ -28,6 +28,8 @@ mod modrm;
 mod paging;
 mod protected;
 pub mod registers;
+#[cfg(feature = "symbolic")]
+mod symbolic;
 
 pub use registers::{DescTable, EFlags, Registers, SegReg, cr0, reg};
 
@@ -522,6 +524,11 @@ pub struct Cpu {
     /// [`syscall_int`]: Cpu::syscall_int
     pub host_trap: Option<HostTrap>,
 
+    /// Concolic-execution overlay (present only with the `symbolic` feature).
+    /// `None` by default and inert until [`Cpu::sym_init`]; see `symbolic.rs`.
+    #[cfg(feature = "symbolic")]
+    pub sym: Option<Box<crate::symbolic::SymEngine>>,
+
     /// Profile counters (present only with the `perf-stats` feature).
     #[cfg(feature = "perf-stats")]
     pub stats: PerfStats,
@@ -563,6 +570,8 @@ impl Cpu {
             trap_faults: false,
             extensions: false,
             host_trap: None,
+            #[cfg(feature = "symbolic")]
+            sym: None,
             #[cfg(feature = "perf-stats")]
             stats: PerfStats::default(),
             #[cfg(test)]
@@ -957,6 +966,10 @@ impl Cpu {
         let try_hot = !self.fused_only;
         #[cfg(not(test))]
         let try_hot = true;
+        // The concolic overlay instruments only the fused handlers, so an
+        // active overlay forces the reference fused path (icache/decoded off).
+        #[cfg(feature = "symbolic")]
+        let try_hot = try_hot && !self.sym_active();
 
         // Decoded-instruction-cache probe: on a hit, skip the fetch, prefix
         // scan and dispatch entirely (see icache.rs for the validity rules).

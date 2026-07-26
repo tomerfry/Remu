@@ -63,3 +63,13 @@ perf-stats = []
 # reached via `Cpu::run`. Host must be x86-64. The interpreter stays the
 # reference; off by default. See src/x86_64/jit/ and src/x86_32/jit/.
 jit = ["dep:dynasm", "dep:dynasmrt"]
+# Symbolic (concolic) execution overlay for the 80386 core: a sparse bitvector
+# expression shadow tracked alongside the concrete interpreter, for collecting
+# path constraints and solving for inputs. Off by default; no runtime deps. See
+# src/symbolic/.
+symbolic = []
+# Drive an external SMT solver (z3/cvc5/… over SMT-LIB 2 stdio) to solve the
+# collected constraints — e.g. find an input that reaches a target branch. Adds
+# no crate dependency (spawns the solver binary; set `REMU_SMT_SOLVER` to pick
+# it), only a runtime need for a solver on PATH.
+symbolic-solver = ["symbolic"]

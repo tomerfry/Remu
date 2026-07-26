@@ -25,6 +25,8 @@
 mod arm32;
 mod mos6502;
 mod oslayers;
+#[cfg(feature = "symbolic")]
+mod symbolic;
 mod util;
 mod x86;
 mod x86_32;
@@ -82,5 +84,14 @@ fn _remu(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Shared
     m.add_class::<PyRunExit>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    // Concolic execution: the `sym_*` methods are attached to the 386, x86-64
+    // and ARM32 CPU classes; these are the module-level entry points.
+    #[cfg(feature = "symbolic")]
+    {
+        m.add_function(wrap_pyfunction!(symbolic::sym_solver_available, m)?)?;
+        #[cfg(feature = "symbolic-solver")]
+        m.add_function(wrap_pyfunction!(symbolic::sym_find_input, m)?)?;
+    }
+    m.add("__symbolic__", cfg!(feature = "symbolic"))?;
     Ok(())
 }

@@ -39,6 +39,8 @@ pub mod os;
 pub mod os64;
 #[cfg(feature = "python")]
 mod python;
+#[cfg(feature = "symbolic")]
+pub mod symbolic;
 pub mod usermode;
 pub mod x86;
 pub mod x86_32;
