@@ -74,6 +74,7 @@ macro_rules! sym_methods {
             /// `slot` is the architectural register number.
             fn sym_symbolize_reg(&mut self, slot: u8, name: &str) -> PyResult<u32> {
                 self.require_engine()?;
+                self.require_fresh_name(name)?;
                 if slot as usize >= $slots {
                     return Err(PyValueError::new_err(format!(
                         "register slot out of range (0..={})",
@@ -95,6 +96,7 @@ macro_rules! sym_methods {
                 concrete: u64,
             ) -> PyResult<u32> {
                 self.require_engine()?;
+                self.require_fresh_name(name)?;
                 if !matches!(width, 8 | 16 | 32 | 64) {
                     return Err(PyValueError::new_err("width must be 8, 16, 32 or 64"));
                 }
@@ -178,6 +180,19 @@ macro_rules! sym_methods {
                     Some(_) => Ok(()),
                     None => Err(not_initialized()),
                 }
+            }
+
+            /// Reject a name already in use. Models are keyed by name, so two
+            /// inputs sharing one would collapse into a single entry and
+            /// `find_input` would then drive both symbols with one value.
+            fn require_fresh_name(&self, name: &str) -> PyResult<()> {
+                if self.inner.sym_engine().is_some_and(|e| e.has_input(name)) {
+                    return Err(PyValueError::new_err(format!(
+                        "symbolic input name {name:?} is already in use — names must be unique, \
+                         because solved models are keyed by them"
+                    )));
+                }
+                Ok(())
             }
 
             /// Reject a `flip` index that names no collected branch, so the

@@ -137,14 +137,14 @@ impl SymEngine {
     pub fn check(&self, reg_val: impl Fn(usize) -> u64, flags: [bool; 6]) -> bool {
         for (i, slot) in self.regs.iter().enumerate() {
             if let Some(e) = slot
-                && e.eval(&self.seed) != (reg_val(i) & mask(self.reg_bits))
+                && e.seed_val(&self.seed) != (reg_val(i) & mask(self.reg_bits))
             {
                 return false;
             }
         }
         for (i, slot) in self.flags.iter().enumerate() {
             if let Some(e) = slot
-                && e.eval(&self.seed) != flags[i]
+                && e.seed_val(&self.seed) != flags[i]
             {
                 return false;
             }
@@ -163,23 +163,27 @@ impl SymEngine {
     /// takes the *other* side of branch `i`. With `None`, all constraints are
     /// asserted (the current path).
     pub fn smtlib(&self, flip: Option<usize>) -> String {
-        use super::smtlib::write_bool;
+        use super::smtlib::Smt;
         let mut s = String::from("(set-logic QF_BV)\n");
         for inp in &self.inputs {
             s.push_str(&format!("(declare-const x!{} (_ BitVec {}))\n", inp.id.0, inp.width));
         }
+        // One emitter across every constraint, so subterms shared between
+        // branches (the common case — they all read the same registers) are
+        // defined once.
         let end = flip.map_or(self.constraints.len(), |i| i + 1);
+        let mut smt = Smt::new();
+        let mut asserts = String::new();
         for (k, c) in self.constraints[..end].iter().enumerate() {
-            s.push_str("(assert ");
+            let t = smt.bool_term(c);
             if Some(k) == flip {
-                s.push_str("(not ");
-                write_bool(c, &mut s);
-                s.push(')');
+                asserts.push_str(&format!("(assert (not {t}))\n"));
             } else {
-                write_bool(c, &mut s);
+                asserts.push_str(&format!("(assert {t})\n"));
             }
-            s.push_str(")\n");
         }
+        s.push_str(smt.defs());
+        s.push_str(&asserts);
         s.push_str("(check-sat)\n");
         if !self.inputs.is_empty() {
             s.push_str("(get-value (");
@@ -194,8 +198,25 @@ impl SymEngine {
         s
     }
 
+    /// Whether an input called `name` already exists.
+    ///
+    /// Every model this engine hands back — [`Solver`](super::Solver) results,
+    /// and the explorer's `InputMap` — is keyed by *name*, so two inputs
+    /// sharing one collapse into a single entry and the explorer then applies
+    /// one value to both symbols. Callers must keep names unique; this is how
+    /// they check.
+    pub fn has_input(&self, name: &str) -> bool {
+        self.inputs.iter().any(|i| i.name == name)
+    }
+
     /// Allocate a fresh input symbol seeded with `seed_val`.
+    ///
+    /// `name` must not already be in use — see [`SymEngine::has_input`].
     fn fresh(&mut self, name: String, width: Width, seed_val: u64) -> SymId {
+        debug_assert!(
+            !self.has_input(&name),
+            "duplicate symbolic input name {name:?}: models are keyed by name, so the two would collapse into one entry"
+        );
         let id = SymId(self.next_id);
         self.next_id += 1;
         self.seed.insert(id, seed_val & mask(width));
@@ -240,7 +261,7 @@ impl SymEngine {
         } else {
             Expr::extract(lo + width - 1, lo, regv)
         };
-        if opnd.eval(&self.seed) != (concrete & mask(width)) {
+        if opnd.seed_val(&self.seed) != (concrete & mask(width)) {
             self.regs[slot as usize] = None; // stale — an unmodeled write changed it
             return Expr::constant(width, concrete);
         }
@@ -302,7 +323,7 @@ impl SymEngine {
         for k in (0..nbytes - 1).rev() {
             e = Expr::concat(e, byte(k));
         }
-        if e.eval(&self.seed) != (concrete & mask(width)) {
+        if e.seed_val(&self.seed) != (concrete & mask(width)) {
             for k in 0..nbytes {
                 self.mem.remove(&lin.wrapping_add(k));
             }
@@ -384,7 +405,7 @@ impl SymEngine {
     pub fn flag(&mut self, i: usize, concrete_bit: bool) -> BoolExpr {
         match self.flags[i].clone() {
             Some(e) => {
-                if e.eval(&self.seed) != concrete_bit {
+                if e.seed_val(&self.seed) != concrete_bit {
                     self.flags[i] = None; // stale
                     BoolExpr::constant(concrete_bit)
                 } else {
@@ -416,7 +437,7 @@ impl SymEngine {
         if pred.as_const().is_some() {
             return;
         }
-        debug_assert_eq!(pred.eval(&self.seed), taken, "branch predicate diverged from concrete");
+        debug_assert_eq!(pred.seed_val(&self.seed), taken, "branch predicate diverged from concrete");
         self.constraints.push(if taken { pred } else { BoolExpr::not(pred) });
     }
 
@@ -462,7 +483,7 @@ impl SymEngine {
         let eb = self.read_place(b, width, bv);
         let cin = self.flag(CF, cin_bit);
         let (res, defs) = alu::alu(idx, &ea, &eb, &cin, width);
-        debug_assert_eq!(res.eval(&self.seed), rv & mask(width), "symbolic ALU diverged from concrete");
+        debug_assert_eq!(res.seed_val(&self.seed), rv & mask(width), "symbolic ALU diverged from concrete");
         self.set_flags(defs);
         if let Some(d) = dst {
             self.write_place(d, res, concrete_reg);
@@ -478,7 +499,7 @@ impl SymEngine {
             UnaryOp::Dec => alu::dec(&e, width),
             UnaryOp::Neg => alu::neg(&e, width),
         };
-        debug_assert_eq!(res.eval(&self.seed), rv & mask(width), "symbolic unary diverged");
+        debug_assert_eq!(res.seed_val(&self.seed), rv & mask(width), "symbolic unary diverged");
         self.set_flags(defs);
         self.write_place(place, res, concrete_reg);
     }
@@ -506,7 +527,7 @@ impl SymEngine {
         };
         let e = self.read_place(place, width, vv);
         let (res, defs) = alu::shift(kind, &e, n, width);
-        debug_assert_eq!(res.eval(&self.seed), rv & mask(width), "symbolic shift diverged");
+        debug_assert_eq!(res.seed_val(&self.seed), rv & mask(width), "symbolic shift diverged");
         self.set_flags(defs);
         self.write_place(place, res, concrete_reg);
     }

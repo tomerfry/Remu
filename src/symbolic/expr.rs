@@ -17,7 +17,7 @@
 //! not need it and M0 exercises only constant leaves.)
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Width of a bitvector, in bits. The 386 uses 1/8/16/32; wider temporaries
 /// (9/17/33/64) appear when a construction needs headroom, e.g. the carry-out
@@ -99,6 +99,8 @@ pub enum Kind {
 pub struct ExprNode {
     pub width: Width,
     pub kind: Kind,
+    /// Memoized value under the concolic seed — see [`Expr::seed_val`].
+    seed_val: OnceLock<u64>,
 }
 
 /// A reference-counted handle to a bitvector expression. Cloning is cheap.
@@ -118,9 +120,95 @@ pub enum BoolKind {
     Not(BoolExpr),
 }
 
+/// A boolean node: its shape plus its memoized value under the seed.
+#[derive(Debug)]
+pub struct BoolNode {
+    pub kind: BoolKind,
+    seed_val: OnceLock<bool>,
+}
+
+// --- Iterative teardown -------------------------------------------------------
+//
+// A symbolic run builds one node per instruction on top of the last, so a long
+// loop leaves a chain thousands deep. The derived recursive `Drop` walks that
+// chain one stack frame per link and overflows — which aborts the process
+// outright, with no unwind and nothing catchable from Python. So both node
+// types dismantle themselves with an explicit worklist instead: take a node's
+// children out (leaving it a leaf), then release them one at a time, only
+// descending into those whose last reference just went away.
+
+/// Move `kind`'s children onto the worklists, leaving it a childless leaf.
+fn take_expr_children(kind: &mut Kind, es: &mut Vec<Expr>, bs: &mut Vec<BoolExpr>) {
+    match std::mem::replace(kind, Kind::Const(0)) {
+        Kind::Const(_) | Kind::Symbol(_) => {}
+        Kind::Bin(_, a, b) | Kind::Concat(a, b) => {
+            es.push(a);
+            es.push(b);
+        }
+        Kind::Un(_, a) | Kind::Extract { e: a, .. } | Kind::Extend { e: a, .. } => es.push(a),
+        Kind::Ite(c, t, f) => {
+            bs.push(c);
+            es.push(t);
+            es.push(f);
+        }
+    }
+}
+
+/// The boolean twin of [`take_expr_children`].
+fn take_bool_children(kind: &mut BoolKind, es: &mut Vec<Expr>, bs: &mut Vec<BoolExpr>) {
+    match std::mem::replace(kind, BoolKind::Const(false)) {
+        BoolKind::Const(_) => {}
+        BoolKind::Cmp(_, a, b) => {
+            es.push(a);
+            es.push(b);
+        }
+        BoolKind::BitOf(e, _) => es.push(e),
+        BoolKind::And(a, b) | BoolKind::Or(a, b) | BoolKind::Xor(a, b) => {
+            bs.push(a);
+            bs.push(b);
+        }
+        BoolKind::Not(a) => bs.push(a),
+    }
+}
+
+/// Release a worklist of handles without recursing. `Arc::into_inner` yields a
+/// node only when this was its last reference, so shared subterms are simply
+/// decremented and left alone.
+fn drain(mut es: Vec<Expr>, mut bs: Vec<BoolExpr>) {
+    loop {
+        if let Some(Expr(arc)) = es.pop() {
+            if let Some(mut node) = Arc::into_inner(arc) {
+                take_expr_children(&mut node.kind, &mut es, &mut bs);
+            }
+        } else if let Some(BoolExpr(arc)) = bs.pop() {
+            if let Some(mut node) = Arc::into_inner(arc) {
+                take_bool_children(&mut node.kind, &mut es, &mut bs);
+            }
+        } else {
+            return;
+        }
+    }
+}
+
+impl Drop for ExprNode {
+    fn drop(&mut self) {
+        let (mut es, mut bs) = (Vec::new(), Vec::new());
+        take_expr_children(&mut self.kind, &mut es, &mut bs);
+        drain(es, bs);
+    }
+}
+
+impl Drop for BoolNode {
+    fn drop(&mut self) {
+        let (mut es, mut bs) = (Vec::new(), Vec::new());
+        take_bool_children(&mut self.kind, &mut es, &mut bs);
+        drain(es, bs);
+    }
+}
+
 /// A reference-counted handle to a boolean expression.
 #[derive(Debug, Clone)]
-pub struct BoolExpr(Arc<BoolKind>);
+pub struct BoolExpr(Arc<BoolNode>);
 
 /// An assignment of concrete values to symbolic inputs, used by [`Expr::eval`]
 /// / [`BoolExpr::eval`] to evaluate an expression to a concrete result.
@@ -236,7 +324,63 @@ fn eval_cmp(op: CmpOp, a: u64, b: u64, width: Width) -> bool {
 
 impl Expr {
     fn node(width: Width, kind: Kind) -> Expr {
-        Expr(Arc::new(ExprNode { width, kind }))
+        Expr(Arc::new(ExprNode { width, kind, seed_val: OnceLock::new() }))
+    }
+
+    /// A stable identity for this node's allocation, for DAG sharing in the
+    /// SMT emitter (two handles to the same node share a key).
+    #[inline]
+    pub(crate) fn ptr_key(&self) -> usize {
+        Arc::as_ptr(&self.0) as *const u8 as usize
+    }
+
+    /// The value of this node under the concolic **seed**, memoized in the node.
+    ///
+    /// Unlike [`eval`](Expr::eval) this caches, so it is only correct for a
+    /// single model: the engine's seed, which is append-only (a symbol's value
+    /// never changes once created). The engine calls it exclusively with its
+    /// own seed. Use `eval` for any other model.
+    ///
+    /// This is what keeps the self-heal check O(1): the shadow deepens by one
+    /// node per instruction and every operand below it is already memoized.
+    pub(crate) fn seed_val(&self, model: &Model) -> u64 {
+        if let Some(v) = self.0.seed_val.get() {
+            return *v;
+        }
+        let v = match self.kind() {
+            Kind::Const(v) => *v,
+            Kind::Symbol(id) => model.get(id).copied().unwrap_or(0) & mask(self.width()),
+            Kind::Bin(op, a, b) => {
+                eval_bin(*op, a.seed_val(model), b.seed_val(model), self.width())
+            }
+            Kind::Un(op, e) => {
+                let v = e.seed_val(model);
+                let r = match op {
+                    UnOp::Neg => 0u64.wrapping_sub(v),
+                    UnOp::Not => !v,
+                };
+                r & mask(self.width())
+            }
+            Kind::Extract { hi: _, lo, e } => (e.seed_val(model) >> lo) & mask(self.width()),
+            Kind::Concat(h, l) => (h.seed_val(model) << l.width()) | l.seed_val(model),
+            Kind::Extend { signed, to, e } => {
+                let v = e.seed_val(model);
+                if *signed {
+                    sign_extend(v, e.width()) as u64 & mask(*to)
+                } else {
+                    v & mask(e.width())
+                }
+            }
+            Kind::Ite(c, t, e) => {
+                if c.seed_val(model) {
+                    t.seed_val(model)
+                } else {
+                    e.seed_val(model)
+                }
+            }
+        };
+        let _ = self.0.seed_val.set(v);
+        v
     }
 
     /// A concrete constant of the given width (`val` is masked to `width`).
@@ -404,7 +548,7 @@ impl Expr {
 
 impl BoolExpr {
     fn node(kind: BoolKind) -> BoolExpr {
-        BoolExpr(Arc::new(kind))
+        BoolExpr(Arc::new(BoolNode { kind, seed_val: OnceLock::new() }))
     }
 
     pub fn constant(b: bool) -> BoolExpr {
@@ -413,7 +557,7 @@ impl BoolExpr {
 
     #[inline]
     pub fn as_const(&self) -> Option<bool> {
-        match *self.0 {
+        match self.0.kind {
             BoolKind::Const(b) => Some(b),
             _ => None,
         }
@@ -421,7 +565,34 @@ impl BoolExpr {
 
     #[inline]
     pub fn kind(&self) -> &BoolKind {
-        &self.0
+        &self.0.kind
+    }
+
+    /// A stable identity for this node's allocation — see [`Expr::ptr_key`].
+    #[inline]
+    pub(crate) fn ptr_key(&self) -> usize {
+        Arc::as_ptr(&self.0) as *const u8 as usize
+    }
+
+    /// The value of this formula under the concolic **seed**, memoized — the
+    /// boolean twin of [`Expr::seed_val`], with the same single-model caveat.
+    pub(crate) fn seed_val(&self, model: &Model) -> bool {
+        if let Some(v) = self.0.seed_val.get() {
+            return *v;
+        }
+        let v = match self.kind() {
+            BoolKind::Const(v) => *v,
+            BoolKind::Cmp(op, a, b) => {
+                eval_cmp(*op, a.seed_val(model), b.seed_val(model), a.width())
+            }
+            BoolKind::BitOf(e, i) => (e.seed_val(model) >> i) & 1 == 1,
+            BoolKind::And(a, b) => a.seed_val(model) && b.seed_val(model),
+            BoolKind::Or(a, b) => a.seed_val(model) || b.seed_val(model),
+            BoolKind::Xor(a, b) => a.seed_val(model) ^ b.seed_val(model),
+            BoolKind::Not(a) => !a.seed_val(model),
+        };
+        let _ = self.0.seed_val.set(v);
+        v
     }
 
     /// A comparison, folding when both operands are constant.
@@ -482,7 +653,7 @@ impl BoolExpr {
 
     /// Evaluate to a concrete boolean under `model`.
     pub fn eval(&self, model: &Model) -> bool {
-        match &*self.0 {
+        match self.kind() {
             BoolKind::Const(b) => *b,
             BoolKind::Cmp(op, a, b) => eval_cmp(*op, a.eval(model), b.eval(model), a.width()),
             BoolKind::BitOf(e, i) => (e.eval(model) >> i) & 1 == 1,

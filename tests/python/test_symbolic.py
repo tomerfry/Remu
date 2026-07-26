@@ -23,6 +23,8 @@ needs_solver = pytest.mark.skipif(
 CODE = 0x1100
 DATA = 0x2000
 
+from remu.x86_32 import Cpu as Cpu386, Memory  # noqa: E402  (after the skip guard)
+
 
 # --- Harnesses ----------------------------------------------------------------
 
@@ -165,6 +167,17 @@ class TestTracking:
         # Flipping negates the branch, so the two scripts must differ.
         assert cpu.sym_smtlib(flip=0) != script
 
+    def test_duplicate_input_names_rejected(self):
+        """Models are keyed by name, so two inputs sharing one would collapse
+        into a single entry and find_input would drive both with one value."""
+        cpu, _ = setup386(ALU_CHAIN)
+        cpu.sym_init()
+        cpu.sym_symbolize_reg(0, "dup")
+        with pytest.raises(ValueError, match="already in use"):
+            cpu.sym_symbolize_reg(3, "dup")
+        with pytest.raises(ValueError, match="already in use"):
+            cpu.sym_symbolize_mem(DATA, 32, "dup", 0)
+
     def test_bad_arguments_raise(self):
         cpu, _ = setup386(ALU_CHAIN)
         cpu.sym_init()
@@ -174,6 +187,62 @@ class TestTracking:
             cpu.sym_symbolize_mem(DATA, 12, "nope", 0)
         with pytest.raises(IndexError, match="no branch 0"):
             cpu.sym_smtlib(flip=0)
+
+
+# --- Scale --------------------------------------------------------------------
+#
+# These pin the two ways the SMT emitter used to fall over. Both failed as a
+# hard process abort or a multi-gigabyte allocation rather than an exception, so
+# a regression here takes the whole test run down with it — which is the point.
+
+
+class TestScale:
+    # ADD EAX,1 ; DEC CX ; JNZ loop   then   CMP EAX,magic ; JNE +2
+    LOOP = bytes([0x66, 0x05, 0x01, 0, 0, 0, 0x49, 0x75, 0xF7])
+    CHECK = bytes([0x66, 0x3D, 0x78, 0x56, 0x34, 0x12, 0x75, 0x02])
+
+    def test_deep_chain_does_not_overflow_the_stack(self):
+        """A symbolic value carried through a long loop nests one expression
+        node per iteration; emitting and freeing that must not recurse."""
+        n = 20_000
+        mem = Memory()
+        mem.load(CODE, self.LOOP + self.CHECK + b"\xF4\xF4")
+        cpu = Cpu386()
+        cpu.set_cs_ip(0x0000, CODE)
+        cpu.esp = 0xFFF0
+        cpu.ecx = n
+        cpu.sym_init()
+        cpu.sym_symbolize_reg(0, "eax")
+        cpu.run(mem, 3 * n + 4)
+
+        assert cpu.sym_constraint_count == 1
+        script = cpu.sym_smtlib()
+        # Linear in the chain, and every node named once.
+        assert script.count("define-fun") <= 3 * n
+        assert len(script) < 8_000_000
+
+    def test_shared_subterms_are_emitted_once(self):
+        """ADC feeds each carry-out into the next carry-in, so the DAG is
+        heavily shared. Printing it as a tree was exponential (~4.2x per
+        instruction); with sharing it must stay linear."""
+        adc = bytes([0x66, 0x15, 0x03, 0, 0, 0])  # ADC EAX, 3
+        jle = bytes([0x66, 0x3D, 0x78, 0x56, 0x34, 0x12, 0x7E, 0x02])
+
+        def script_len(n):
+            mem = Memory()
+            mem.load(CODE, adc * n + jle + b"\xF4\xF4")
+            cpu = Cpu386()
+            cpu.set_cs_ip(0x0000, CODE)
+            cpu.esp = 0xFFF0
+            cpu.sym_init()
+            cpu.sym_symbolize_reg(0, "eax")
+            cpu.run(mem, n + 2)
+            return len(cpu.sym_smtlib())
+
+        small, big = script_len(4), script_len(16)
+        # Linear would be ~4x for 4x the instructions; exponential was ~4.2x
+        # per *instruction*. Anything under 10x proves the sharing works.
+        assert big < small * 10, f"{small} -> {big} bytes looks super-linear"
 
 
 # --- Solving ------------------------------------------------------------------

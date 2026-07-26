@@ -11,14 +11,23 @@
 //! [`smtlib`]: super::smtlib
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// Wall-clock limit for one `check-sat`, unless `REMU_SMT_TIMEOUT` says
+/// otherwise. QF_BV is decidable but not always quickly; without a bound a
+/// hard query hangs the caller forever, and via the Python bindings the GIL is
+/// released, so not even Ctrl-C gets in.
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 /// A handle to an external SMT solver.
 #[derive(Debug, Clone)]
 pub struct Solver {
     binary: String,
     args: Vec<String>,
+    timeout: Option<Duration>,
 }
 
 impl Default for Solver {
@@ -32,9 +41,16 @@ impl Solver {
     /// mode.
     pub fn new() -> Self {
         let binary = std::env::var("REMU_SMT_SOLVER").unwrap_or_else(|_| "z3".to_string());
+        // `REMU_SMT_TIMEOUT` is in seconds; `0` disables the limit.
+        let timeout = match std::env::var("REMU_SMT_TIMEOUT").ok().and_then(|v| v.parse().ok()) {
+            Some(0) => None,
+            Some(secs) => Some(Duration::from_secs(secs)),
+            None => Some(Duration::from_secs(DEFAULT_TIMEOUT_SECS)),
+        };
         Solver {
             binary,
             args: vec!["-in".to_string()],
+            timeout,
         }
     }
 
@@ -50,7 +66,7 @@ impl Solver {
 
     /// Run `script` and, if satisfiable, return the model as a map from SMT
     /// variable name (`x!<id>`) to its concrete value. Returns `None` on
-    /// `unsat`, a spawn/IO failure, or an unparseable response.
+    /// `unsat`, a timeout, a spawn/IO failure, or an unparseable response.
     pub fn solve(&self, script: &str) -> Option<HashMap<String, u64>> {
         let mut child = Command::new(&self.binary)
             .args(&self.args)
@@ -59,13 +75,58 @@ impl Solver {
             .stderr(Stdio::null())
             .spawn()
             .ok()?;
-        child.stdin.take()?.write_all(script.as_bytes()).ok()?;
-        let out = child.wait_with_output().ok()?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        if !text.contains("sat") || first_result(&text)? != "sat" {
+        let mut stdin = child.stdin.take()?;
+        let mut stdout = child.stdout.take()?;
+
+        // Feed and drain concurrently. Writing the whole script before reading
+        // any output deadlocks as soon as the solver emits enough (an early
+        // `(error …)`, say) to fill its stdout pipe while we are still writing
+        // — and scripts here reach megabytes.
+        let owned = script.to_string();
+        let writer = thread::spawn(move || {
+            let _ = stdin.write_all(owned.as_bytes());
+            // Dropping stdin closes the pipe, which is the solver's EOF.
+        });
+        let reader = thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = stdout.read_to_string(&mut buf);
+            buf
+        });
+
+        let timed_out = self.wait_for(&mut child);
+        let _ = writer.join();
+        let text = reader.join().ok()?;
+        if timed_out {
+            return None;
+        }
+        if first_result(&text)? != "sat" {
             return None;
         }
         Some(parse_model(&text))
+    }
+
+    /// Wait for `child`, killing it if it outruns the timeout. Returns whether
+    /// it was killed.
+    fn wait_for(&self, child: &mut std::process::Child) -> bool {
+        let Some(limit) = self.timeout else {
+            let _ = child.wait();
+            return false;
+        };
+        let deadline = Instant::now() + limit;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return false,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return true;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(_) => return false,
+            }
+        }
     }
 }
 
